@@ -164,6 +164,7 @@ app.put<{ Body: DataSourceInput }>("/api/data-source", async (request, reply) =>
     await selectDb.configure(safe, password);
     return { config: safe, version: tested.version };
   } catch (error) {
+    request.log.error({ err: error }, "Failed to persist SelectDB configuration");
     return reply.code(422).send({
       message: error instanceof Error ? error.message : "保存连接失败",
     });

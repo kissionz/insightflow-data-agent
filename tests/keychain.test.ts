@@ -60,4 +60,40 @@ describe("KeychainStore on Windows", () => {
       "Windows DPAPI 凭据写入后回读校验失败",
     );
   });
+
+  it("migrates a legacy SecureString credential without asking again", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-dpapi-"));
+    roots.push(root);
+    const credentialPath = path.join(
+      root,
+      ".montane",
+      "data-agent",
+      "selectdb-password.dpapi",
+    );
+    fs.mkdirSync(path.dirname(credentialPath), { recursive: true });
+    fs.writeFileSync(credentialPath, "01000000d08c9ddf0115d1118c7a00c04fc297eb");
+    const password = "legacy-密钥";
+    const scripts: string[] = [];
+    const store = new KeychainStore(root, path.join(root, ".montane"), {
+      platform: "win32",
+      executePowerShell: async (script) => {
+        scripts.push(script);
+        if (script.includes("ConvertTo-SecureString")) {
+          return Buffer.from(password, "utf8").toString("base64");
+        }
+        if (script.includes("Unprotect")) {
+          return Buffer.from(password, "utf8").toString("base64");
+        }
+        return "";
+      },
+    });
+
+    expect(await store.getPassword()).toBe(password);
+    expect(scripts.some((script) => script.includes("ConvertTo-SecureString"))).toBe(
+      true,
+    );
+    expect(scripts.some((script) => script.includes("ProtectedData]::Protect"))).toBe(
+      true,
+    );
+  });
 });

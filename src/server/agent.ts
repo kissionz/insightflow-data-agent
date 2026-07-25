@@ -1,30 +1,28 @@
 import type {
-  ResultArtifact,
-  TraceStep,
-  Turn,
-  TurnStatus,
-} from "../shared/types.js";
+  AgentReporter,
+  ToolCall,
+  ToolOutcome,
+  ToolStatus,
+} from "montane-code";
+import type { TraceStep, Turn, TurnStatus } from "../shared/types.js";
 import { EventHub } from "./events.js";
+import { DataAgentHarness } from "./harness.js";
 import { createId } from "./id.js";
 import { Repository } from "./repository.js";
-import { SemanticIndex } from "./semantic-index.js";
-import type { QueryPlan } from "./planner.js";
-import type { QueryResult } from "./selectdb.js";
 
 const TRACE_BLUEPRINT: Array<{
   kind: TraceStep["kind"];
   label: string;
-  status: TurnStatus;
 }> = [
-  { kind: "understanding", label: "理解问题", status: "understanding" },
-  { kind: "inheritance", label: "继承上下文", status: "understanding" },
-  { kind: "semantic_binding", label: "绑定业务语义", status: "planning" },
-  { kind: "relation_path", label: "选择关系路径", status: "planning" },
-  { kind: "grain_check", label: "校验分析粒度", status: "planning" },
-  { kind: "query_plan", label: "生成查询计划", status: "planning" },
-  { kind: "sql", label: "生成只读 SQL", status: "querying" },
-  { kind: "execution", label: "执行查询", status: "querying" },
-  { kind: "interpretation", label: "解释结果", status: "querying" },
+  { kind: "understanding", label: "理解问题" },
+  { kind: "inheritance", label: "继承上下文" },
+  { kind: "semantic_binding", label: "检索业务本体" },
+  { kind: "relation_path", label: "解析关系路径" },
+  { kind: "grain_check", label: "校验分析粒度" },
+  { kind: "query_plan", label: "Harness 查询规划" },
+  { kind: "sql", label: "生成只读 SQL" },
+  { kind: "execution", label: "执行 SelectDB 工具" },
+  { kind: "interpretation", label: "解释结果" },
 ];
 
 export class DataAgent {
@@ -33,13 +31,7 @@ export class DataAgent {
   constructor(
     private readonly repository: Repository,
     private readonly events: EventHub,
-    private readonly runtime?: {
-      plan: (
-        question: string,
-        conversationId: string,
-      ) => Promise<QueryPlan | null>;
-      execute: (sql: string, maxRows: number) => Promise<QueryResult>;
-    },
+    private readonly harness: DataAgentHarness,
   ) {}
 
   createTurn(conversationId: string, question: string): Turn {
@@ -62,7 +54,7 @@ export class DataAgent {
         kind: step.kind,
         label: step.label,
         status: "pending",
-        summary: "等待前序步骤完成",
+        summary: "等待 Harness 前序事件",
         createdAt: now,
       })),
     };
@@ -82,68 +74,70 @@ export class DataAgent {
     this.running.add(initialTurn.id);
     let turn = initialTurn;
 
+    const persist = (type: "turn_updated" | "trace_step_started" | "trace_step_completed") => {
+      turn = structuredClone(turn);
+      this.repository.saveTurn(turn);
+      this.events.publish({
+        conversationId: turn.conversationId,
+        turnId: turn.id,
+        type,
+        turn,
+      });
+    };
+    const updateStep = (
+      kind: TraceStep["kind"],
+      status: TraceStep["status"],
+      summary: string,
+      detail?: string,
+    ) => {
+      const index = turn.trace.findIndex((step) => step.kind === kind);
+      if (index < 0) return;
+      const current = turn.trace[index]!;
+      turn.trace[index] = {
+        ...current,
+        status,
+        summary,
+        detail,
+        completedAt:
+          status === "completed" || status === "failed"
+            ? new Date().toISOString()
+            : undefined,
+      };
+      persist(status === "running" ? "trace_step_started" : "trace_step_completed");
+    };
+
     try {
-      const ontology = this.repository.getOntology();
-      const index = new SemanticIndex(ontology);
-      const matches = index.search(turn.question);
-      const summaries = buildSummaries(turn, matches.map((match) => match.label));
-      let livePlan: QueryPlan | null = null;
-      let liveQuery: QueryResult | null = null;
+      updateStep(
+        "understanding",
+        "completed",
+        `问题已提交 Montane AgentLoop：${turn.question.slice(0, 42)}`,
+      );
+      updateStep(
+        "inheritance",
+        "completed",
+        turn.parentTurnId
+          ? "SessionStore 已加载同一会话的历史事件"
+          : "SessionManager 已创建新的 Harness 会话",
+      );
+      turn.status = "planning";
+      updateStep(
+        "query_plan",
+        "running",
+        "AgentLoop 正在选择受控工具并生成执行计划",
+      );
 
-      for (let stepIndex = 0; stepIndex < turn.trace.length; stepIndex += 1) {
-        const step = turn.trace[stepIndex];
-        const blueprint = TRACE_BLUEPRINT[stepIndex];
-        turn.status = blueprint.status;
-        step.status = "running";
-        step.summary = "正在处理…";
-        turn = structuredClone(turn);
-        this.repository.saveTurn(turn);
-        this.events.publish({
-          conversationId: turn.conversationId,
-          turnId: turn.id,
-          type: "trace_step_started",
-          turn,
-        });
-
-        if (step.kind === "query_plan" && this.runtime) {
-          livePlan = await this.runtime.plan(turn.question, turn.conversationId);
-          if (livePlan) summaries.query_plan = livePlan.explanation;
-        }
-        if (step.kind === "sql" && livePlan) {
-          summaries.sql = livePlan.sql;
-        }
-        if (step.kind === "execution" && livePlan && this.runtime) {
-          liveQuery = await this.runtime.execute(
-            livePlan.sql,
-            livePlan.resultKind === "detail" ? 50 : 200,
-          );
-          summaries.execution = `查询完成，返回 ${liveQuery.rows.length} 行，用时 ${liveQuery.durationMs} 毫秒`;
-        } else {
-          await delay(step.kind === "execution" ? 620 : 260);
-        }
-        turn.trace[stepIndex] = {
-          ...turn.trace[stepIndex],
-          status: "completed",
-          summary: summaries[step.kind],
-          completedAt: new Date().toISOString(),
-        };
-        turn = structuredClone(turn);
-        this.repository.saveTurn(turn);
-        this.events.publish({
-          conversationId: turn.conversationId,
-          turnId: turn.id,
-          type: "trace_step_completed",
-          turn,
-        });
-      }
-
-      const result =
-        livePlan && liveQuery
-          ? createLiveResult(livePlan, liveQuery)
-          : createResult(turn.question);
+      const conversation = this.repository.getConversation(turn.conversationId);
+      if (!conversation) throw new Error("会话不存在");
+      const reporter = new HarnessTurnReporter(
+        (kind, status, summary, detail) => {
+          if (kind === "execution" && status === "running") turn.status = "querying";
+          updateStep(kind, status, summary, detail);
+        },
+      );
+      const output = await this.harness.run(conversation, turn, reporter);
       turn.status = "completed";
-      turn.answer = result.conclusion;
-      turn.result = result;
+      turn.answer = output.answer;
+      turn.result = output.result;
       turn.completedAt = new Date().toISOString();
       turn = structuredClone(turn);
       this.repository.saveTurn(turn);
@@ -154,8 +148,11 @@ export class DataAgent {
         turn,
       });
     } catch (error) {
+      const message = error instanceof Error ? error.message : "Harness 分析失败";
+      const running = turn.trace.find((step) => step.status === "running");
+      if (running) updateStep(running.kind, "failed", message);
       turn.status = "failed";
-      turn.answer = error instanceof Error ? error.message : "分析失败";
+      turn.answer = message;
       turn.completedAt = new Date().toISOString();
       this.repository.saveTurn(turn);
       this.events.publish({
@@ -170,143 +167,153 @@ export class DataAgent {
   }
 }
 
-function buildSummaries(turn: Turn, labels: string[]): Record<TraceStep["kind"], string> {
-  const bound = labels.length ? labels.slice(0, 4).join("、") : "订单、成交金额、时间";
-  const inherited = turn.parentTurnId
-    ? "继承上一轮已确认的业务范围与时间口径"
-    : "本轮未引用历史条件，按独立问题解析";
-  return {
-    understanding: `识别问题意图：${turn.question.slice(0, 38)}`,
-    inheritance: inherited,
-    semantic_binding: `命中已发布本体：${bound}`,
-    relation_path: "订单 → 门店，采用已验证关系，未发现额外扇出",
-    grain_check: "按月份与区域聚合，指标在当前粒度下可安全计算",
-    query_plan: "聚合成交金额、订单量与客单价，并计算环比和贡献度",
-    sql: "已生成 WITH / SELECT 只读查询，强制限制 10,000 行",
-    approval: "本轮无高风险操作，无需人工审批",
-    execution: "查询完成，返回 18 行聚合结果，用时 1.4 秒",
-    interpretation: "已完成趋势、变化幅度与主要贡献项解释",
-  };
-}
+class HarnessTurnReporter implements AgentReporter {
+  private receivedText = false;
 
-function createResult(question: string): ResultArtifact {
-  const asksCategory = /品类|商品|类目/.test(question);
-  if (asksCategory) {
-    return {
-      kind: "analysis",
-      mode: "demo",
-      conclusion:
-        "家居品类本月增长最快，成交金额环比提升 31.2%；数码品类规模最大，但增速回落至 6.8%。建议继续跟踪家居活动带来的新增客户留存。",
-      kpis: [
-        { label: "品类成交金额", value: "¥8.62M", change: "+15.4%" },
-        { label: "增长最快", value: "家居", change: "+31.2%" },
-        { label: "贡献最高", value: "数码", change: "38.6%" },
-      ],
-      chart: {
-        title: "本月各品类成交金额",
-        type: "bar",
-        categories: ["数码", "家居", "服饰", "美妆", "食品"],
-        series: [{ name: "成交金额（百万元）", data: [3.33, 2.04, 1.42, 1.08, 0.75] }],
-      },
-      columns: ["品类", "成交金额", "环比", "订单量"],
-      rows: [
-        { 品类: "数码", 成交金额: "¥3.33M", 环比: "+6.8%", 订单量: 6482 },
-        { 品类: "家居", 成交金额: "¥2.04M", 环比: "+31.2%", 订单量: 9237 },
-        { 品类: "服饰", 成交金额: "¥1.42M", 环比: "+12.7%", 订单量: 7821 },
-        { 品类: "美妆", 成交金额: "¥1.08M", 环比: "+18.1%", 订单量: 6318 },
-      ],
-      rowCount: 5,
-      truncated: false,
-    };
+  constructor(
+    private readonly update: (
+      kind: TraceStep["kind"],
+      status: TraceStep["status"],
+      summary: string,
+      detail?: string,
+    ) => void,
+  ) {}
+
+  onTextDelta(_delta: string): void {
+    if (this.receivedText) return;
+    this.receivedText = true;
+    this.update(
+      "interpretation",
+      "running",
+      "AgentLoop 正在基于工具结果生成最终解释",
+    );
   }
 
-  return {
-    kind: "analysis",
-    mode: "demo",
-    conclusion:
-      "华东区本月成交金额为 ¥12.84M，较上月增长 18.6%。杭州湖滨店与上海静安店合计贡献增量的 61%，是本月增长的主要来源。",
-    kpis: [
-      { label: "成交金额", value: "¥12.84M", change: "+18.6%" },
-      { label: "订单量", value: "38,420", change: "+11.2%" },
-      { label: "客单价", value: "¥334", change: "+6.6%" },
-    ],
-    chart: {
-      title: "华东区近 6 个月成交金额",
-      type: "bar",
-      categories: ["2月", "3月", "4月", "5月", "6月", "7月"],
-      series: [{ name: "成交金额（百万元）", data: [8.6, 9.2, 9.8, 10.4, 10.83, 12.84] }],
-    },
-    columns: ["门店", "成交金额", "环比", "订单量"],
-    rows: [
-      { 门店: "杭州湖滨店", 成交金额: "¥3.26M", 环比: "+28.4%", 订单量: 9221 },
-      { 门店: "上海静安店", 成交金额: "¥2.91M", 环比: "+22.7%", 订单量: 8346 },
-      { 门店: "南京新街口店", 成交金额: "¥2.18M", 环比: "+14.3%", 订单量: 6759 },
-      { 门店: "苏州中心店", 成交金额: "¥1.76M", 环比: "+9.8%", 订单量: 5287 },
-    ],
-    rowCount: 18,
-    truncated: false,
-  };
+  onTextEnd(): void {
+    if (!this.receivedText) return;
+    this.receivedText = false;
+    this.update(
+      "interpretation",
+      "completed",
+      "最终结论已写入 Harness SessionStore",
+    );
+  }
+
+  onToolStatus(
+    call: ToolCall,
+    status: ToolStatus,
+    result?: ToolOutcome,
+  ): void {
+    if (call.name === "OntologySearch") {
+      this.handleOntologyStatus(status, result);
+      return;
+    }
+    if (call.name === "SelectDBQuery") {
+      this.handleQueryStatus(call, status, result);
+    }
+  }
+
+  private handleOntologyStatus(status: ToolStatus, result?: ToolOutcome): void {
+    if (status === "running") {
+      this.update(
+        "query_plan",
+        "completed",
+        "AgentLoop 已选择 OntologySearch 只读工具",
+      );
+      this.update(
+        "semantic_binding",
+        "running",
+        "OntologySearch 正在检索已发布语义索引",
+      );
+      return;
+    }
+    if (status === "succeeded") {
+      const data = result?.data as
+        | {
+            matches?: Array<{ label?: string }>;
+            relations?: Array<{
+              name?: string;
+              cardinality?: string;
+              fanoutRisk?: string;
+            }>;
+          }
+        | undefined;
+      const labels =
+        data?.matches?.map((match) => match.label).filter(Boolean).slice(0, 5) ?? [];
+      const relations = data?.relations ?? [];
+      this.update(
+        "semantic_binding",
+        "completed",
+        labels.length ? `命中业务语义：${labels.join("、")}` : "完成本体检索",
+      );
+      this.update(
+        "relation_path",
+        "completed",
+        relations.length
+          ? `解析 ${relations.length} 条候选关系：${relations
+              .slice(0, 2)
+              .map((relation) => relation.name)
+              .join("、")}`
+          : "当前问题可在单一对象内完成",
+      );
+      this.update(
+        "grain_check",
+        "completed",
+        relations.some((relation) => relation.fanoutRisk === "HIGH")
+          ? "发现高扇出关系，Harness 将按去重口径生成查询"
+          : "关系基数与聚合粒度检查通过",
+      );
+      return;
+    }
+    if (isFailure(status)) {
+      this.update(
+        "semantic_binding",
+        "failed",
+        result?.content || "OntologySearch 执行失败",
+      );
+    }
+  }
+
+  private handleQueryStatus(
+    call: ToolCall,
+    status: ToolStatus,
+    result?: ToolOutcome,
+  ): void {
+    const sql = String(call.args.sql ?? "");
+    if (status === "running") {
+      this.update(
+        "sql",
+        "completed",
+        "SQL 已通过 Harness 工具参数校验和只读安全检查",
+        sql,
+      );
+      this.update(
+        "execution",
+        "running",
+        "SelectDBQuery 正在执行受控查询",
+      );
+      return;
+    }
+    if (status === "succeeded") {
+      const rowCount = Number(result?.data?.rowCount ?? 0);
+      const mode = result?.data?.mode === "live" ? "真实查询" : "示例查询";
+      this.update(
+        "execution",
+        "completed",
+        `${mode}完成，返回 ${rowCount} 行`,
+      );
+      return;
+    }
+    if (isFailure(status)) {
+      this.update(
+        "execution",
+        "failed",
+        result?.content || "SelectDBQuery 执行失败",
+      );
+    }
+  }
 }
 
-function createLiveResult(plan: QueryPlan, query: QueryResult): ResultArtifact {
-  const columns = query.columns;
-  const rows = query.rows.map((row) =>
-    Object.fromEntries(
-      Object.entries(row).map(([key, value]) => [
-        key,
-        typeof value === "number" ? value : value == null ? "—" : String(value),
-      ]),
-    ),
-  ) as ResultArtifact["rows"];
-  const categoryColumn = columns.find((column) =>
-    rows.some((row) => typeof row[column] === "string"),
-  );
-  const numberColumns = columns.filter((column) =>
-    rows.some((row) => typeof row[column] === "number"),
-  );
-  const categories = rows
-    .slice(0, 12)
-    .map((row, index) => String(row[categoryColumn ?? columns[0]] ?? index + 1));
-  const seriesColumns = numberColumns.slice(0, 3);
-  const series = seriesColumns.map((column) => ({
-    name: column,
-    data: rows.slice(0, 12).map((row) => Number(row[column] ?? 0)),
-  }));
-  const numericValues = numberColumns.flatMap((column) =>
-    rows.map((row) => Number(row[column])).filter(Number.isFinite),
-  );
-
-  return {
-    kind: "analysis",
-    mode: "live",
-    conclusion: query.rows.length
-      ? `${plan.title}已完成，共返回 ${query.rows.length} 行结果。以下结论严格基于当前查询结果与已发布业务口径。`
-      : `${plan.title}未返回符合条件的数据，建议检查时间范围或筛选条件。`,
-    kpis: [
-      { label: "结果行数", value: String(query.rows.length) },
-      {
-        label: seriesColumns[0] || "数值字段",
-        value: numericValues.length
-          ? Intl.NumberFormat("zh-CN", { maximumFractionDigits: 2 }).format(
-              numericValues.reduce((sum, value) => sum + value, 0),
-            )
-          : "—",
-      },
-      { label: "查询耗时", value: `${query.durationMs}ms` },
-    ],
-    chart: {
-      title: plan.title,
-      type: "bar",
-      categories,
-      series: series.length ? series : [{ name: "记录数", data: categories.map(() => 1) }],
-    },
-    columns,
-    rows,
-    rowCount: query.rows.length,
-    truncated: query.truncated,
-  };
-}
-
-function delay(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+function isFailure(status: ToolStatus): boolean {
+  return ["failed", "rejected", "denied"].includes(status);
 }

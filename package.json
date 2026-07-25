@@ -7,11 +7,16 @@
     "node": ">=24.0.0"
   },
   "scripts": {
+    "ensure:montane": "node scripts/ensure-montane.mjs",
+    "predev": "npm run ensure:montane",
     "dev": "concurrently -k -n api,web -c blue,cyan \"tsx watch src/server/index.ts\" \"vite\"",
+    "prebuild": "npm run ensure:montane",
     "build": "npm run build:server && npm run build:web",
     "build:server": "tsc -p tsconfig.server.json",
     "build:web": "tsc -p tsconfig.json && vite build",
+    "prestart": "npm run ensure:montane",
     "start": "node dist/server/server/index.js",
+    "pretest": "npm run ensure:montane",
     "test": "vitest run",
     "test:watch": "vitest",
     "check": "npm run build && npm test"
@@ -21,7 +26,7 @@
     "@phosphor-icons/react": "^2.1.10",
     "echarts": "^6.0.0",
     "fastify": "^5.6.1",
-    "montane-code": "file:../data engineer",
+    "montane-code": "git+https://github.com/kissionz/data-engineer.git#a8672f8f78bcb0ab5351698659a5a8e706835867",
     "mysql2": "^3.15.3",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",

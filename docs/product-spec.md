@@ -486,6 +486,16 @@ MVP 不部署独立向量数据库。Ontology 达到更大规模后，可以通�
 - `InspectQueryResult`
 - `CreateVisualizationSpec`
 
+MVP 当前将上述职责收敛为两个组合工具：
+
+- `OntologySearch`：完成候选召回、对象/指标绑定、关系路径和扇出风险返回。
+- `SelectDBQuery`：完成 SQL 参数校验、只读防护、行数限制和 SelectDB 执行。
+
+两者均注册到 `ToolRegistry`，由 `AgentLoop` 调用并经过 `PermissionGate`。
+`AgentReporter` 将实际工具状态投影为每轮 UI 追踪，`SessionStore` 保存
+`assistant_tool_calls`、`tool_result` 和 `assistant_final` 原始事件。MVP 不再使用
+独立的直连模型查询规划器。
+
 执行原则：
 
 - LLM 负责意图理解、语义匹配、计划和解释。

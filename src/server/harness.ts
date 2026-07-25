@@ -1,0 +1,511 @@
+import {
+  AgentLoop,
+  ContextBuilder,
+  OpenAIModel,
+  PermissionGate,
+  SessionManager,
+  SessionStore,
+  ToolRegistry,
+  defaultPolicy,
+  type AgentMessage,
+  type AgentReporter,
+  type AgentResponse,
+  type ModelClient,
+  type Tool,
+  type ToolOutcome,
+} from "montane-code";
+import type {
+  Conversation,
+  ResultArtifact,
+  Turn,
+} from "../shared/types.js";
+import { createId } from "./id.js";
+import { Repository } from "./repository.js";
+import { SemanticIndex } from "./semantic-index.js";
+import type { QueryResult } from "./selectdb.js";
+import { guardReadOnlySql } from "./sql-guard.js";
+
+const DATA_AGENT_SYSTEM_PROMPT = `
+你是 InsightFlow Data Agent，运行在 Montane Harness 中。
+
+必须遵循以下执行协议：
+1. 每轮先调用 OntologySearch，将用户问题绑定到已发布业务对象、属性、指标和关系。
+2. 只能根据 OntologySearch 返回的语义生成查询，不得猜测表名、字段或关系。
+3. 然后调用 SelectDBQuery 执行一条只读 SQL；只允许 SELECT 或 WITH ... SELECT。
+4. 必须检查关系基数、扇出风险和分析粒度。
+5. 最终使用中文给出简洁、可验证的结论，只能引用工具返回的数据。
+6. 不得在最终答案中暴露数据源地址、用户名、密码或内部配置。
+7. 不得调用未提供的工具，也不得省略查询执行直接编造结果。
+`.trim();
+
+interface HarnessRunResult {
+  answer: string;
+  result: ResultArtifact;
+  sessionId: string;
+}
+
+interface CapturedAnalysis {
+  artifact: ResultArtifact;
+  sql: string;
+}
+
+type ManagedSession = Awaited<ReturnType<SessionManager["create"]>>;
+
+export class DataAgentHarness {
+  private readonly sessionManager: SessionManager;
+  private readonly sessions = new Map<string, ManagedSession>();
+
+  constructor(
+    private readonly workspaceRoot: string,
+    private readonly repository: Repository,
+    private readonly executeLiveQuery: (
+      sql: string,
+      maxRows: number,
+    ) => Promise<QueryResult>,
+  ) {
+    this.sessionManager = new SessionManager(workspaceRoot, {
+      model: process.env.OPENAI_MODEL || "insightflow-demo-harness",
+    });
+  }
+
+  async run(
+    conversation: Conversation,
+    turn: Turn,
+    reporter: AgentReporter,
+  ): Promise<HarnessRunResult> {
+    const managed = await this.getOrCreateSession(conversation);
+    const source = this.repository.getDataSource();
+    const liveMode = Boolean(
+      source.configured && process.env.OPENAI_API_KEY && process.env.OPENAI_MODEL,
+    );
+    let captured: CapturedAnalysis | null = null;
+    const tools = new ToolRegistry();
+    tools.register(this.ontologySearchTool());
+    tools.register(
+      this.selectDbQueryTool(turn.question, liveMode, (analysis) => {
+        captured = analysis;
+      }),
+    );
+
+    const policy = defaultPolicy();
+    policy.allowedTools.add("OntologySearch");
+    policy.allowedTools.add("SelectDBQuery");
+    const permissions = new PermissionGate(policy, this.workspaceRoot);
+    const session = new SessionStore(
+      managed.sessionPath,
+      managed.id,
+      async (event) => {
+        await managed.updateLastSequence(event.sequence);
+      },
+    );
+    const model = liveMode ? this.createLiveModel() : new DemoHarnessModel();
+    const context = new ContextBuilder(
+      this.workspaceRoot,
+      60,
+      DATA_AGENT_SYSTEM_PROMPT,
+    );
+    const loop = new AgentLoop(
+      model,
+      tools,
+      permissions,
+      context,
+      session,
+      8,
+      async () => "reject" as const,
+      reporter,
+      undefined,
+      undefined,
+      async (status) => {
+        await managed.updateStatus(status);
+      },
+      {
+        maxTurns: 8,
+        maxWallTimeMs: 190_000,
+        maxInputTokens: 120_000,
+        maxOutputTokens: 12_000,
+        maxToolCalls: 8,
+        maxModelRetries: 2,
+      },
+    );
+
+    const answer = await loop.run(turn.question);
+    const completed = captured as CapturedAnalysis | null;
+    if (!completed) {
+      throw new Error("Harness 未执行 SelectDBQuery，无法生成可信分析结果");
+    }
+
+    return {
+      answer,
+      result: {
+        ...completed.artifact,
+        conclusion: answer,
+      },
+      sessionId: managed.id,
+    };
+  }
+
+  async close(): Promise<void> {
+    await Promise.all([...this.sessions.values()].map((session) => session.release()));
+    this.sessions.clear();
+  }
+
+  private async getOrCreateSession(conversation: Conversation): Promise<ManagedSession> {
+    const existing = this.sessions.get(conversation.id);
+    if (existing) return existing;
+
+    let managed: ManagedSession;
+    if (conversation.harnessSessionId) {
+      try {
+        managed = await this.sessionManager.resume(conversation.harnessSessionId);
+      } catch {
+        managed = await this.sessionManager.create({ title: conversation.title });
+      }
+    } else {
+      managed = await this.sessionManager.create({ title: conversation.title });
+    }
+    this.sessions.set(conversation.id, managed);
+
+    if (conversation.harnessSessionId !== managed.id) {
+      this.repository.saveConversation({
+        ...conversation,
+        harnessSessionId: managed.id,
+      });
+    }
+    return managed;
+  }
+
+  private createLiveModel(): ModelClient {
+    return new OpenAIModel({
+      apiKey: process.env.OPENAI_API_KEY!,
+      model: process.env.OPENAI_MODEL!,
+      baseUrl: process.env.OPENAI_BASE_URL,
+    });
+  }
+
+  private ontologySearchTool(): Tool {
+    return {
+      name: "OntologySearch",
+      description:
+        "检索已发布业务本体，返回与问题匹配的对象、指标、属性、关系路径与扇出风险。",
+      effect: "readonly",
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          query: {
+            type: "string",
+            description: "需要绑定到业务语义的原始用户问题",
+          },
+        },
+        required: ["query"],
+      },
+      execute: async (args): Promise<ToolOutcome> => {
+        const query = String(args.query ?? "");
+        const ontology = this.repository.getOntology();
+        const index = new SemanticIndex(ontology);
+        const matches = index.search(query, 10);
+        const objectIds = matches
+          .filter((match) => match.kind === "object")
+          .map((match) => match.id);
+        const metricObjectIds = matches
+          .filter((match) => match.kind === "metric")
+          .map(
+            (match) =>
+              ontology.metrics.find((metric) => metric.id === match.id)?.objectId,
+          )
+          .filter((id): id is string => Boolean(id));
+        const relevantIds = new Set([...objectIds, ...metricObjectIds]);
+        const objects = ontology.objects.filter((object) => relevantIds.has(object.id));
+        const metrics = ontology.metrics.filter((metric) =>
+          matches.some((match) => match.id === metric.id),
+        );
+        const relations = ontology.relations.filter(
+          (relation) =>
+            relevantIds.has(relation.sourceObjectId) ||
+            relevantIds.has(relation.targetObjectId),
+        );
+        const tables = this.repository.getTables();
+        const payload = {
+          ontologyVersion: ontology.version,
+          matches,
+          objects: objects.map((object) => ({
+            id: object.id,
+            label: object.label,
+            table: tables.find((table) => table.id === object.sourceTableId)?.name,
+            properties: object.properties.map((property) => ({
+              label: property.label,
+              column: property.sourceColumn,
+              dataType: property.dataType,
+              sensitive: property.sensitive,
+            })),
+          })),
+          metrics: metrics.map((metric) => ({
+            label: metric.label,
+            expression: metric.expression,
+            aggregation: metric.aggregation,
+          })),
+          relations: relations.map((relation) => ({
+            name: relation.name,
+            joinExpression: relation.joinExpression,
+            cardinality: relation.cardinality,
+            fanoutRisk: relation.fanoutRisk,
+          })),
+        };
+        return {
+          ok: true,
+          content: JSON.stringify(payload),
+          data: payload,
+        };
+      },
+    };
+  }
+
+  private selectDbQueryTool(
+    question: string,
+    liveMode: boolean,
+    capture: (analysis: CapturedAnalysis) => void,
+  ): Tool {
+    return {
+      name: "SelectDBQuery",
+      description:
+        "执行经过安全校验的 SelectDB/Doris 只读查询。聚合结果最多 200 行，明细最多 50 行。",
+      effect: "readonly",
+      timeoutMs: 180_000,
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          sql: {
+            type: "string",
+            description: "一条 SELECT 或 WITH ... SELECT 查询",
+          },
+          result_kind: {
+            type: "string",
+            enum: ["aggregate", "detail"],
+          },
+          title: {
+            type: "string",
+            description: "结果图表的中文标题",
+          },
+        },
+        required: ["sql", "result_kind", "title"],
+      },
+      execute: async (args): Promise<ToolOutcome> => {
+        const sql = String(args.sql ?? "");
+        const resultKind = args.result_kind === "detail" ? "detail" : "aggregate";
+        const title = String(args.title ?? "分析结果");
+        const maxRows = resultKind === "detail" ? 50 : 200;
+        guardReadOnlySql(sql, maxRows);
+
+        const artifact = liveMode
+          ? createLiveResult(
+              title,
+              await this.executeLiveQuery(sql, maxRows),
+            )
+          : createDemoResult(question);
+        capture({ artifact, sql });
+        return {
+          ok: true,
+          content: JSON.stringify({
+            mode: artifact.mode,
+            title: artifact.chart.title,
+            rowCount: artifact.rowCount,
+            columns: artifact.columns,
+            rows: artifact.rows.slice(0, 50),
+            truncated: artifact.truncated,
+          }),
+          data: {
+            mode: artifact.mode,
+            rowCount: artifact.rowCount,
+            columns: artifact.columns,
+            rows: artifact.rows.slice(0, 50),
+            truncated: artifact.truncated,
+          },
+        };
+      },
+    };
+  }
+}
+
+class DemoHarnessModel implements ModelClient {
+  readonly capabilities = {
+    contextWindow: 32_000,
+    maxOutputTokens: 2_000,
+    supportsStreaming: true,
+    supportsToolUse: true,
+    supportsImages: false,
+  };
+
+  async complete(options: {
+    messages: AgentMessage[];
+    tools: Array<Record<string, unknown>>;
+    onTextDelta?: (delta: string) => void;
+  }): Promise<AgentResponse> {
+    const current = currentTurnMessages(options.messages);
+    const question =
+      [...current].reverse().find((message) => message.role === "user")?.content ?? "";
+    const toolResults = current
+      .filter((message) => message.role === "tool")
+      .map((message) => message.toolResult);
+
+    if (!toolResults.some((result) => result?.name === "OntologySearch")) {
+      return {
+        toolCalls: [
+          {
+            id: createId("tool"),
+            name: "OntologySearch",
+            args: { query: question },
+          },
+        ],
+        stopReason: "tool_use",
+      };
+    }
+
+    if (!toolResults.some((result) => result?.name === "SelectDBQuery")) {
+      const category = /品类|商品|类目/.test(question);
+      return {
+        toolCalls: [
+          {
+            id: createId("tool"),
+            name: "SelectDBQuery",
+            args: {
+              sql: category
+                ? "SELECT category_name, SUM(pay_amount) AS gmv FROM fact_orders GROUP BY category_name ORDER BY gmv DESC"
+                : "SELECT region_name, SUM(pay_amount) AS gmv, COUNT(DISTINCT order_id) AS order_count FROM fact_orders GROUP BY region_name ORDER BY gmv DESC",
+              result_kind: "aggregate",
+              title: category ? "本月各品类成交金额" : "区域经营表现",
+            },
+          },
+        ],
+        stopReason: "tool_use",
+      };
+    }
+
+    const finalText = createDemoResult(question).conclusion;
+    options.onTextDelta?.(finalText);
+    return {
+      finalText,
+      stopReason: "end_turn",
+      usage: {
+        inputTokens: 420,
+        outputTokens: 96,
+      },
+      requestId: createId("demo_request"),
+    };
+  }
+}
+
+function currentTurnMessages(messages: AgentMessage[]): AgentMessage[] {
+  let lastUserIndex = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index]?.role === "user") {
+      lastUserIndex = index;
+      break;
+    }
+  }
+  return lastUserIndex >= 0 ? messages.slice(lastUserIndex) : messages;
+}
+
+function createDemoResult(question: string): ResultArtifact {
+  if (/品类|商品|类目/.test(question)) {
+    return {
+      kind: "analysis",
+      mode: "demo",
+      conclusion:
+        "家居品类本月增长最快，成交金额环比提升 31.2%；数码品类规模最大，但增速回落至 6.8%。建议继续跟踪家居活动带来的新增客户留存。",
+      kpis: [
+        { label: "品类成交金额", value: "¥8.62M", change: "+15.4%" },
+        { label: "增长最快", value: "家居", change: "+31.2%" },
+        { label: "贡献最高", value: "数码", change: "38.6%" },
+      ],
+      chart: {
+        title: "本月各品类成交金额",
+        type: "bar",
+        categories: ["数码", "家居", "服饰", "美妆", "食品"],
+        series: [{ name: "成交金额（百万元）", data: [3.33, 2.04, 1.42, 1.08, 0.75] }],
+      },
+      columns: ["品类", "成交金额", "环比", "订单量"],
+      rows: [
+        { 品类: "数码", 成交金额: "¥3.33M", 环比: "+6.8%", 订单量: 6482 },
+        { 品类: "家居", 成交金额: "¥2.04M", 环比: "+31.2%", 订单量: 9237 },
+        { 品类: "服饰", 成交金额: "¥1.42M", 环比: "+12.7%", 订单量: 7821 },
+        { 品类: "美妆", 成交金额: "¥1.08M", 环比: "+18.1%", 订单量: 6318 },
+      ],
+      rowCount: 5,
+      truncated: false,
+    };
+  }
+
+  return {
+    kind: "analysis",
+    mode: "demo",
+    conclusion:
+      "华东区本月成交金额为 ¥12.84M，较上月增长 18.6%。杭州湖滨店与上海静安店合计贡献增量的 61%，是本月增长的主要来源。",
+    kpis: [
+      { label: "成交金额", value: "¥12.84M", change: "+18.6%" },
+      { label: "订单量", value: "38,420", change: "+11.2%" },
+      { label: "客单价", value: "¥334", change: "+6.6%" },
+    ],
+    chart: {
+      title: "华东区近 6 个月成交金额",
+      type: "bar",
+      categories: ["2月", "3月", "4月", "5月", "6月", "7月"],
+      series: [{ name: "成交金额（百万元）", data: [8.6, 9.2, 9.8, 10.4, 10.83, 12.84] }],
+    },
+    columns: ["门店", "成交金额", "环比", "订单量"],
+    rows: [
+      { 门店: "杭州湖滨店", 成交金额: "¥3.26M", 环比: "+28.4%", 订单量: 9221 },
+      { 门店: "上海静安店", 成交金额: "¥2.91M", 环比: "+22.7%", 订单量: 8346 },
+      { 门店: "南京新街口店", 成交金额: "¥2.18M", 环比: "+14.3%", 订单量: 6759 },
+      { 门店: "苏州中心店", 成交金额: "¥1.76M", 环比: "+9.8%", 订单量: 5287 },
+    ],
+    rowCount: 18,
+    truncated: false,
+  };
+}
+
+function createLiveResult(title: string, query: QueryResult): ResultArtifact {
+  const columns = query.columns;
+  const rows = query.rows.map((row) =>
+    Object.fromEntries(
+      Object.entries(row).map(([key, value]) => [
+        key,
+        typeof value === "number" ? value : value == null ? "—" : String(value),
+      ]),
+    ),
+  ) as ResultArtifact["rows"];
+  const categoryColumn = columns.find((column) =>
+    rows.some((row) => typeof row[column] === "string"),
+  );
+  const numberColumns = columns.filter((column) =>
+    rows.some((row) => typeof row[column] === "number"),
+  );
+  const categories = rows
+    .slice(0, 12)
+    .map((row, index) => String(row[categoryColumn ?? columns[0]] ?? index + 1));
+  const series = numberColumns.slice(0, 3).map((column) => ({
+    name: column,
+    data: rows.slice(0, 12).map((row) => Number(row[column] ?? 0)),
+  }));
+
+  return {
+    kind: "analysis",
+    mode: "live",
+    conclusion: "",
+    kpis: [
+      { label: "结果行数", value: String(query.rows.length) },
+      { label: "数值字段", value: String(numberColumns.length) },
+      { label: "查询耗时", value: `${query.durationMs}ms` },
+    ],
+    chart: {
+      title,
+      type: "bar",
+      categories,
+      series: series.length ? series : [{ name: "记录数", data: categories.map(() => 1) }],
+    },
+    columns,
+    rows,
+    rowCount: query.rows.length,
+    truncated: query.truncated,
+  };
+}

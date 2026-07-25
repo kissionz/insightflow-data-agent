@@ -13,9 +13,9 @@ import type {
 import { DataAgent } from "./agent.js";
 import { loadConfig } from "./config.js";
 import { EventHub } from "./events.js";
+import { DataAgentHarness } from "./harness.js";
 import { createId } from "./id.js";
 import { KeychainStore } from "./keychain.js";
-import { MontaneSemanticPlanner } from "./planner.js";
 import { Repository } from "./repository.js";
 import { SelectDbClient } from "./selectdb.js";
 
@@ -24,28 +24,18 @@ const repository = new Repository(config.databasePath);
 const events = new EventHub();
 const keychain = new KeychainStore(config.workspaceRoot);
 const selectDb = new SelectDbClient();
-const planner = new MontaneSemanticPlanner();
-const agent = new DataAgent(repository, events, {
-  plan: async (question, conversationId) => {
-    const source = repository.getDataSource();
-    if (!source.configured) return null;
-    const conversation = repository.getConversation(conversationId);
-    if (!conversation) throw new Error("会话不存在");
-    return planner.plan(
-      question,
-      repository.getOntology(),
-      repository.getTables(),
-      conversation,
-    );
-  },
-  execute: async (sql, maxRows) => {
+const harness = new DataAgentHarness(
+  config.workspaceRoot,
+  repository,
+  async (sql, maxRows) => {
     const source = repository.getDataSource();
     const password = await keychain.getPassword();
     if (!source.configured || !password) throw new Error("SelectDB 凭证不可用");
     await selectDb.configure(source, password);
     return selectDb.query(sql, 180_000, maxRows);
   },
-});
+);
+const agent = new DataAgent(repository, events, harness);
 const app = Fastify({ logger: true });
 
 const dataSourceSchema = z.object({
@@ -269,6 +259,7 @@ if (fs.existsSync(webRoot)) {
 }
 
 async function shutdown(): Promise<void> {
+  await harness.close();
   await selectDb.close();
   repository.close();
   await app.close();

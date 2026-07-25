@@ -83,6 +83,7 @@ export interface Conversation {
   createdAt: string;
   updatedAt: string;
   status: "active" | "archived";
+  harnessSessionId?: string;
   turns: Turn[];
 }
 

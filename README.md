@@ -50,6 +50,16 @@ AgentLoop
 不会生成固定图表、示例数据或虚构结论。每轮仍保留完整追踪，未执行的语义与
 SQL 步骤会标记为“未执行”。`.montane/sessions/` 中会保留原始 Harness 事件记录。
 
+Windows PowerShell 可以在启动前设置模型环境：
+
+```powershell
+$env:OPENAI_API_KEY="..."
+$env:OPENAI_MODEL="..."
+npm start
+```
+
+「设置」页会显示真实问数链路是否已经就绪。
+
 ## 验证
 
 ```bash

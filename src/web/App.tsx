@@ -770,7 +770,7 @@ function ManagementWorkspace({
         />
       )}
       {page === "audit" && <AuditPage conversations={state.conversations} />}
-      {page === "settings" && <SettingsPage />}
+      {page === "settings" && <SettingsPage runtime={state.runtime} />}
     </main>
   );
 }
@@ -1287,9 +1287,25 @@ function AuditPage({ conversations }: { conversations: Conversation[] }) {
   );
 }
 
-function SettingsPage() {
+function SettingsPage({ runtime }: { runtime: BootstrapPayload["runtime"] }) {
   return (
     <div className="management-content settings-grid">
+      <section className="panel setting-card">
+        <div className="setting-icon"><Brain size={20} /></div>
+        <div>
+          <h2>真实问数链路</h2>
+          <p>
+            {runtime.analysisReady
+              ? "SelectDB 与分析模型均已就绪，可以执行真实查询。"
+              : runtime.modelConfigured
+                ? "分析模型已加载，请确认 SelectDB 连接与本体已发布。"
+                : "尚未加载分析模型，请在启动环境中设置 OPENAI_API_KEY 和 OPENAI_MODEL。"}
+          </p>
+        </div>
+        <span className={`status-pill ${runtime.analysisReady ? "success" : "warning"}`}>
+          {runtime.analysisReady ? "已就绪" : "待配置"}
+        </span>
+      </section>
       <section className="panel setting-card">
         <div className="setting-icon"><Clock size={20} /></div>
         <div><h2>查询执行</h2><p>最大超时 180 秒，聚合最多 200 行，明细最多 50 行。</p></div>

@@ -94,6 +94,28 @@ describe("Repository schema reconciliation", () => {
     expect(repository.getDraftOntology()?.objects[0].label).toBe("草稿订单");
     repository.close();
   });
+
+  it("migrates legacy object primary keys to property identity roles", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-repo-"));
+    roots.push(root);
+    const repository = new Repository(path.join(root, "ontology.sqlite"));
+    const legacy = structuredClone(testOntology);
+    legacy.version = 2;
+    legacy.objects[0].primaryKey = ["p_order_id"];
+    delete (
+      legacy.objects[0].properties[0] as Partial<
+        (typeof legacy.objects)[number]["properties"][number]
+      >
+    ).identityRole;
+    repository.saveOntology(legacy);
+
+    const migrated = repository.getPublishedOntology();
+    expect(migrated.objects[0].primaryKey).toBeUndefined();
+    expect(migrated.objects[0].properties[0].identityRole).toBe(
+      "OBJECT_IDENTIFIER",
+    );
+    repository.close();
+  });
 });
 
 function scannedTable(id: string, name: string): PhysicalTable {

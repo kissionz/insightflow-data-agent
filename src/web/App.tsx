@@ -798,6 +798,8 @@ function OntologyPage({
 }) {
   const [selected, setSelected] = useState<string[]>([]);
   const [validation, setValidation] = useState<OntologyValidationResult | null>(null);
+  const [pendingDeleteId, setPendingDeleteId] = useState("");
+  const [deletingId, setDeletingId] = useState("");
   const working = ontologyDraft ?? ontology;
   const [focusedId, setFocusedId] = useState(working.objects[0]?.id ?? "");
   const available = tables.filter((table) => table.status === "UNMODELED");
@@ -878,6 +880,32 @@ function OntologyPage({
       onError(asMessage(reason));
     }
   }
+  async function removeObject(object: OntologyObject) {
+    setDeletingId(object.id);
+    try {
+      const result = await api.deleteOntologyObject(object.id);
+      onState((previous) =>
+        previous
+          ? {
+              ...previous,
+              ontologyDraft: result.ontology,
+              tables: result.tables,
+            }
+          : previous,
+      );
+      setValidation(result.validation);
+      setFocusedId((current) =>
+        result.ontology.objects.some((candidate) => candidate.id === current)
+          ? current
+          : (result.ontology.objects[0]?.id ?? ""),
+      );
+      setPendingDeleteId("");
+    } catch (reason) {
+      onError(asMessage(reason));
+    } finally {
+      setDeletingId("");
+    }
+  }
   return (
     <div className="management-content">
       <div className="stats-row">
@@ -899,23 +927,58 @@ function OntologyPage({
           </div>
           {working.objects.length ? (
             working.objects.map((object) => (
-              <button
-                className={`ontology-object ${
-                  focusedObject?.id === object.id ? "selected" : ""
+              <div
+                className={`ontology-object-row ${drafting ? "editable" : ""} ${
+                  pendingDeleteId === object.id ? "confirming" : ""
                 }`}
                 key={object.id}
-                onClick={() => setFocusedId(object.id)}
-                aria-pressed={focusedObject?.id === object.id}
               >
-                <span className="object-icon">
-                  <CirclesFour size={18} />
-                </span>
-                <span>
-                  <strong>{object.label}</strong>
-                  <small>{object.name} · {object.properties.length} 个属性</small>
-                </span>
-                <CaretRight size={16} />
-              </button>
+                <button
+                  className={`ontology-object ${
+                    focusedObject?.id === object.id ? "selected" : ""
+                  }`}
+                  onClick={() => setFocusedId(object.id)}
+                  aria-pressed={focusedObject?.id === object.id}
+                >
+                  <span className="object-icon">
+                    <CirclesFour size={18} />
+                  </span>
+                  <span>
+                    <strong>{object.label}</strong>
+                    <small>{object.name} · {object.properties.length} 个属性</small>
+                  </span>
+                  <CaretRight size={16} />
+                </button>
+                {drafting && pendingDeleteId !== object.id && (
+                  <button
+                    className="ontology-object-delete"
+                    onClick={() => setPendingDeleteId(object.id)}
+                    aria-label={`删除对象 ${object.label}`}
+                    title="从草稿移除对象"
+                  >
+                    <Trash size={15} />
+                  </button>
+                )}
+                {pendingDeleteId === object.id && (
+                  <div className="object-delete-confirm">
+                    <span>同时移除指标和关系，来源表回到待建模。</span>
+                    <button
+                      className="subtle-button"
+                      onClick={() => setPendingDeleteId("")}
+                      disabled={deletingId === object.id}
+                    >
+                      取消
+                    </button>
+                    <button
+                      className="subtle-button danger-text"
+                      onClick={() => void removeObject(object)}
+                      disabled={deletingId === object.id}
+                    >
+                      {deletingId === object.id ? "移除中" : "确认移除"}
+                    </button>
+                  </div>
+                )}
+              </div>
             ))
           ) : (
             <div className="ontology-empty">
@@ -939,6 +1002,7 @@ function OntologyPage({
           </div>
           {focusedObject ? (
             <OntologyObjectInspector
+              key={`${working.version}-${working.objects.length}-${working.metrics.length}-${working.relations.length}-${focusedObject.id}`}
               object={focusedObject}
               ontology={working}
               tables={tables}
@@ -1087,7 +1151,7 @@ function OntologyObjectInspector({
     <div className="object-detail">
       <div className="object-summary">
         <div>
-          <span>对象标识</span>
+          <span>对象编码</span>
           <strong>{object.name}</strong>
         </div>
         <div>
@@ -1110,7 +1174,8 @@ function OntologyObjectInspector({
             <tr>
               <th>业务名称</th>
               <th>物理字段</th>
-              <th>类型</th>
+              <th>语义类型</th>
+              <th>业务角色</th>
               <th>可见性</th>
             </tr>
           </thead>
@@ -1119,7 +1184,28 @@ function OntologyObjectInspector({
               <tr key={property.id}>
                 <td><strong>{property.label}</strong><small>{property.name}</small></td>
                 <td>{property.sourceColumn}</td>
-                <td><code>{property.dataType}</code></td>
+                <td>
+                  <strong>{propertySemanticTypeLabel(property.semanticType)}</strong>
+                  <small>{property.dataType}</small>
+                </td>
+                <td>
+                  <div className="property-role-summary">
+                    {property.identityRole !== "NONE" && (
+                      <span>{propertyIdentityRoleLabel(property.identityRole)}</span>
+                    )}
+                    {relations.some(
+                      (relation) =>
+                        relation.sourcePropertyId === property.id ||
+                        relation.targetPropertyId === property.id,
+                    ) && <span className="relation">关联键</span>}
+                    {property.identityRole === "NONE" &&
+                      !relations.some(
+                        (relation) =>
+                          relation.sourcePropertyId === property.id ||
+                          relation.targetPropertyId === property.id,
+                      ) && <small>普通属性</small>}
+                  </div>
+                </td>
                 <td>{propertyVisibilityLabel(property.visibility)}</td>
               </tr>
             ))}
@@ -1382,7 +1468,7 @@ function OntologyObjectEditor({
                 onChange={(event) => changeObject({ label: event.target.value })}
               />
             </EditorField>
-            <EditorField label="对象标识">
+            <EditorField label="对象编码">
               <input
                 value={draftObject.name}
                 onChange={(event) => changeObject({ name: event.target.value })}
@@ -1415,44 +1501,6 @@ function OntologyObjectEditor({
                 onChange={(event) => changeObject({ description: event.target.value })}
               />
             </EditorField>
-            <EditorField label="主键/业务唯一键">
-              <select
-                multiple
-                value={draftObject.primaryKey}
-                onChange={(event) =>
-                  changeObject({
-                    primaryKey: [...event.target.selectedOptions].map(
-                      (option) => option.value,
-                    ),
-                  })
-                }
-              >
-                {draftObject.properties.map((property) => (
-                  <option key={property.id} value={property.id}>
-                    {property.label} ({property.sourceColumn})
-                  </option>
-                ))}
-              </select>
-            </EditorField>
-            <EditorField label="默认时间字段">
-              <select
-                value={draftObject.defaultTimePropertyId ?? ""}
-                onChange={(event) =>
-                  changeObject({
-                    defaultTimePropertyId: event.target.value || undefined,
-                  })
-                }
-              >
-                <option value="">不设置</option>
-                {draftObject.properties
-                  .filter((property) => property.semanticType === "TIME")
-                  .map((property) => (
-                    <option key={property.id} value={property.id}>
-                      {property.label}
-                    </option>
-                  ))}
-              </select>
-            </EditorField>
             <EditorField label="对象同义词" wide>
               <input
                 value={draftObject.synonyms.join("、")}
@@ -1470,98 +1518,129 @@ function OntologyObjectEditor({
         <div className="editor-section property-editor">
           <div className="editor-help">
             <Info size={16} />
-            分析属性进入语义索引；仅明细展示由查询执行器自动补充；完全隐藏不会索引或展示。
+            语义类型描述字段含义，身份角色定义对象标识；关联键由关系配置自动生成。
           </div>
           <div className="property-edit-table">
             <div className="property-edit-row header">
-              <span>业务名称</span><span>物理字段</span><span>语义类型</span><span>可见性</span>
+              <span>业务名称</span><span>物理字段</span><span>语义类型</span><span>业务角色</span><span>可见性</span>
             </div>
-            {draftObject.properties.map((property) => (
-              <div className="property-edit-row" key={property.id}>
-                <input
-                  value={property.label}
-                  onChange={(event) =>
-                    changeProperty(property.id, { label: event.target.value })
-                  }
-                />
-                <div className="physical-field">
-                  <code>{property.sourceColumn}</code>
-                  <small>{property.dataType}</small>
+            {draftObject.properties.map((property) => {
+              const relationUses = draftRelations.filter(
+                (relation) =>
+                  relation.sourcePropertyId === property.id ||
+                  relation.targetPropertyId === property.id,
+              );
+              return (
+                <div className="property-edit-row" key={property.id}>
+                  <input
+                    value={property.label}
+                    onChange={(event) =>
+                      changeProperty(property.id, { label: event.target.value })
+                    }
+                  />
+                  <div className="physical-field">
+                    <code>{property.sourceColumn}</code>
+                    <small>{property.dataType}</small>
+                  </div>
+                  <select
+                    value={property.semanticType}
+                    onChange={(event) =>
+                      changeProperty(property.id, {
+                        semanticType: event.target
+                          .value as OntologyObject["properties"][number]["semanticType"],
+                      })
+                    }
+                  >
+                    {PROPERTY_TYPES.map((type) => (
+                      <option key={type} value={type}>
+                        {propertySemanticTypeLabel(type)}
+                      </option>
+                    ))}
+                  </select>
+                  <div className="property-role-cell">
+                    <select
+                      value={property.identityRole}
+                      onChange={(event) =>
+                        changeProperty(property.id, {
+                          identityRole: event.target
+                            .value as OntologyObject["properties"][number]["identityRole"],
+                        })
+                      }
+                    >
+                      <option value="NONE">普通属性</option>
+                      <option value="OBJECT_IDENTIFIER">对象标识</option>
+                      <option value="BUSINESS_KEY">业务唯一键</option>
+                    </select>
+                    {relationUses.map((relation) => (
+                      <span
+                        className="relation-role-badge"
+                        key={relation.id}
+                        title={relation.name}
+                      >
+                        <LinkIcon size={11} /> 关联键
+                      </span>
+                    ))}
+                  </div>
+                  <select
+                    value={property.visibility}
+                    onChange={(event) =>
+                      changeProperty(property.id, {
+                        visibility: event.target
+                          .value as OntologyObject["properties"][number]["visibility"],
+                      })
+                    }
+                  >
+                    <option value="ANALYTICAL">分析属性</option>
+                    <option value="DETAIL_ONLY">仅明细展示</option>
+                    <option value="HIDDEN">完全隐藏</option>
+                  </select>
+                  <textarea
+                    rows={2}
+                    value={property.description}
+                    placeholder="属性口径说明"
+                    onChange={(event) =>
+                      changeProperty(property.id, { description: event.target.value })
+                    }
+                  />
+                  <input
+                    value={property.synonyms.join("、")}
+                    placeholder="同义词"
+                    disabled={property.visibility !== "ANALYTICAL"}
+                    onChange={(event) =>
+                      changeProperty(property.id, {
+                        synonyms: splitTerms(event.target.value),
+                      })
+                    }
+                  />
+                  <label className="inline-check">
+                    <input
+                      type="checkbox"
+                      checked={property.defaultDisplay}
+                      disabled={property.visibility !== "DETAIL_ONLY"}
+                      onChange={(event) =>
+                        changeProperty(property.id, {
+                          defaultDisplay: event.target.checked,
+                        })
+                      }
+                    />
+                    明细默认展示
+                  </label>
+                  <label className="inline-check">
+                    <input
+                      type="checkbox"
+                      checked={property.exportable}
+                      disabled={property.visibility === "HIDDEN"}
+                      onChange={(event) =>
+                        changeProperty(property.id, {
+                          exportable: event.target.checked,
+                        })
+                      }
+                    />
+                    允许导出
+                  </label>
                 </div>
-                <select
-                  value={property.semanticType}
-                  onChange={(event) =>
-                    changeProperty(property.id, {
-                      semanticType: event.target
-                        .value as OntologyObject["properties"][number]["semanticType"],
-                    })
-                  }
-                >
-                  {PROPERTY_TYPES.map((type) => (
-                    <option key={type} value={type}>
-                      {propertySemanticTypeLabel(type)}
-                    </option>
-                  ))}
-                </select>
-                <select
-                  value={property.visibility}
-                  onChange={(event) =>
-                    changeProperty(property.id, {
-                      visibility: event.target
-                        .value as OntologyObject["properties"][number]["visibility"],
-                    })
-                  }
-                >
-                  <option value="ANALYTICAL">分析属性</option>
-                  <option value="DETAIL_ONLY">仅明细展示</option>
-                  <option value="HIDDEN">完全隐藏</option>
-                </select>
-                <textarea
-                  rows={2}
-                  value={property.description}
-                  placeholder="属性口径说明"
-                  onChange={(event) =>
-                    changeProperty(property.id, { description: event.target.value })
-                  }
-                />
-                <input
-                  value={property.synonyms.join("、")}
-                  placeholder="同义词"
-                  disabled={property.visibility !== "ANALYTICAL"}
-                  onChange={(event) =>
-                    changeProperty(property.id, {
-                      synonyms: splitTerms(event.target.value),
-                    })
-                  }
-                />
-                <label className="inline-check">
-                  <input
-                    type="checkbox"
-                    checked={property.defaultDisplay}
-                    disabled={property.visibility !== "DETAIL_ONLY"}
-                    onChange={(event) =>
-                      changeProperty(property.id, {
-                        defaultDisplay: event.target.checked,
-                      })
-                    }
-                  />
-                  明细默认展示
-                </label>
-                <label className="inline-check">
-                  <input
-                    type="checkbox"
-                    checked={property.exportable}
-                    disabled={property.visibility === "HIDDEN"}
-                    onChange={(event) =>
-                      changeProperty(property.id, {
-                        exportable: event.target.checked,
-                      })
-                    }
-                  />
-                  允许导出
-                </label>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </div>
       )}
@@ -1780,6 +1859,25 @@ function OntologyObjectEditor({
       {tab === "rules" && (
         <div className="editor-section">
           <div className="form-grid ontology-form-grid">
+            <EditorField label="默认时间字段">
+              <select
+                value={draftObject.defaultTimePropertyId ?? ""}
+                onChange={(event) =>
+                  changeObject({
+                    defaultTimePropertyId: event.target.value || undefined,
+                  })
+                }
+              >
+                <option value="">不设置</option>
+                {draftObject.properties
+                  .filter((property) => property.semanticType === "TIME")
+                  .map((property) => (
+                    <option key={property.id} value={property.id}>
+                      {property.label}
+                    </option>
+                  ))}
+              </select>
+            </EditorField>
             <EditorField label="默认过滤条件" wide>
               <textarea
                 rows={4}
@@ -2496,6 +2594,16 @@ function propertySemanticTypeLabel(
     QUANTITY: "数量",
     BOOLEAN: "布尔值",
   }[type];
+}
+
+function propertyIdentityRoleLabel(
+  role: OntologyObject["properties"][number]["identityRole"],
+): string {
+  return {
+    NONE: "普通属性",
+    OBJECT_IDENTIFIER: "对象标识",
+    BUSINESS_KEY: "业务唯一键",
+  }[role];
 }
 
 function relationTypeLabel(type: OntologyRelation["type"]): string {

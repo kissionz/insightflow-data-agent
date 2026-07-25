@@ -1365,13 +1365,22 @@ tbody tr:hover {
   font-size: 13px;
 }
 
+.ontology-object-row {
+  margin: 8px;
+}
+
+.ontology-object-row.editable {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 28px;
+  gap: 3px;
+}
+
 .ontology-object {
   display: grid;
-  width: calc(100% - 16px);
+  width: 100%;
   grid-template-columns: 34px minmax(0, 1fr) 16px;
   align-items: center;
   gap: 9px;
-  margin: 8px;
   border-radius: 7px;
   background: transparent;
   padding: 9px;
@@ -1411,6 +1420,44 @@ tbody tr:hover {
   font-size: 9px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.ontology-object-delete {
+  display: grid;
+  width: 28px;
+  place-items: center;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted-2);
+}
+
+.ontology-object-delete:hover {
+  background: color-mix(in oklab, var(--danger), white 92%);
+  color: var(--danger);
+}
+
+.object-delete-confirm {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid color-mix(in oklab, var(--danger), white 80%);
+  border-radius: 7px;
+  background: color-mix(in oklab, var(--danger), white 96%);
+  padding: 7px 8px;
+}
+
+.object-delete-confirm span {
+  color: #7a2e33;
+  font-size: 8px;
+  line-height: 1.35;
+}
+
+.object-delete-confirm .subtle-button {
+  min-height: 24px;
+  padding: 4px 6px;
+  font-size: 8px;
 }
 
 .object-inspector {
@@ -1537,6 +1584,31 @@ tbody tr:hover {
   color: #475467;
   font-size: 8px;
   padding: 2px 4px;
+}
+
+.property-role-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.property-role-summary span {
+  border-radius: 999px;
+  background: var(--blue-soft);
+  color: var(--blue-hover);
+  padding: 2px 6px;
+  font-size: 8px;
+  font-weight: 600;
+}
+
+.property-role-summary span.relation {
+  background: #eef7f2;
+  color: #147a49;
+}
+
+.property-role-summary small {
+  color: var(--muted);
+  font-size: 8px;
 }
 
 .inspector-columns {
@@ -1838,11 +1910,35 @@ tbody tr:hover {
 
 .property-edit-row {
   display: grid;
-  grid-template-columns: 1.1fr 1fr 0.85fr 1fr;
+  grid-template-columns: 1.05fr 0.9fr 0.85fr 0.95fr 0.95fr;
   gap: 8px;
   align-items: center;
   border-top: 1px solid var(--border);
   padding: 9px;
+}
+
+.property-role-cell {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+}
+
+.property-role-cell select {
+  width: 100%;
+}
+
+.relation-role-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  border-radius: 999px;
+  background: #eef7f2;
+  color: #147a49;
+  padding: 2px 6px;
+  font-size: 8px;
+  font-weight: 600;
 }
 
 .property-edit-row.header {

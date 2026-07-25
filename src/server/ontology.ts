@@ -29,6 +29,7 @@ const propertySchema = z.object({
     "QUANTITY",
     "BOOLEAN",
   ]),
+  identityRole: z.enum(["NONE", "OBJECT_IDENTIFIER", "BUSINESS_KEY"]),
   visibility: z.enum(["ANALYTICAL", "DETAIL_ONLY", "HIDDEN"]),
   synonyms: z.array(z.string().trim().min(1).max(120)).max(50),
   format: z.string().max(120).optional(),
@@ -46,7 +47,6 @@ const objectSchema = z.object({
   sourceTableId: z.string().min(1),
   status: entityStatusSchema,
   grain: z.string().max(1_000),
-  primaryKey: z.array(z.string().min(1)).max(20),
   defaultTimePropertyId: z.string().min(1).optional(),
   defaultFilter: z.string().max(4_000).optional(),
   category: z.string().max(120).optional(),
@@ -143,31 +143,36 @@ export function addTablesToDraft(
   draft: OntologySnapshot,
   selected: PhysicalTable[],
 ): OntologySnapshot {
+  const next = structuredClone(draft);
   return {
-    ...structuredClone(draft),
+    ...next,
     objects: [
-      ...draft.objects,
+      ...next.objects,
       ...selected.map<OntologyObject>((table) => {
-        const properties = table.columns.map((column, index) => ({
-          id: createId("property"),
-          name: column.name,
-          label: column.comment || column.name,
-          description: column.comment || "",
-          dataType: column.dataType,
-          sourceColumn: column.name,
-          sensitive: column.sensitive,
-          semanticType: inferSemanticType(column.name, column.dataType),
-          visibility: column.sensitive ? ("HIDDEN" as const) : ("ANALYTICAL" as const),
-          synonyms: [],
-          detailOrder: index + 1,
-          defaultDisplay: true,
-          exportable: !column.sensitive,
-        }));
+        const properties: OntologyObject["properties"] = table.columns.map(
+          (column, index) => ({
+            id: createId("property"),
+            name: column.name,
+            label: column.comment || column.name,
+            description: column.comment || "",
+            dataType: column.dataType,
+            sourceColumn: column.name,
+            sensitive: column.sensitive,
+            semanticType: inferSemanticType(column.name, column.dataType),
+            identityRole: "NONE",
+            visibility: column.sensitive ? "HIDDEN" : "ANALYTICAL",
+            synonyms: [],
+            detailOrder: index + 1,
+            defaultDisplay: true,
+            exportable: !column.sensitive,
+          }),
+        );
         const primaryCandidate = properties.find(
           (property) =>
             property.name === "id" ||
             property.name === `${table.name.replace(/^(dim|fact)_/, "").replace(/s$/, "")}_id`,
         );
+        if (primaryCandidate) primaryCandidate.identityRole = "OBJECT_IDENTIFIER";
         return {
           id: createId("object"),
           name: table.name.replace(/^(dim|fact)_/, "").replace(/s$/, ""),
@@ -176,7 +181,6 @@ export function addTablesToDraft(
           sourceTableId: table.id,
           status: "DRAFT",
           grain: "",
-          primaryKey: primaryCandidate ? [primaryCandidate.id] : [],
           defaultTimePropertyId: properties.find(
             (property) => property.semanticType === "TIME",
           )?.id,
@@ -266,6 +270,28 @@ export function applyObjectEdit(
   };
 }
 
+export function removeObjectFromDraft(
+  draft: OntologySnapshot,
+  objectId: string,
+): { ontology: OntologySnapshot; sourceTableId: string } {
+  const next = structuredClone(draft);
+  const object = next.objects.find((candidate) => candidate.id === objectId);
+  if (!object) throw new Error("草稿对象不存在");
+  return {
+    sourceTableId: object.sourceTableId,
+    ontology: {
+      ...next,
+      objects: next.objects.filter((candidate) => candidate.id !== objectId),
+      metrics: next.metrics.filter((metric) => metric.objectId !== objectId),
+      relations: next.relations.filter(
+        (relation) =>
+          relation.sourceObjectId !== objectId &&
+          relation.targetObjectId !== objectId,
+      ),
+    },
+  };
+}
+
 export function validateOntology(
   snapshot: OntologySnapshot,
   tables: PhysicalTable[],
@@ -290,10 +316,18 @@ export function validateOntology(
     if (!object.grain.trim()) {
       issues.push(error("GRAIN_REQUIRED", "请填写对象粒度", object.id));
     }
-    if (!object.primaryKey.length) {
-      issues.push(error("PRIMARY_KEY_REQUIRED", "请配置主键或业务唯一键", object.id));
-    } else if (object.primaryKey.some((id) => !propertyIds.has(id))) {
-      issues.push(error("PRIMARY_KEY_INVALID", "主键引用了不存在的属性", object.id));
+    if (
+      !object.properties.some(
+        (property) => property.identityRole === "OBJECT_IDENTIFIER",
+      )
+    ) {
+      issues.push(
+        error(
+          "OBJECT_IDENTIFIER_REQUIRED",
+          "请至少将一个属性标记为对象标识",
+          object.id,
+        ),
+      );
     }
     if (
       object.defaultTimePropertyId &&

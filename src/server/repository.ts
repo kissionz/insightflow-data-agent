@@ -285,22 +285,33 @@ function normalizeOntology(snapshot: OntologySnapshot): OntologySnapshot {
     baseVersion:
       snapshot.baseVersion ??
       (snapshot.status === "DRAFT" ? Math.max(0, snapshot.version - 1) : undefined),
-    objects: snapshot.objects.map((object) => ({
-      ...object,
-      grain: object.grain ?? "",
-      primaryKey: object.primaryKey ?? [],
-      exampleQuestions: object.exampleQuestions ?? [],
-      properties: object.properties.map((property, index) => ({
-        ...property,
-        description: property.description ?? "",
-        semanticType: property.semanticType ?? inferSemanticType(property.name, property.dataType),
-        visibility: property.visibility ?? "ANALYTICAL",
-        synonyms: property.synonyms ?? [],
-        detailOrder: property.detailOrder ?? index + 1,
-        defaultDisplay: property.defaultDisplay ?? true,
-        exportable: property.exportable ?? true,
-      })),
-    })),
+    objects: snapshot.objects.map((object) => {
+      const legacyIdentifiers = new Set(object.primaryKey ?? []);
+      const currentObject = { ...object };
+      delete currentObject.primaryKey;
+      return {
+        ...currentObject,
+        grain: object.grain ?? "",
+        exampleQuestions: object.exampleQuestions ?? [],
+        properties: object.properties.map((property, index) => ({
+          ...property,
+          description: property.description ?? "",
+          semanticType:
+            property.semanticType ??
+            inferSemanticType(property.name, property.dataType),
+          identityRole:
+            property.identityRole ??
+            (legacyIdentifiers.has(property.id)
+              ? "OBJECT_IDENTIFIER"
+              : "NONE"),
+          visibility: property.visibility ?? "ANALYTICAL",
+          synonyms: property.synonyms ?? [],
+          detailOrder: property.detailOrder ?? index + 1,
+          defaultDisplay: property.defaultDisplay ?? true,
+          exportable: property.exportable ?? true,
+        })),
+      };
+    }),
     relations: snapshot.relations.map((relation) => ({
       ...relation,
       direction: relation.direction ?? "BIDIRECTIONAL",

@@ -13,12 +13,17 @@ export const testOntology: OntologySnapshot = {
       sourceTableId: "t_orders",
       status: "PUBLISHED",
       grain: "一行代表一个订单",
-      primaryKey: ["p_order_id"],
       defaultTimePropertyId: undefined,
       exampleQuestions: [],
       synonyms: ["交易", "销售订单"],
       properties: [
-        property("p_order_id", "order_id", "订单编号", "BIGINT"),
+        property(
+          "p_order_id",
+          "order_id",
+          "订单编号",
+          "BIGINT",
+          "OBJECT_IDENTIFIER",
+        ),
         property("p_order_amount", "pay_amount", "实付金额", "DECIMAL"),
         property("p_store_id", "store_id", "门店编号", "BIGINT"),
         property("p_customer_id", "customer_id", "客户编号", "BIGINT"),
@@ -32,11 +37,16 @@ export const testOntology: OntologySnapshot = {
       sourceTableId: "t_customers",
       status: "PUBLISHED",
       grain: "一行代表一个客户",
-      primaryKey: ["p_customer_id"],
       exampleQuestions: [],
       synonyms: ["会员"],
       properties: [
-        property("p_customer_id", "customer_id", "客户编号", "BIGINT"),
+        property(
+          "p_customer_id",
+          "customer_id",
+          "客户编号",
+          "BIGINT",
+          "OBJECT_IDENTIFIER",
+        ),
         property("p_customer_level", "member_level", "会员等级", "VARCHAR"),
       ],
     },
@@ -48,11 +58,16 @@ export const testOntology: OntologySnapshot = {
       sourceTableId: "t_stores",
       status: "PUBLISHED",
       grain: "一行代表一个门店",
-      primaryKey: ["p_store_id"],
       exampleQuestions: [],
       synonyms: ["店铺"],
       properties: [
-        property("p_store_id", "store_id", "门店编号", "BIGINT"),
+        property(
+          "p_store_id",
+          "store_id",
+          "门店编号",
+          "BIGINT",
+          "OBJECT_IDENTIFIER",
+        ),
       ],
     },
   ],
@@ -108,7 +123,13 @@ export const testOntology: OntologySnapshot = {
   ],
 };
 
-function property(id: string, name: string, label: string, dataType: string) {
+function property(
+  id: string,
+  name: string,
+  label: string,
+  dataType: string,
+  identityRole: "NONE" | "OBJECT_IDENTIFIER" | "BUSINESS_KEY" = "NONE",
+) {
   return {
     id,
     name,
@@ -118,6 +139,7 @@ function property(id: string, name: string, label: string, dataType: string) {
     sensitive: false,
     description: "",
     semanticType: name.endsWith("_id") ? ("IDENTIFIER" as const) : ("DIMENSION" as const),
+    identityRole,
     visibility: "ANALYTICAL" as const,
     synonyms: [],
     detailOrder: 1,

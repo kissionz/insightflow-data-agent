@@ -3,6 +3,7 @@ import {
   createDraftFromPublished,
   metricExpression,
   publishDraft,
+  removeObjectFromDraft,
   validateOntology,
 } from "../src/server/ontology.js";
 import { testOntology } from "./fixtures.js";
@@ -36,6 +37,7 @@ describe("ontology lifecycle", () => {
   it("blocks publishing an incomplete object", () => {
     const draft = createDraftFromPublished(testOntology);
     draft.objects[0].grain = "";
+    draft.objects[0].properties[0].identityRole = "NONE";
 
     const result = validateOntology(
       draft,
@@ -54,6 +56,32 @@ describe("ontology lifecycle", () => {
 
     expect(result.valid).toBe(false);
     expect(result.issues.some((issue) => issue.code === "GRAIN_REQUIRED")).toBe(true);
+    expect(
+      result.issues.some(
+        (issue) => issue.code === "OBJECT_IDENTIFIER_REQUIRED",
+      ),
+    ).toBe(true);
+  });
+
+  it("removes an object together with its metrics and relations", () => {
+    const draft = createDraftFromPublished(testOntology);
+    const removed = removeObjectFromDraft(draft, "o_order");
+
+    expect(removed.sourceTableId).toBe("t_orders");
+    expect(
+      removed.ontology.objects.some((object) => object.id === "o_order"),
+    ).toBe(false);
+    expect(
+      removed.ontology.metrics.some((metric) => metric.objectId === "o_order"),
+    ).toBe(false);
+    expect(
+      removed.ontology.relations.some(
+        (relation) =>
+          relation.sourceObjectId === "o_order" ||
+          relation.targetObjectId === "o_order",
+      ),
+    ).toBe(false);
+    expect(draft.objects.some((object) => object.id === "o_order")).toBe(true);
   });
 
   it("rejects metrics and relations that expose detail-only properties", () => {

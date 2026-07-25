@@ -22,6 +22,7 @@ import {
   createDraftFromPublished,
   objectEditSchema,
   publishDraft,
+  removeObjectFromDraft,
   validateOntology,
 } from "./ontology.js";
 import { Repository } from "./repository.js";
@@ -259,6 +260,33 @@ app.put<{ Params: { id: string }; Body: unknown }>(
   },
 );
 
+app.delete<{ Params: { id: string } }>(
+  "/api/ontology/draft/objects/:id",
+  async (request, reply) => {
+    const draft = repository.getDraftOntology();
+    if (!draft) {
+      return reply.code(409).send({ message: "请先创建编辑草稿" });
+    }
+    try {
+      const removed = removeObjectFromDraft(draft, request.params.id);
+      repository.saveOntology(removed.ontology);
+      repository.updateTableStatuses([removed.sourceTableId], "UNMODELED");
+      return {
+        ontology: removed.ontology,
+        tables: repository.getTables(),
+        validation: validateOntology(
+          removed.ontology,
+          repository.getTables(),
+        ),
+      };
+    } catch (error) {
+      return reply.code(422).send({
+        message: error instanceof Error ? error.message : "删除对象失败",
+      });
+    }
+  },
+);
+
 app.post("/api/ontology/draft/validate", async (_request, reply) => {
   const draft = repository.getDraftOntology();
   if (!draft) return reply.code(409).send({ message: "当前没有本体草稿" });
@@ -268,14 +296,19 @@ app.post("/api/ontology/draft/validate", async (_request, reply) => {
 app.delete("/api/ontology/draft", async (_request, reply) => {
   const draft = repository.getDraftOntology();
   if (!draft) return reply.code(409).send({ message: "当前没有本体草稿" });
+  const published = repository.getPublishedOntology();
   repository.deleteDraftOntology();
   const draftingIds = repository
     .getTables()
     .filter((table) => table.status === "DRAFTING")
     .map((table) => table.id);
   repository.updateTableStatuses(draftingIds, "UNMODELED");
+  repository.updateTableStatuses(
+    published.objects.map((object) => object.sourceTableId),
+    "MODELED",
+  );
   return {
-    ontology: repository.getPublishedOntology(),
+    ontology: published,
     tables: repository.getTables(),
   };
 });
@@ -294,11 +327,10 @@ app.post("/api/ontology/publish", async (_request, reply) => {
   }
   const published = publishDraft(current);
   repository.saveOntology(published);
-  const draftingIds = repository
-    .getTables()
-    .filter((table) => table.status === "DRAFTING")
-    .map((table) => table.id);
-  repository.updateTableStatuses(draftingIds, "MODELED");
+  repository.updateTableStatuses(
+    published.objects.map((object) => object.sourceTableId),
+    "MODELED",
+  );
   return {
     ontology: published,
     tables: repository.getTables(),

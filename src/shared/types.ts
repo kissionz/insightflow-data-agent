@@ -124,6 +124,11 @@ export type OntologyEntityStatus =
 
 export type PropertyVisibility = "ANALYTICAL" | "DETAIL_ONLY" | "HIDDEN";
 
+export type PropertyIdentityRole =
+  | "NONE"
+  | "OBJECT_IDENTIFIER"
+  | "BUSINESS_KEY";
+
 export type PropertySemanticType =
   | "IDENTIFIER"
   | "DIMENSION"
@@ -143,6 +148,7 @@ export interface OntologyProperty {
   sourceColumn: string;
   sensitive: boolean;
   semanticType: PropertySemanticType;
+  identityRole: PropertyIdentityRole;
   visibility: PropertyVisibility;
   synonyms: string[];
   format?: string;
@@ -160,7 +166,8 @@ export interface OntologyObject {
   sourceTableId: string;
   status: OntologyEntityStatus;
   grain: string;
-  primaryKey: string[];
+  /** @deprecated Legacy snapshots are migrated to property.identityRole at read time. */
+  primaryKey?: string[];
   defaultTimePropertyId?: string;
   defaultFilter?: string;
   category?: string;

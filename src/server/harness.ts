@@ -283,6 +283,7 @@ export class DataAgentHarness {
                 dataType: property.dataType,
                 sensitive: property.sensitive,
                 semanticType: property.semanticType,
+                identityRole: property.identityRole,
               })),
           })),
           metrics: metrics.map((metric) => ({

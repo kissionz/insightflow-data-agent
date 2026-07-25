@@ -72,6 +72,14 @@ export const api = {
       method: "PUT",
       body: JSON.stringify({ object, metrics, relations }),
     }),
+  deleteOntologyObject: (objectId: string) =>
+    request<{
+      ontology: OntologySnapshot;
+      tables: PhysicalTable[];
+      validation: OntologyValidationResult;
+    }>(`/api/ontology/draft/objects/${objectId}`, {
+      method: "DELETE",
+    }),
   validateOntologyDraft: () =>
     request<OntologyValidationResult>("/api/ontology/draft/validate", {
       method: "POST",

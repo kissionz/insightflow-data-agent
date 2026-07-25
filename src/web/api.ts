@@ -3,7 +3,11 @@ import type {
   Conversation,
   DataAgentEvent,
   DataSourceInput,
+  Metric,
+  OntologyObject,
+  OntologyRelation,
   OntologySnapshot,
+  OntologyValidationResult,
   PhysicalTable,
   SafeDataSourceConfig,
   Turn,
@@ -52,8 +56,37 @@ export const api = {
       "/api/ontology/drafts",
       { method: "POST", body: JSON.stringify({ tableIds }) },
     ),
-  publishOntology: () =>
+  createOntologyDraft: () =>
+    request<{ ontology: OntologySnapshot }>("/api/ontology/draft", {
+      method: "POST",
+    }),
+  saveOntologyObject: (
+    object: OntologyObject,
+    metrics: Metric[],
+    relations: OntologyRelation[],
+  ) =>
+    request<{
+      ontology: OntologySnapshot;
+      validation: OntologyValidationResult;
+    }>(`/api/ontology/draft/objects/${object.id}`, {
+      method: "PUT",
+      body: JSON.stringify({ object, metrics, relations }),
+    }),
+  validateOntologyDraft: () =>
+    request<OntologyValidationResult>("/api/ontology/draft/validate", {
+      method: "POST",
+    }),
+  discardOntologyDraft: () =>
     request<{ ontology: OntologySnapshot; tables: PhysicalTable[] }>(
+      "/api/ontology/draft",
+      { method: "DELETE" },
+    ),
+  publishOntology: () =>
+    request<{
+      ontology: OntologySnapshot;
+      tables: PhysicalTable[];
+      validation: OntologyValidationResult;
+    }>(
       "/api/ontology/publish",
       { method: "POST" },
     ),

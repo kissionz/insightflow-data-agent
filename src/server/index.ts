@@ -16,6 +16,14 @@ import { EventHub } from "./events.js";
 import { DataAgentHarness } from "./harness.js";
 import { createId } from "./id.js";
 import { credentialStoreKind, KeychainStore } from "./keychain.js";
+import {
+  addTablesToDraft,
+  applyObjectEdit,
+  createDraftFromPublished,
+  objectEditSchema,
+  publishDraft,
+  validateOntology,
+} from "./ontology.js";
 import { Repository } from "./repository.js";
 import { SelectDbClient } from "./selectdb.js";
 
@@ -55,7 +63,8 @@ app.get("/api/bootstrap", async () => {
   const montaneRuntime = await harness.runtimeStatus();
   return {
     conversations: repository.getConversations(),
-    ontology: repository.getOntology(),
+    ontology: repository.getPublishedOntology(),
+    ontologyDraft: repository.getDraftOntology() ?? undefined,
     tables: repository.getTables(),
     dataSource,
     runtime: {
@@ -202,33 +211,10 @@ app.post<{ Body: { tableIds: string[] } }>("/api/ontology/drafts", async (reques
     return reply.code(400).send({ message: "请选择尚未建模的表" });
   }
 
-  const current = repository.getOntology();
-  const draft: OntologySnapshot = {
-    ...structuredClone(current),
-    version: current.version + 1,
-    status: "DRAFT",
-    publishedAt: undefined,
-    objects: [
-      ...current.objects,
-      ...selected.map<OntologyObject>((table) => ({
-        id: createId("object"),
-        name: table.name.replace(/^(dim|fact)_/, "").replace(/s$/, ""),
-        label: table.description?.replace(/表$/, "") || table.name,
-        description: `基于 ${table.database}.${table.name} 自动生成的本体草稿`,
-        sourceTableId: table.id,
-        status: "DRAFT",
-        synonyms: [],
-        properties: table.columns.map((column) => ({
-          id: createId("property"),
-          name: column.name,
-          label: column.comment || column.name,
-          dataType: column.dataType,
-          sourceColumn: column.name,
-          sensitive: column.sensitive,
-        })),
-      })),
-    ],
-  };
+  const base =
+    repository.getDraftOntology() ??
+    createDraftFromPublished(repository.getPublishedOntology());
+  const draft = addTablesToDraft(base, selected);
   repository.saveOntology(draft);
   repository.updateTableStatuses(
     selected.map((table) => table.id),
@@ -237,35 +223,87 @@ app.post<{ Body: { tableIds: string[] } }>("/api/ontology/drafts", async (reques
   return { ontology: draft, tables: repository.getTables() };
 });
 
+app.post("/api/ontology/draft", async () => {
+  const draft =
+    repository.getDraftOntology() ??
+    createDraftFromPublished(repository.getPublishedOntology());
+  repository.saveOntology(draft);
+  return { ontology: draft };
+});
+
+app.put<{ Params: { id: string }; Body: unknown }>(
+  "/api/ontology/draft/objects/:id",
+  async (request, reply) => {
+    const draft = repository.getDraftOntology();
+    if (!draft) {
+      return reply.code(409).send({ message: "请先创建编辑草稿" });
+    }
+    const parsed = objectEditSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({
+        message: parsed.error.issues[0]?.message || "对象配置不完整",
+      });
+    }
+    try {
+      const updated = applyObjectEdit(draft, request.params.id, parsed.data);
+      repository.saveOntology(updated);
+      return {
+        ontology: updated,
+        validation: validateOntology(updated, repository.getTables()),
+      };
+    } catch (error) {
+      return reply.code(422).send({
+        message: error instanceof Error ? error.message : "保存对象失败",
+      });
+    }
+  },
+);
+
+app.post("/api/ontology/draft/validate", async (_request, reply) => {
+  const draft = repository.getDraftOntology();
+  if (!draft) return reply.code(409).send({ message: "当前没有本体草稿" });
+  return validateOntology(draft, repository.getTables());
+});
+
+app.delete("/api/ontology/draft", async (_request, reply) => {
+  const draft = repository.getDraftOntology();
+  if (!draft) return reply.code(409).send({ message: "当前没有本体草稿" });
+  repository.deleteDraftOntology();
+  const draftingIds = repository
+    .getTables()
+    .filter((table) => table.status === "DRAFTING")
+    .map((table) => table.id);
+  repository.updateTableStatuses(draftingIds, "UNMODELED");
+  return {
+    ontology: repository.getPublishedOntology(),
+    tables: repository.getTables(),
+  };
+});
+
 app.post("/api/ontology/publish", async (_request, reply) => {
-  const current = repository.getOntology();
-  if (current.status !== "DRAFT") {
+  const current = repository.getDraftOntology();
+  if (!current) {
     return reply.code(409).send({ message: "当前没有待发布的本体草稿" });
   }
-  const published: OntologySnapshot = {
-    ...current,
-    status: "PUBLISHED",
-    publishedAt: new Date().toISOString(),
-    objects: current.objects.map((object) => ({
-      ...object,
-      status: object.status === "DRAFT" ? "PUBLISHED" : object.status,
-    })),
-    relations: current.relations.map((relation) => ({
-      ...relation,
-      status: relation.status === "DRAFT" ? "PUBLISHED" : relation.status,
-    })),
-    metrics: current.metrics.map((metric) => ({
-      ...metric,
-      status: metric.status === "DRAFT" ? "PUBLISHED" : metric.status,
-    })),
-  };
+  const validation = validateOntology(current, repository.getTables());
+  if (!validation.valid) {
+    return reply.code(422).send({
+      message: `发布校验失败：${validation.issues.find((issue) => issue.level === "ERROR")?.message}`,
+      validation,
+    });
+  }
+  const published = publishDraft(current);
   repository.saveOntology(published);
   const draftingIds = repository
     .getTables()
     .filter((table) => table.status === "DRAFTING")
     .map((table) => table.id);
   repository.updateTableStatuses(draftingIds, "MODELED");
-  return { ontology: published, tables: repository.getTables() };
+  return {
+    ontology: published,
+    tables: repository.getTables(),
+    validation,
+  };
 });
 
 const webRoot = path.resolve("dist/web");

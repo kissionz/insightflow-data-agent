@@ -22,4 +22,20 @@ describe("SemanticIndex", () => {
       "r_order_store",
     ]);
   });
+
+  it("does not index detail-only or hidden properties", () => {
+    const ontology = structuredClone(testOntology);
+    ontology.objects[0].properties[1] = {
+      ...ontology.objects[0].properties[1],
+      name: "detail_secret_code",
+      label: "仅展示编码",
+      synonyms: ["内部展示码"],
+      visibility: "DETAIL_ONLY",
+    };
+    const isolated = new SemanticIndex(ontology);
+
+    expect(
+      isolated.search("内部展示码").some((match) => match.id === "o_order"),
+    ).toBe(false);
+  });
 });

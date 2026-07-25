@@ -18,6 +18,7 @@ import type {
   Turn,
 } from "../shared/types.js";
 import { Repository } from "./repository.js";
+import { appendDetailOnlyProperties } from "./detail-projection.js";
 import { SemanticIndex } from "./semantic-index.js";
 import type { QueryResult } from "./selectdb.js";
 import { guardReadOnlySql } from "./sql-guard.js";
@@ -262,8 +263,9 @@ export class DataAgentHarness {
         );
         const relations = ontology.relations.filter(
           (relation) =>
-            relevantIds.has(relation.sourceObjectId) ||
-            relevantIds.has(relation.targetObjectId),
+            relation.enabled &&
+            (relevantIds.has(relation.sourceObjectId) ||
+              relevantIds.has(relation.targetObjectId)),
         );
         const tables = this.repository.getTables();
         const payload = {
@@ -273,12 +275,15 @@ export class DataAgentHarness {
             id: object.id,
             label: object.label,
             table: tables.find((table) => table.id === object.sourceTableId)?.name,
-            properties: object.properties.map((property) => ({
-              label: property.label,
-              column: property.sourceColumn,
-              dataType: property.dataType,
-              sensitive: property.sensitive,
-            })),
+            properties: object.properties
+              .filter((property) => property.visibility === "ANALYTICAL")
+              .map((property) => ({
+                label: property.label,
+                column: property.sourceColumn,
+                dataType: property.dataType,
+                sensitive: property.sensitive,
+                semanticType: property.semanticType,
+              })),
           })),
           metrics: metrics.map((metric) => ({
             label: metric.label,
@@ -330,10 +335,18 @@ export class DataAgentHarness {
         required: ["sql", "result_kind", "title"],
       },
       execute: async (args): Promise<ToolOutcome> => {
-        const sql = String(args.sql ?? "");
+        const requestedSql = String(args.sql ?? "");
         const resultKind = args.result_kind === "detail" ? "detail" : "aggregate";
         const title = String(args.title ?? "分析结果");
         const maxRows = resultKind === "detail" ? 50 : 200;
+        const sql =
+          resultKind === "detail"
+            ? appendDetailOnlyProperties(
+                requestedSql,
+                this.repository.getPublishedOntology(),
+                this.repository.getTables(),
+              )
+            : requestedSql;
         guardReadOnlySql(sql, maxRows);
 
         const artifact = createLiveResult(

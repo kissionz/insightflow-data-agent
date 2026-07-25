@@ -20,10 +20,13 @@ import {
   Info,
   Link as LinkIcon,
   MagnifyingGlass,
+  FloppyDisk,
+  PencilSimple,
   Plus,
   SealCheck,
   Sparkle,
   Table,
+  Trash,
   Warning,
   X,
 } from "@phosphor-icons/react";
@@ -31,7 +34,11 @@ import type {
   BootstrapPayload,
   Conversation,
   DataSourceInput,
+  Metric,
+  OntologyObject,
+  OntologyRelation,
   OntologySnapshot,
+  OntologyValidationResult,
   PhysicalTable,
   TraceStep,
   Turn,
@@ -756,6 +763,7 @@ function ManagementWorkspace({
       {page === "ontology" && (
         <OntologyPage
           ontology={state.ontology}
+          draft={state.ontologyDraft}
           tables={state.tables}
           onState={onState}
           onError={onError}
@@ -777,35 +785,77 @@ function ManagementWorkspace({
 
 function OntologyPage({
   ontology,
+  draft: ontologyDraft,
   tables,
   onState,
   onError,
 }: {
   ontology: OntologySnapshot;
+  draft?: OntologySnapshot;
   tables: PhysicalTable[];
   onState: React.Dispatch<React.SetStateAction<BootstrapPayload | null>>;
   onError: (message: string) => void;
 }) {
   const [selected, setSelected] = useState<string[]>([]);
-  const [focusedId, setFocusedId] = useState(ontology.objects[0]?.id ?? "");
+  const [validation, setValidation] = useState<OntologyValidationResult | null>(null);
+  const working = ontologyDraft ?? ontology;
+  const [focusedId, setFocusedId] = useState(working.objects[0]?.id ?? "");
   const available = tables.filter((table) => table.status === "UNMODELED");
-  const drafting = ontology.status === "DRAFT";
+  const drafting = Boolean(ontologyDraft);
   const focusedObject =
-    ontology.objects.find((object) => object.id === focusedId) ??
-    ontology.objects[0] ??
+    working.objects.find((object) => object.id === focusedId) ??
+    working.objects[0] ??
     null;
   useEffect(() => {
-    if (!focusedObject && ontology.objects[0]) {
-      setFocusedId(ontology.objects[0].id);
+    if (!focusedObject && working.objects[0]) {
+      setFocusedId(working.objects[0].id);
     }
-  }, [focusedObject, ontology.objects]);
+  }, [focusedObject, working.objects]);
   async function draft() {
     try {
       const result = await api.createDrafts(selected);
       onState((previous) =>
-        previous ? { ...previous, ontology: result.ontology, tables: result.tables } : previous,
+        previous
+          ? { ...previous, ontologyDraft: result.ontology, tables: result.tables }
+          : previous,
       );
       setSelected([]);
+    } catch (reason) {
+      onError(asMessage(reason));
+    }
+  }
+  async function beginEditing() {
+    try {
+      const result = await api.createOntologyDraft();
+      onState((previous) =>
+        previous ? { ...previous, ontologyDraft: result.ontology } : previous,
+      );
+      setValidation(null);
+    } catch (reason) {
+      onError(asMessage(reason));
+    }
+  }
+  async function validate() {
+    try {
+      setValidation(await api.validateOntologyDraft());
+    } catch (reason) {
+      onError(asMessage(reason));
+    }
+  }
+  async function discard() {
+    try {
+      const result = await api.discardOntologyDraft();
+      onState((previous) =>
+        previous
+          ? {
+              ...previous,
+              ontology: result.ontology,
+              ontologyDraft: undefined,
+              tables: result.tables,
+            }
+          : previous,
+      );
+      setValidation(null);
     } catch (reason) {
       onError(asMessage(reason));
     }
@@ -814,8 +864,16 @@ function OntologyPage({
     try {
       const result = await api.publishOntology();
       onState((previous) =>
-        previous ? { ...previous, ontology: result.ontology, tables: result.tables } : previous,
+        previous
+          ? {
+              ...previous,
+              ontology: result.ontology,
+              ontologyDraft: undefined,
+              tables: result.tables,
+            }
+          : previous,
       );
+      setValidation(result.validation);
     } catch (reason) {
       onError(asMessage(reason));
     }
@@ -823,12 +881,12 @@ function OntologyPage({
   return (
     <div className="management-content">
       <div className="stats-row">
-        <StatCard label="业务对象" value={ontology.objects.length} icon={CirclesFour} />
-        <StatCard label="对象关系" value={ontology.relations.length} icon={GitBranch} />
-        <StatCard label="业务指标" value={ontology.metrics.length} icon={ChartBar} />
+        <StatCard label="业务对象" value={working.objects.length} icon={CirclesFour} />
+        <StatCard label="对象关系" value={working.relations.length} icon={GitBranch} />
+        <StatCard label="业务指标" value={working.metrics.length} icon={ChartBar} />
         <StatCard label="当前版本" value={`v${ontology.version}`} icon={SealCheck} />
       </div>
-      <div className="ontology-grid">
+      <div className={`ontology-grid ${drafting ? "editing" : ""}`}>
         <section className="panel ontology-list">
           <div className="panel-heading">
             <div>
@@ -839,8 +897,8 @@ function OntologyPage({
               {drafting ? "草稿待发布" : "已发布"}
             </span>
           </div>
-          {ontology.objects.length ? (
-            ontology.objects.map((object) => (
+          {working.objects.length ? (
+            working.objects.map((object) => (
               <button
                 className={`ontology-object ${
                   focusedObject?.id === object.id ? "selected" : ""
@@ -882,9 +940,17 @@ function OntologyPage({
           {focusedObject ? (
             <OntologyObjectInspector
               object={focusedObject}
-              ontology={ontology}
+              ontology={working}
               tables={tables}
               onSelectObject={setFocusedId}
+              editable={drafting}
+              onSaved={(updated, result) => {
+                onState((previous) =>
+                  previous ? { ...previous, ontologyDraft: updated } : previous,
+                );
+                setValidation(result);
+              }}
+              onError={onError}
             />
           ) : (
             <div className="inspector-empty">
@@ -938,13 +1004,38 @@ function OntologyPage({
           >
             <Sparkle size={17} /> 生成本体草稿
           </button>
-          <button
-            className="primary-button full"
-            disabled={!drafting}
-            onClick={() => void publish()}
-          >
-            <SealCheck size={17} /> 发布 v{ontology.version}
-          </button>
+          {!drafting ? (
+            <button className="primary-button full" onClick={() => void beginEditing()}>
+              <PencilSimple size={17} /> 编辑已发布版本
+            </button>
+          ) : (
+            <>
+              <button className="secondary-button full" onClick={() => void validate()}>
+                <CheckCircle size={17} /> 校验草稿
+              </button>
+              <button className="primary-button full" onClick={() => void publish()}>
+                <SealCheck size={17} /> 发布 v{working.version}
+              </button>
+              <button className="subtle-button full danger-text" onClick={() => void discard()}>
+                <Trash size={16} /> 放弃草稿
+              </button>
+            </>
+          )}
+          {validation && (
+            <div className={`validation-summary ${validation.valid ? "valid" : "invalid"}`}>
+              <strong>{validation.valid ? "校验通过" : "需要修正"}</strong>
+              <span>
+                {validation.issues.length
+                  ? `${validation.issues.filter((issue) => issue.level === "ERROR").length} 个错误，${validation.issues.filter((issue) => issue.level === "WARNING").length} 个提醒`
+                  : "可以发布当前草稿"}
+              </span>
+              {validation.issues.slice(0, 3).map((issue) => (
+                <small key={`${issue.code}-${issue.entityId ?? issue.objectId ?? ""}`}>
+                  {issue.message}
+                </small>
+              ))}
+            </div>
+          )}
         </section>
       </div>
     </div>
@@ -956,11 +1047,20 @@ function OntologyObjectInspector({
   ontology,
   tables,
   onSelectObject,
+  editable,
+  onSaved,
+  onError,
 }: {
   object: OntologySnapshot["objects"][number];
   ontology: OntologySnapshot;
   tables: PhysicalTable[];
   onSelectObject: (id: string) => void;
+  editable: boolean;
+  onSaved: (
+    ontology: OntologySnapshot,
+    validation: OntologyValidationResult,
+  ) => void;
+  onError: (message: string) => void;
 }) {
   const source = tables.find((table) => table.id === object.sourceTableId);
   const metrics = ontology.metrics.filter((metric) => metric.objectId === object.id);
@@ -968,6 +1068,21 @@ function OntologyObjectInspector({
     (relation) =>
       relation.sourceObjectId === object.id || relation.targetObjectId === object.id,
   );
+  if (editable) {
+    return (
+      <OntologyObjectEditor
+        key={`${ontology.version}-${object.id}`}
+        object={object}
+        ontology={ontology}
+        tables={tables}
+        source={source}
+        metrics={metrics}
+        relations={relations}
+        onSaved={onSaved}
+        onError={onError}
+      />
+    );
+  }
   return (
     <div className="object-detail">
       <div className="object-summary">
@@ -996,7 +1111,7 @@ function OntologyObjectInspector({
               <th>业务名称</th>
               <th>物理字段</th>
               <th>类型</th>
-              <th>敏感</th>
+              <th>可见性</th>
             </tr>
           </thead>
           <tbody>
@@ -1005,7 +1120,7 @@ function OntologyObjectInspector({
                 <td><strong>{property.label}</strong><small>{property.name}</small></td>
                 <td>{property.sourceColumn}</td>
                 <td><code>{property.dataType}</code></td>
-                <td>{property.sensitive ? "是" : "否"}</td>
+                <td>{propertyVisibilityLabel(property.visibility)}</td>
               </tr>
             ))}
           </tbody>
@@ -1051,6 +1166,926 @@ function OntologyObjectInspector({
             }) : <p>该对象暂未定义关系</p>}
           </div>
         </section>
+      </div>
+    </div>
+  );
+}
+
+type OntologyEditorTab = "basic" | "properties" | "metrics" | "relations" | "rules";
+
+function OntologyObjectEditor({
+  object,
+  ontology,
+  tables,
+  source,
+  metrics,
+  relations,
+  onSaved,
+  onError,
+}: {
+  object: OntologyObject;
+  ontology: OntologySnapshot;
+  tables: PhysicalTable[];
+  source?: PhysicalTable;
+  metrics: Metric[];
+  relations: OntologyRelation[];
+  onSaved: (
+    ontology: OntologySnapshot,
+    validation: OntologyValidationResult,
+  ) => void;
+  onError: (message: string) => void;
+}) {
+  const [tab, setTab] = useState<OntologyEditorTab>("basic");
+  const [draftObject, setDraftObject] = useState(() => structuredClone(object));
+  const [draftMetrics, setDraftMetrics] = useState(() => structuredClone(metrics));
+  const [draftRelations, setDraftRelations] = useState(() => structuredClone(relations));
+  const [selectedMetricId, setSelectedMetricId] = useState(metrics[0]?.id ?? "");
+  const [selectedRelationId, setSelectedRelationId] = useState(relations[0]?.id ?? "");
+  const [saving, setSaving] = useState(false);
+  const [dirty, setDirty] = useState(false);
+  const selectedMetric = draftMetrics.find((metric) => metric.id === selectedMetricId);
+  const selectedRelation = draftRelations.find(
+    (relation) => relation.id === selectedRelationId,
+  );
+
+  function changeObject(patch: Partial<OntologyObject>) {
+    setDraftObject((current) => ({ ...current, ...patch }));
+    setDirty(true);
+  }
+  function changeProperty(
+    propertyId: string,
+    patch: Partial<OntologyObject["properties"][number]>,
+  ) {
+    changeObject({
+      properties: draftObject.properties.map((property) =>
+        property.id === propertyId ? { ...property, ...patch } : property,
+      ),
+    });
+  }
+  function changeMetric(metricId: string, patch: Partial<Metric>) {
+    setDraftMetrics((items) =>
+      items.map((metric) =>
+        metric.id === metricId ? { ...metric, ...patch } : metric,
+      ),
+    );
+    setDirty(true);
+  }
+  function changeRelation(relationId: string, patch: Partial<OntologyRelation>) {
+    setDraftRelations((items) =>
+      items.map((relation) =>
+        relation.id === relationId ? { ...relation, ...patch } : relation,
+      ),
+    );
+    setDirty(true);
+  }
+  function addMetric() {
+    const metric: Metric = {
+      id: createClientId("metric"),
+      objectId: object.id,
+      name: `metric_${draftMetrics.length + 1}`,
+      label: "新指标",
+      description: "",
+      definitionMode: "VISUAL",
+      sourcePropertyId: draftObject.properties.find(
+        (property) => property.visibility === "ANALYTICAL",
+      )?.id,
+      expression: "",
+      aggregation: "SUM",
+      format: "number",
+      synonyms: [],
+      status: "DRAFT",
+    };
+    setDraftMetrics((items) => [...items, metric]);
+    setSelectedMetricId(metric.id);
+    setDirty(true);
+  }
+  function addRelation() {
+    const target = ontology.objects.find((candidate) => candidate.id !== object.id);
+    if (!target) {
+      onError("至少需要两个业务对象才能创建关系");
+      return;
+    }
+    const sourceProperty =
+      object.properties.find(
+        (property) =>
+          property.visibility === "ANALYTICAL" &&
+          property.semanticType === "IDENTIFIER",
+      ) ??
+      object.properties.find((property) => property.visibility === "ANALYTICAL");
+    const targetProperty =
+      target.properties.find(
+        (property) =>
+          property.visibility === "ANALYTICAL" &&
+          (property.sourceColumn === sourceProperty?.sourceColumn ||
+            property.name === sourceProperty?.name),
+      ) ??
+      target.properties.find(
+        (property) =>
+          property.visibility === "ANALYTICAL" &&
+          property.semanticType === "IDENTIFIER",
+      ) ??
+      target.properties.find((property) => property.visibility === "ANALYTICAL");
+    const relation: OntologyRelation = {
+      id: createClientId("relation"),
+      name: `${object.label}关联${target.label}`,
+      sourceObjectId: object.id,
+      targetObjectId: target.id,
+      sourcePropertyId: sourceProperty?.id,
+      targetPropertyId: targetProperty?.id,
+      type: "REFERENCE",
+      cardinality: "MANY_TO_ONE",
+      joinExpression: relationJoinExpression(
+        object,
+        target,
+        sourceProperty?.id,
+        targetProperty?.id,
+        source,
+        tables.find((table) => table.id === target.sourceTableId),
+      ),
+      direction: "BIDIRECTIONAL",
+      required: false,
+      enabled: true,
+      fanoutRisk: "NONE",
+      status: "DRAFT",
+    };
+    setDraftRelations((items) => [...items, relation]);
+    setSelectedRelationId(relation.id);
+    setDirty(true);
+  }
+  async function save() {
+    setSaving(true);
+    try {
+      const normalizedMetrics = draftMetrics.map((metric) => ({
+        ...metric,
+        expression:
+          metric.definitionMode === "VISUAL"
+            ? visualMetricExpression(metric, draftObject)
+            : metric.expression,
+      }));
+      const result = await api.saveOntologyObject(
+        draftObject,
+        normalizedMetrics,
+        draftRelations,
+      );
+      setDraftMetrics(normalizedMetrics);
+      setDirty(false);
+      onSaved(result.ontology, result.validation);
+    } catch (reason) {
+      onError(asMessage(reason));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const tabs: Array<{ id: OntologyEditorTab; label: string; count?: number }> = [
+    { id: "basic", label: "基本信息" },
+    { id: "properties", label: "属性", count: draftObject.properties.length },
+    { id: "metrics", label: "指标", count: draftMetrics.length },
+    { id: "relations", label: "关系", count: draftRelations.length },
+    { id: "rules", label: "规则" },
+  ];
+  return (
+    <div className="ontology-editor">
+      <div className="editor-toolbar">
+        <div className="editor-tabs" role="tablist" aria-label="对象编辑分区">
+          {tabs.map((item) => (
+            <button
+              key={item.id}
+              className={tab === item.id ? "active" : ""}
+              onClick={() => setTab(item.id)}
+              role="tab"
+              aria-selected={tab === item.id}
+            >
+              {item.label}
+              {item.count !== undefined && <span>{item.count}</span>}
+            </button>
+          ))}
+        </div>
+        <div className="save-state">
+          <span className={dirty ? "dirty" : ""}>{dirty ? "有未保存修改" : "已保存"}</span>
+          <button
+            className="primary-button"
+            disabled={!dirty || saving}
+            onClick={() => void save()}
+          >
+            <FloppyDisk size={16} /> {saving ? "保存中" : "保存对象"}
+          </button>
+        </div>
+      </div>
+
+      {tab === "basic" && (
+        <div className="editor-section">
+          <div className="form-grid ontology-form-grid">
+            <EditorField label="业务名称">
+              <input
+                value={draftObject.label}
+                onChange={(event) => changeObject({ label: event.target.value })}
+              />
+            </EditorField>
+            <EditorField label="对象标识">
+              <input
+                value={draftObject.name}
+                onChange={(event) => changeObject({ name: event.target.value })}
+              />
+            </EditorField>
+            <EditorField label="来源表">
+              <input
+                value={source ? `${source.database}.${source.name}` : "来源表不可用"}
+                disabled
+              />
+            </EditorField>
+            <EditorField label="业务分类">
+              <input
+                value={draftObject.category ?? ""}
+                placeholder="例如：交易域"
+                onChange={(event) => changeObject({ category: event.target.value })}
+              />
+            </EditorField>
+            <EditorField label="对象粒度" wide>
+              <input
+                value={draftObject.grain}
+                placeholder="例如：一行代表一个订单"
+                onChange={(event) => changeObject({ grain: event.target.value })}
+              />
+            </EditorField>
+            <EditorField label="业务描述" wide>
+              <textarea
+                rows={3}
+                value={draftObject.description}
+                onChange={(event) => changeObject({ description: event.target.value })}
+              />
+            </EditorField>
+            <EditorField label="主键/业务唯一键">
+              <select
+                multiple
+                value={draftObject.primaryKey}
+                onChange={(event) =>
+                  changeObject({
+                    primaryKey: [...event.target.selectedOptions].map(
+                      (option) => option.value,
+                    ),
+                  })
+                }
+              >
+                {draftObject.properties.map((property) => (
+                  <option key={property.id} value={property.id}>
+                    {property.label} ({property.sourceColumn})
+                  </option>
+                ))}
+              </select>
+            </EditorField>
+            <EditorField label="默认时间字段">
+              <select
+                value={draftObject.defaultTimePropertyId ?? ""}
+                onChange={(event) =>
+                  changeObject({
+                    defaultTimePropertyId: event.target.value || undefined,
+                  })
+                }
+              >
+                <option value="">不设置</option>
+                {draftObject.properties
+                  .filter((property) => property.semanticType === "TIME")
+                  .map((property) => (
+                    <option key={property.id} value={property.id}>
+                      {property.label}
+                    </option>
+                  ))}
+              </select>
+            </EditorField>
+            <EditorField label="对象同义词" wide>
+              <input
+                value={draftObject.synonyms.join("、")}
+                placeholder="用顿号或逗号分隔"
+                onChange={(event) =>
+                  changeObject({ synonyms: splitTerms(event.target.value) })
+                }
+              />
+            </EditorField>
+          </div>
+        </div>
+      )}
+
+      {tab === "properties" && (
+        <div className="editor-section property-editor">
+          <div className="editor-help">
+            <Info size={16} />
+            分析属性进入语义索引；仅明细展示由查询执行器自动补充；完全隐藏不会索引或展示。
+          </div>
+          <div className="property-edit-table">
+            <div className="property-edit-row header">
+              <span>业务名称</span><span>物理字段</span><span>语义类型</span><span>可见性</span>
+            </div>
+            {draftObject.properties.map((property) => (
+              <div className="property-edit-row" key={property.id}>
+                <input
+                  value={property.label}
+                  onChange={(event) =>
+                    changeProperty(property.id, { label: event.target.value })
+                  }
+                />
+                <div className="physical-field">
+                  <code>{property.sourceColumn}</code>
+                  <small>{property.dataType}</small>
+                </div>
+                <select
+                  value={property.semanticType}
+                  onChange={(event) =>
+                    changeProperty(property.id, {
+                      semanticType: event.target
+                        .value as OntologyObject["properties"][number]["semanticType"],
+                    })
+                  }
+                >
+                  {PROPERTY_TYPES.map((type) => (
+                    <option key={type} value={type}>
+                      {propertySemanticTypeLabel(type)}
+                    </option>
+                  ))}
+                </select>
+                <select
+                  value={property.visibility}
+                  onChange={(event) =>
+                    changeProperty(property.id, {
+                      visibility: event.target
+                        .value as OntologyObject["properties"][number]["visibility"],
+                    })
+                  }
+                >
+                  <option value="ANALYTICAL">分析属性</option>
+                  <option value="DETAIL_ONLY">仅明细展示</option>
+                  <option value="HIDDEN">完全隐藏</option>
+                </select>
+                <textarea
+                  rows={2}
+                  value={property.description}
+                  placeholder="属性口径说明"
+                  onChange={(event) =>
+                    changeProperty(property.id, { description: event.target.value })
+                  }
+                />
+                <input
+                  value={property.synonyms.join("、")}
+                  placeholder="同义词"
+                  disabled={property.visibility !== "ANALYTICAL"}
+                  onChange={(event) =>
+                    changeProperty(property.id, {
+                      synonyms: splitTerms(event.target.value),
+                    })
+                  }
+                />
+                <label className="inline-check">
+                  <input
+                    type="checkbox"
+                    checked={property.defaultDisplay}
+                    disabled={property.visibility !== "DETAIL_ONLY"}
+                    onChange={(event) =>
+                      changeProperty(property.id, {
+                        defaultDisplay: event.target.checked,
+                      })
+                    }
+                  />
+                  明细默认展示
+                </label>
+                <label className="inline-check">
+                  <input
+                    type="checkbox"
+                    checked={property.exportable}
+                    disabled={property.visibility === "HIDDEN"}
+                    onChange={(event) =>
+                      changeProperty(property.id, {
+                        exportable: event.target.checked,
+                      })
+                    }
+                  />
+                  允许导出
+                </label>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {tab === "metrics" && (
+        <div className="editor-section split-editor">
+          <EditorEntityList
+            title="指标"
+            items={draftMetrics.map((metric) => ({
+              id: metric.id,
+              label: metric.label,
+              detail: metric.expression || "尚未生成表达式",
+            }))}
+            selectedId={selectedMetricId}
+            onSelect={setSelectedMetricId}
+            onAdd={addMetric}
+          />
+          {selectedMetric ? (
+            <div className="entity-form">
+              <div className="entity-form-heading">
+                <strong>指标定义</strong>
+                <button
+                  className="subtle-button danger-text"
+                  onClick={() => {
+                    setDraftMetrics((items) =>
+                      items.filter((metric) => metric.id !== selectedMetric.id),
+                    );
+                    setSelectedMetricId("");
+                    setDirty(true);
+                  }}
+                >
+                  <Trash size={14} /> 删除指标
+                </button>
+              </div>
+              <div className="form-grid ontology-form-grid">
+                <EditorField label="指标名称">
+                  <input
+                    value={selectedMetric.label}
+                    onChange={(event) =>
+                      changeMetric(selectedMetric.id, { label: event.target.value })
+                    }
+                  />
+                </EditorField>
+                <EditorField label="指标标识">
+                  <input
+                    value={selectedMetric.name}
+                    onChange={(event) =>
+                      changeMetric(selectedMetric.id, { name: event.target.value })
+                    }
+                  />
+                </EditorField>
+                <EditorField label="定义方式">
+                  <select
+                    value={selectedMetric.definitionMode}
+                    onChange={(event) =>
+                      changeMetric(selectedMetric.id, {
+                        definitionMode: event.target.value as Metric["definitionMode"],
+                        aggregation:
+                          event.target.value === "SQL"
+                            ? "CUSTOM"
+                            : selectedMetric.aggregation === "CUSTOM"
+                              ? "SUM"
+                              : selectedMetric.aggregation,
+                      })
+                    }
+                  >
+                    <option value="VISUAL">可视化配置</option>
+                    <option value="SQL">SQL 表达式</option>
+                  </select>
+                </EditorField>
+                <EditorField label="展示格式">
+                  <select
+                    value={selectedMetric.format}
+                    onChange={(event) =>
+                      changeMetric(selectedMetric.id, {
+                        format: event.target.value as Metric["format"],
+                      })
+                    }
+                  >
+                    <option value="number">数值</option>
+                    <option value="currency">金额</option>
+                    <option value="percent">百分比</option>
+                  </select>
+                </EditorField>
+                {selectedMetric.definitionMode === "VISUAL" ? (
+                  <>
+                    <EditorField label="聚合方式">
+                      <select
+                        value={selectedMetric.aggregation}
+                        onChange={(event) =>
+                          changeMetric(selectedMetric.id, {
+                            aggregation: event.target.value as Metric["aggregation"],
+                          })
+                        }
+                      >
+                        {["SUM", "COUNT", "COUNT_DISTINCT", "AVG", "MIN", "MAX"].map(
+                          (aggregation) => (
+                            <option key={aggregation}>{aggregation}</option>
+                          ),
+                        )}
+                      </select>
+                    </EditorField>
+                    <EditorField label="计算字段">
+                      <select
+                        value={selectedMetric.sourcePropertyId ?? ""}
+                        disabled={selectedMetric.aggregation === "COUNT"}
+                        onChange={(event) =>
+                          changeMetric(selectedMetric.id, {
+                            sourcePropertyId: event.target.value || undefined,
+                          })
+                        }
+                      >
+                        <option value="">请选择属性</option>
+                        {draftObject.properties
+                          .filter((property) => property.visibility === "ANALYTICAL")
+                          .map((property) => (
+                            <option key={property.id} value={property.id}>
+                              {property.label}
+                            </option>
+                          ))}
+                      </select>
+                    </EditorField>
+                    <EditorField label="固定过滤条件" wide>
+                      <input
+                        value={selectedMetric.filterExpression ?? ""}
+                        placeholder="例如：order_status = 'PAID'"
+                        onChange={(event) =>
+                          changeMetric(selectedMetric.id, {
+                            filterExpression: event.target.value,
+                          })
+                        }
+                      />
+                    </EditorField>
+                    <EditorField label="生成表达式" wide>
+                      <code className="expression-preview">
+                        {visualMetricExpression(selectedMetric, draftObject) || "等待配置"}
+                      </code>
+                    </EditorField>
+                  </>
+                ) : (
+                  <EditorField label="SQL 表达式" wide>
+                    <textarea
+                      rows={4}
+                      value={selectedMetric.expression}
+                      placeholder="例如：SUM(pay_amount)"
+                      onChange={(event) =>
+                        changeMetric(selectedMetric.id, {
+                          expression: event.target.value,
+                        })
+                      }
+                    />
+                  </EditorField>
+                )}
+                <EditorField label="指标描述" wide>
+                  <textarea
+                    rows={3}
+                    value={selectedMetric.description}
+                    onChange={(event) =>
+                      changeMetric(selectedMetric.id, {
+                        description: event.target.value,
+                      })
+                    }
+                  />
+                </EditorField>
+                <EditorField label="同义词" wide>
+                  <input
+                    value={selectedMetric.synonyms.join("、")}
+                    onChange={(event) =>
+                      changeMetric(selectedMetric.id, {
+                        synonyms: splitTerms(event.target.value),
+                      })
+                    }
+                  />
+                </EditorField>
+              </div>
+            </div>
+          ) : (
+            <div className="entity-empty">选择一个指标，或新增指标。</div>
+          )}
+        </div>
+      )}
+
+      {tab === "relations" && (
+        <div className="editor-section split-editor">
+          <EditorEntityList
+            title="对象关系"
+            items={draftRelations.map((relation) => ({
+              id: relation.id,
+              label: relation.name,
+              detail: cardinalityLabel(relation.cardinality),
+            }))}
+            selectedId={selectedRelationId}
+            onSelect={setSelectedRelationId}
+            onAdd={addRelation}
+          />
+          {selectedRelation ? (
+            <RelationEditor
+              relation={selectedRelation}
+              ontology={ontology}
+              tables={tables}
+              onChange={(patch) => changeRelation(selectedRelation.id, patch)}
+              onDelete={() => {
+                setDraftRelations((items) =>
+                  items.filter((relation) => relation.id !== selectedRelation.id),
+                );
+                setSelectedRelationId("");
+                setDirty(true);
+              }}
+            />
+          ) : (
+            <div className="entity-empty">选择一个关系，或新增关系。</div>
+          )}
+        </div>
+      )}
+
+      {tab === "rules" && (
+        <div className="editor-section">
+          <div className="form-grid ontology-form-grid">
+            <EditorField label="默认过滤条件" wide>
+              <textarea
+                rows={4}
+                value={draftObject.defaultFilter ?? ""}
+                placeholder="例如：is_deleted = 0"
+                onChange={(event) =>
+                  changeObject({ defaultFilter: event.target.value })
+                }
+              />
+            </EditorField>
+            <EditorField label="负责人">
+              <input
+                value={draftObject.owner ?? ""}
+                onChange={(event) => changeObject({ owner: event.target.value })}
+              />
+            </EditorField>
+            <EditorField label="示例问题" wide>
+              <textarea
+                rows={5}
+                value={draftObject.exampleQuestions.join("\n")}
+                placeholder={"每行一个问题\n例如：本月订单明细"}
+                onChange={(event) =>
+                  changeObject({
+                    exampleQuestions: event.target.value
+                      .split(/\r?\n/)
+                      .map((item) => item.trim())
+                      .filter(Boolean),
+                  })
+                }
+              />
+            </EditorField>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function EditorField({
+  label,
+  wide,
+  children,
+}: {
+  label: string;
+  wide?: boolean;
+  children: React.ReactNode;
+}) {
+  return (
+    <label className={wide ? "wide" : ""}>
+      <span>{label}</span>
+      {children}
+    </label>
+  );
+}
+
+function EditorEntityList({
+  title,
+  items,
+  selectedId,
+  onSelect,
+  onAdd,
+}: {
+  title: string;
+  items: Array<{ id: string; label: string; detail: string }>;
+  selectedId: string;
+  onSelect: (id: string) => void;
+  onAdd: () => void;
+}) {
+  return (
+    <aside className="entity-list">
+      <div>
+        <strong>{title}</strong>
+        <button className="subtle-button" onClick={onAdd}>
+          <Plus size={14} /> 新增
+        </button>
+      </div>
+      {items.map((item) => (
+        <button
+          key={item.id}
+          className={selectedId === item.id ? "selected" : ""}
+          onClick={() => onSelect(item.id)}
+        >
+          <strong>{item.label}</strong>
+          <small>{item.detail}</small>
+        </button>
+      ))}
+      {!items.length && <p>暂未配置</p>}
+    </aside>
+  );
+}
+
+function RelationEditor({
+  relation,
+  ontology,
+  tables,
+  onChange,
+  onDelete,
+}: {
+  relation: OntologyRelation;
+  ontology: OntologySnapshot;
+  tables: PhysicalTable[];
+  onChange: (patch: Partial<OntologyRelation>) => void;
+  onDelete: () => void;
+}) {
+  const source = ontology.objects.find(
+    (object) => object.id === relation.sourceObjectId,
+  );
+  const target = ontology.objects.find(
+    (object) => object.id === relation.targetObjectId,
+  );
+  function analyticalProperties(object?: OntologyObject) {
+    return object?.properties.filter(
+      (property) => property.visibility === "ANALYTICAL",
+    ) ?? [];
+  }
+  function expression(
+    nextSource = source,
+    nextTarget = target,
+    sourcePropertyId = relation.sourcePropertyId,
+    targetPropertyId = relation.targetPropertyId,
+  ) {
+    if (!nextSource || !nextTarget) return "";
+    return relationJoinExpression(
+      nextSource,
+      nextTarget,
+      sourcePropertyId,
+      targetPropertyId,
+      tables.find((table) => table.id === nextSource.sourceTableId),
+      tables.find((table) => table.id === nextTarget.sourceTableId),
+    );
+  }
+  return (
+    <div className="entity-form">
+      <div className="entity-form-heading">
+        <strong>关系定义</strong>
+        <button className="subtle-button danger-text" onClick={onDelete}>
+          <Trash size={14} /> 删除关系
+        </button>
+      </div>
+      <div className="form-grid ontology-form-grid">
+        <EditorField label="关系名称" wide>
+          <input
+            value={relation.name}
+            onChange={(event) => onChange({ name: event.target.value })}
+          />
+        </EditorField>
+        <EditorField label="源对象">
+          <select
+            value={relation.sourceObjectId}
+            onChange={(event) => {
+              const nextSource = ontology.objects.find(
+                (object) => object.id === event.target.value,
+              );
+              const nextProperty = analyticalProperties(nextSource)[0];
+              onChange({
+                sourceObjectId: event.target.value,
+                sourcePropertyId: nextProperty?.id,
+                joinExpression: expression(
+                  nextSource,
+                  target,
+                  nextProperty?.id,
+                  relation.targetPropertyId,
+                ),
+              });
+            }}
+          >
+            {ontology.objects.map((object) => (
+              <option key={object.id} value={object.id}>{object.label}</option>
+            ))}
+          </select>
+        </EditorField>
+        <EditorField label="源字段">
+          <select
+            value={relation.sourcePropertyId ?? ""}
+            onChange={(event) =>
+              onChange({
+                sourcePropertyId: event.target.value,
+                joinExpression: expression(
+                  source,
+                  target,
+                  event.target.value,
+                  relation.targetPropertyId,
+                ),
+              })
+            }
+          >
+            {analyticalProperties(source).map((property) => (
+              <option key={property.id} value={property.id}>{property.label}</option>
+            ))}
+          </select>
+        </EditorField>
+        <EditorField label="目标对象">
+          <select
+            value={relation.targetObjectId}
+            onChange={(event) => {
+              const nextTarget = ontology.objects.find(
+                (object) => object.id === event.target.value,
+              );
+              const nextProperty =
+                analyticalProperties(nextTarget).find(
+                  (property) =>
+                    property.sourceColumn ===
+                    source?.properties.find(
+                      (candidate) => candidate.id === relation.sourcePropertyId,
+                    )?.sourceColumn,
+                ) ?? analyticalProperties(nextTarget)[0];
+              onChange({
+                targetObjectId: event.target.value,
+                targetPropertyId: nextProperty?.id,
+                joinExpression: expression(
+                  source,
+                  nextTarget,
+                  relation.sourcePropertyId,
+                  nextProperty?.id,
+                ),
+              });
+            }}
+          >
+            {ontology.objects.map((object) => (
+              <option key={object.id} value={object.id}>{object.label}</option>
+            ))}
+          </select>
+        </EditorField>
+        <EditorField label="目标字段">
+          <select
+            value={relation.targetPropertyId ?? ""}
+            onChange={(event) =>
+              onChange({
+                targetPropertyId: event.target.value,
+                joinExpression: expression(
+                  source,
+                  target,
+                  relation.sourcePropertyId,
+                  event.target.value,
+                ),
+              })
+            }
+          >
+            {analyticalProperties(target).map((property) => (
+              <option key={property.id} value={property.id}>{property.label}</option>
+            ))}
+          </select>
+        </EditorField>
+        <EditorField label="基数">
+          <select
+            value={relation.cardinality}
+            onChange={(event) =>
+              onChange({
+                cardinality: event.target.value as OntologyRelation["cardinality"],
+              })
+            }
+          >
+            <option value="ONE_TO_ONE">一对一</option>
+            <option value="ONE_TO_MANY">一对多</option>
+            <option value="MANY_TO_ONE">多对一</option>
+            <option value="MANY_TO_MANY">多对多</option>
+          </select>
+        </EditorField>
+        <EditorField label="关系类型">
+          <select
+            value={relation.type}
+            onChange={(event) =>
+              onChange({ type: event.target.value as OntologyRelation["type"] })
+            }
+          >
+            {RELATION_TYPES.map((type) => (
+              <option key={type} value={type}>{relationTypeLabel(type)}</option>
+            ))}
+          </select>
+        </EditorField>
+        <EditorField label="查询方向">
+          <select
+            value={relation.direction}
+            onChange={(event) =>
+              onChange({
+                direction: event.target.value as OntologyRelation["direction"],
+              })
+            }
+          >
+            <option value="BIDIRECTIONAL">双向</option>
+            <option value="SOURCE_TO_TARGET">源到目标</option>
+            <option value="TARGET_TO_SOURCE">目标到源</option>
+          </select>
+        </EditorField>
+        <EditorField label="Join 表达式" wide>
+          <input
+            value={relation.joinExpression}
+            onChange={(event) => onChange({ joinExpression: event.target.value })}
+          />
+        </EditorField>
+        <label className="inline-check">
+          <input
+            type="checkbox"
+            checked={relation.enabled}
+            onChange={(event) => onChange({ enabled: event.target.checked })}
+          />
+          启用关系
+        </label>
+        <label className="inline-check">
+          <input
+            type="checkbox"
+            checked={relation.required}
+            onChange={(event) => onChange({ required: event.target.checked })}
+          />
+          必须存在目标记录
+        </label>
       </div>
     </div>
   );
@@ -1356,6 +2391,123 @@ function StatusBadge({ status }: { status: Turn["status"] }) {
           ? "待补充"
           : "执行中";
   return <span className={`turn-status ${status}`}>{label}</span>;
+}
+
+const PROPERTY_TYPES: OntologyObject["properties"][number]["semanticType"][] = [
+  "IDENTIFIER",
+  "DIMENSION",
+  "ENUM",
+  "TIME",
+  "GEOGRAPHY",
+  "AMOUNT",
+  "QUANTITY",
+  "BOOLEAN",
+];
+
+const RELATION_TYPES: OntologyRelation["type"][] = [
+  "REFERENCE",
+  "COMPOSITION",
+  "ASSOCIATION",
+  "HIERARCHY",
+  "EVENT_PARTICIPATION",
+  "IDENTITY",
+  "DERIVED",
+];
+
+function splitTerms(value: string): string[] {
+  return [
+    ...new Set(
+      value
+        .split(/[、,，]/)
+        .map((item) => item.trim())
+        .filter(Boolean),
+    ),
+  ];
+}
+
+function createClientId(prefix: string): string {
+  return `${prefix}_${crypto.randomUUID().replaceAll("-", "")}`;
+}
+
+function visualMetricExpression(metric: Metric, object: OntologyObject): string {
+  const property = object.properties.find(
+    (candidate) => candidate.id === metric.sourcePropertyId,
+  );
+  const field =
+    metric.aggregation === "COUNT"
+      ? "*"
+      : property
+        ? `\`${property.sourceColumn.replaceAll("`", "``")}\``
+        : "";
+  if (!field) return "";
+  const filter = metric.filterExpression?.trim();
+  if (!filter) {
+    return metric.aggregation === "COUNT_DISTINCT"
+      ? `COUNT(DISTINCT ${field})`
+      : `${metric.aggregation}(${field})`;
+  }
+  if (metric.aggregation === "COUNT") {
+    return `SUM(CASE WHEN ${filter} THEN 1 ELSE 0 END)`;
+  }
+  if (metric.aggregation === "COUNT_DISTINCT") {
+    return `COUNT(DISTINCT CASE WHEN ${filter} THEN ${field} END)`;
+  }
+  return `${metric.aggregation}(CASE WHEN ${filter} THEN ${field} END)`;
+}
+
+function relationJoinExpression(
+  sourceObject: OntologyObject,
+  targetObject: OntologyObject,
+  sourcePropertyId: string | undefined,
+  targetPropertyId: string | undefined,
+  sourceTable?: PhysicalTable,
+  targetTable?: PhysicalTable,
+): string {
+  const sourceProperty = sourceObject.properties.find(
+    (property) => property.id === sourcePropertyId,
+  );
+  const targetProperty = targetObject.properties.find(
+    (property) => property.id === targetPropertyId,
+  );
+  if (!sourceProperty || !targetProperty) return "";
+  return `${sourceTable?.name ?? sourceObject.name}.${sourceProperty.sourceColumn} = ${targetTable?.name ?? targetObject.name}.${targetProperty.sourceColumn}`;
+}
+
+function propertyVisibilityLabel(
+  visibility: OntologyObject["properties"][number]["visibility"],
+): string {
+  return {
+    ANALYTICAL: "分析属性",
+    DETAIL_ONLY: "仅明细展示",
+    HIDDEN: "完全隐藏",
+  }[visibility];
+}
+
+function propertySemanticTypeLabel(
+  type: OntologyObject["properties"][number]["semanticType"],
+): string {
+  return {
+    IDENTIFIER: "标识符",
+    DIMENSION: "普通维度",
+    ENUM: "枚举",
+    TIME: "时间",
+    GEOGRAPHY: "地理位置",
+    AMOUNT: "金额",
+    QUANTITY: "数量",
+    BOOLEAN: "布尔值",
+  }[type];
+}
+
+function relationTypeLabel(type: OntologyRelation["type"]): string {
+  return {
+    REFERENCE: "引用",
+    COMPOSITION: "组成",
+    ASSOCIATION: "关联",
+    HIERARCHY: "层级",
+    EVENT_PARTICIPATION: "事件参与",
+    IDENTITY: "身份映射",
+    DERIVED: "派生",
+  }[type];
 }
 
 function ontologyStatusLabel(status: OntologySnapshot["status"]): string {

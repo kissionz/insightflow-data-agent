@@ -122,6 +122,36 @@ export type OntologyEntityStatus =
   | "PUBLISHED"
   | "DEPRECATED";
 
+export type PropertyVisibility = "ANALYTICAL" | "DETAIL_ONLY" | "HIDDEN";
+
+export type PropertySemanticType =
+  | "IDENTIFIER"
+  | "DIMENSION"
+  | "ENUM"
+  | "TIME"
+  | "GEOGRAPHY"
+  | "AMOUNT"
+  | "QUANTITY"
+  | "BOOLEAN";
+
+export interface OntologyProperty {
+  id: string;
+  name: string;
+  label: string;
+  description: string;
+  dataType: string;
+  sourceColumn: string;
+  sensitive: boolean;
+  semanticType: PropertySemanticType;
+  visibility: PropertyVisibility;
+  synonyms: string[];
+  format?: string;
+  detailOrder?: number;
+  defaultDisplay: boolean;
+  exportable: boolean;
+  nullDisplay?: string;
+}
+
 export interface OntologyObject {
   id: string;
   name: string;
@@ -129,14 +159,14 @@ export interface OntologyObject {
   description: string;
   sourceTableId: string;
   status: OntologyEntityStatus;
-  properties: Array<{
-    id: string;
-    name: string;
-    label: string;
-    dataType: string;
-    sourceColumn: string;
-    sensitive: boolean;
-  }>;
+  grain: string;
+  primaryKey: string[];
+  defaultTimePropertyId?: string;
+  defaultFilter?: string;
+  category?: string;
+  owner?: string;
+  exampleQuestions: string[];
+  properties: OntologyProperty[];
   synonyms: string[];
 }
 
@@ -159,6 +189,11 @@ export interface OntologyRelation {
     | "MANY_TO_ONE"
     | "MANY_TO_MANY";
   joinExpression: string;
+  sourcePropertyId?: string;
+  targetPropertyId?: string;
+  direction: "BIDIRECTIONAL" | "SOURCE_TO_TARGET" | "TARGET_TO_SOURCE";
+  required: boolean;
+  enabled: boolean;
   fanoutRisk: "NONE" | "LOW" | "HIGH";
   status: OntologyEntityStatus;
 }
@@ -170,19 +205,45 @@ export interface Metric {
   description: string;
   objectId: string;
   expression: string;
-  aggregation: "SUM" | "COUNT" | "COUNT_DISTINCT" | "AVG" | "MIN" | "MAX";
+  definitionMode: "VISUAL" | "SQL";
+  sourcePropertyId?: string;
+  filterExpression?: string;
+  timePropertyId?: string;
+  aggregation:
+    | "SUM"
+    | "COUNT"
+    | "COUNT_DISTINCT"
+    | "AVG"
+    | "MIN"
+    | "MAX"
+    | "CUSTOM";
   format: "currency" | "number" | "percent";
+  unit?: string;
   synonyms: string[];
   status: OntologyEntityStatus;
 }
 
 export interface OntologySnapshot {
   version: number;
+  baseVersion?: number;
   status: OntologyEntityStatus;
   publishedAt?: string;
   objects: OntologyObject[];
   relations: OntologyRelation[];
   metrics: Metric[];
+}
+
+export interface OntologyValidationIssue {
+  level: "ERROR" | "WARNING";
+  code: string;
+  message: string;
+  objectId?: string;
+  entityId?: string;
+}
+
+export interface OntologyValidationResult {
+  valid: boolean;
+  issues: OntologyValidationIssue[];
 }
 
 export interface SafeDataSourceConfig {
@@ -211,6 +272,7 @@ export interface DataSourceInput {
 export interface BootstrapPayload {
   conversations: Conversation[];
   ontology: OntologySnapshot;
+  ontologyDraft?: OntologySnapshot;
   tables: PhysicalTable[];
   dataSource: SafeDataSourceConfig;
   runtime: {

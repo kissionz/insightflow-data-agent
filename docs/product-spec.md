@@ -1,7 +1,8 @@
 # InsightFlow Data Agent MVP 产品实现文档
 
-版本：1.0  
-状态：产品方案已确认，待开发授权  
+版本：1.1
+
+状态：产品方案已确认，本体编辑核心链路已实现
 日期：2026-07-25  
 目标终端：桌面 Web  
 目标用户：本地单用户  
@@ -53,6 +54,9 @@ InsightFlow 是基于现有 Montane Code Agent Runtime 构建的本地 Data Agen
 | 数据源配置 | Web 配置，密码保存到系统密钥链 |
 | 问数页面 | 不展示任何数据源信息 |
 | Ontology 建模 | 扫描后由用户勾选未建模表，增量生成草稿 |
+| Ontology 编辑 | 发布版只读；任何修改先克隆为隔离草稿 |
+| 属性可见性 | 分析可用、仅明细、完全隐藏三档 |
+| 指标定义 | 支持可视化聚合配置和直接 SQL 表达式 |
 | Ontology 存储 | 本地 SQLite |
 | Ontology 检索 | 发布时编译本地语义索引 |
 | 追踪模型 | 每轮对话独立追踪 |
@@ -344,6 +348,36 @@ DRAFT -> VERIFIED -> PUBLISHED -> DEPRECATED
 
 只有 `PUBLISHED` 版本可用于正式问数。每轮查询必须保存其使用的 `ontology_version_id`。
 
+### 8.7 草稿隔离与发布
+
+- 已发布版本在界面和运行时均为只读。
+- 编辑已发布版本时，系统克隆完整快照并创建下一版本草稿。
+- 草稿中的对象、属性、指标、关系和规则只写入草稿快照。
+- 草稿不进入本地语义索引，也不发送给 Montane，不影响正在进行的问数。
+- 同一工作区只保留一个活动草稿；新增物理表追加到该草稿，不重复复制已建模表。
+- 放弃草稿会恢复其中新增表的未建模状态，不修改已发布版本。
+- 发布前必须通过对象映射、主键、指标表达式、关系端点和危险 SQL 校验。
+- 发布成功后，新快照成为唯一运行版本并重建语义索引；旧发布版本继续保留为历史版本。
+
+### 8.8 属性可见性
+
+| 模式 | 本地语义索引 | 发送给 Montane | 查询结果展示 |
+|---|---|---|---|
+| `ANALYTICAL` 分析可用 | 是 | 是 | 可用于查询、筛选、分组和明细 |
+| `DETAIL_ONLY` 仅明细 | 否 | 否 | 明细查询时由确定性代码自动追加 |
+| `HIDDEN` 完全隐藏 | 否 | 否 | 不展示、不导出 |
+
+`DETAIL_ONLY` 字段不会参与自然语言召回，也不会出现在给 Montane 的 Ontology 上下文中。仅当查询结果被判定为单对象明细、字段启用默认明细展示且 SQL 结构可安全改写时，系统才把它追加到投影列。聚合查询、多表歧义查询和复杂投影不会自动追加。
+
+### 8.9 对象编辑清单
+
+- 基础：业务名称、显示名称、描述、分类、粒度、主键、默认时间字段、同义词。
+- 属性：语义类型、可见性、描述、同义词、默认明细展示、导出权限。
+- 指标：名称、口径、格式、单位、同义词、时间字段，以及可视化或 SQL 定义模式。
+- 关系：来源和目标对象、关联字段、关系类型、基数、方向、连接表达式、是否启用、是否必需。
+- 规则：默认筛选、负责人和示例问题。
+- 物理来源表和字段映射在本次 MVP 编辑器中只读，避免误改血缘。
+
 ## 9. 物理 Schema 生命周期
 
 ### 9.1 表状态
@@ -378,8 +412,12 @@ interface MetricDefinition {
   name: string;
   description: string;
   objectTypeId: string;
+  definitionMode: "VISUAL" | "SQL";
   expression: string;
-  aggregation: "SUM" | "COUNT" | "COUNT_DISTINCT" | "AVG" | "MIN" | "MAX";
+  aggregation: "SUM" | "COUNT" | "COUNT_DISTINCT" | "AVG" | "MIN" | "MAX" | "CUSTOM";
+  sourcePropertyId?: string;
+  filterExpression?: string;
+  timePropertyId?: string;
   grain: string[];
   allowedDimensions: string[];
   defaultTimeDimension?: string;
@@ -392,7 +430,7 @@ interface MetricDefinition {
 }
 ```
 
-指标不能只保存 SQL。必须显式声明所属对象、粒度、聚合方式、允许维度和默认时间字段。
+可视化模式通过聚合方式、来源属性和可选过滤条件生成 SelectDB 兼容表达式；SQL 模式允许直接维护只读指标表达式。两种模式都必须显式声明所属对象、口径和格式，并在发布前经过危险语句与字段映射校验。
 
 ## 11. Ontology 存储
 

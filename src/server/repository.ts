@@ -69,10 +69,25 @@ export class Repository {
   }
 
   getOntology(): OntologySnapshot {
+    return this.getPublishedOntology();
+  }
+
+  getPublishedOntology(): OntologySnapshot {
     const row = this.db
-      .prepare("SELECT payload FROM ontology_versions ORDER BY version DESC LIMIT 1")
+      .prepare(
+        "SELECT payload FROM ontology_versions WHERE status = 'PUBLISHED' ORDER BY version DESC LIMIT 1",
+      )
       .get() as unknown as JsonRow;
-    return JSON.parse(row.payload) as OntologySnapshot;
+    return normalizeOntology(JSON.parse(row.payload) as OntologySnapshot);
+  }
+
+  getDraftOntology(): OntologySnapshot | null {
+    const row = this.db
+      .prepare(
+        "SELECT payload FROM ontology_versions WHERE status = 'DRAFT' ORDER BY version DESC LIMIT 1",
+      )
+      .get() as unknown as JsonRow | undefined;
+    return row ? normalizeOntology(JSON.parse(row.payload) as OntologySnapshot) : null;
   }
 
   saveOntology(snapshot: OntologySnapshot): void {
@@ -83,6 +98,10 @@ export class Repository {
          ON CONFLICT(version) DO UPDATE SET status = excluded.status, payload = excluded.payload`,
       )
       .run(snapshot.version, snapshot.status, new Date().toISOString(), JSON.stringify(snapshot));
+  }
+
+  deleteDraftOntology(): void {
+    this.db.prepare("DELETE FROM ontology_versions WHERE status = 'DRAFT'").run();
   }
 
   getTables(): PhysicalTable[] {
@@ -199,7 +218,7 @@ export class Repository {
 
   private removeLegacyDemoFixtures(): void {
     const demoObjectIds = new Set(["o_order", "o_customer", "o_product", "o_store"]);
-    const ontology = this.getOntology();
+    const ontology = this.getPublishedOntology();
     const isUntouchedDemoOntology =
       ontology.version === 4 &&
       ontology.objects.length === demoObjectIds.size &&
@@ -258,4 +277,52 @@ function emptyOntology(): OntologySnapshot {
     relations: [],
     metrics: [],
   };
+}
+
+function normalizeOntology(snapshot: OntologySnapshot): OntologySnapshot {
+  return {
+    ...snapshot,
+    baseVersion:
+      snapshot.baseVersion ??
+      (snapshot.status === "DRAFT" ? Math.max(0, snapshot.version - 1) : undefined),
+    objects: snapshot.objects.map((object) => ({
+      ...object,
+      grain: object.grain ?? "",
+      primaryKey: object.primaryKey ?? [],
+      exampleQuestions: object.exampleQuestions ?? [],
+      properties: object.properties.map((property, index) => ({
+        ...property,
+        description: property.description ?? "",
+        semanticType: property.semanticType ?? inferSemanticType(property.name, property.dataType),
+        visibility: property.visibility ?? "ANALYTICAL",
+        synonyms: property.synonyms ?? [],
+        detailOrder: property.detailOrder ?? index + 1,
+        defaultDisplay: property.defaultDisplay ?? true,
+        exportable: property.exportable ?? true,
+      })),
+    })),
+    relations: snapshot.relations.map((relation) => ({
+      ...relation,
+      direction: relation.direction ?? "BIDIRECTIONAL",
+      required: relation.required ?? false,
+      enabled: relation.enabled ?? true,
+    })),
+    metrics: snapshot.metrics.map((metric) => ({
+      ...metric,
+      definitionMode: metric.definitionMode ?? "SQL",
+    })),
+  };
+}
+
+function inferSemanticType(
+  name: string,
+  dataType: string,
+): OntologySnapshot["objects"][number]["properties"][number]["semanticType"] {
+  const normalized = name.toLowerCase();
+  if (/(^id$|_id$|code$|number$)/.test(normalized)) return "IDENTIFIER";
+  if (/(date|time|_at$)/.test(normalized) || /(date|time)/i.test(dataType)) return "TIME";
+  if (/(amount|price|fee|cost|revenue)/.test(normalized)) return "AMOUNT";
+  if (/(count|quantity|qty|num)/.test(normalized)) return "QUANTITY";
+  if (/^(is_|has_)/.test(normalized) || /bool/i.test(dataType)) return "BOOLEAN";
+  return "DIMENSION";
 }

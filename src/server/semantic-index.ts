@@ -71,7 +71,13 @@ export class SemanticIndex {
       object.name,
       object.label,
       ...object.synonyms,
-      ...object.properties.flatMap((property) => [property.name, property.label]),
+      ...object.properties
+        .filter((property) => property.visibility === "ANALYTICAL")
+        .flatMap((property) => [
+          property.name,
+          property.label,
+          ...property.synonyms,
+        ]),
     ]);
   }
 
@@ -108,6 +114,7 @@ export class SemanticIndex {
   }
 
   private indexRelation(relation: OntologyRelation): void {
+    if (!relation.enabled) return;
     const source = this.adjacency.get(relation.sourceObjectId) ?? [];
     source.push({ objectId: relation.targetObjectId, relationId: relation.id });
     this.adjacency.set(relation.sourceObjectId, source);

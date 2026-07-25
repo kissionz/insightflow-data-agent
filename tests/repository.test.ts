@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { PhysicalTable } from "../src/shared/types.js";
 import { Repository } from "../src/server/repository.js";
+import { testOntology } from "./fixtures.js";
 
 const roots: string[] = [];
 
@@ -66,6 +67,31 @@ describe("Repository schema reconciliation", () => {
     ]);
 
     expect(next.find((table) => table.id === modeled.id)?.status).toBe("CHANGED");
+    repository.close();
+  });
+
+  it("keeps an editable draft isolated from the published ontology", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-repo-"));
+    roots.push(root);
+    const repository = new Repository(path.join(root, "ontology.sqlite"));
+    repository.saveOntology(testOntology);
+    repository.saveOntology({
+      ...structuredClone(testOntology),
+      version: 2,
+      baseVersion: 1,
+      status: "DRAFT",
+      publishedAt: undefined,
+      objects: testOntology.objects.map((object, index) => ({
+        ...structuredClone(object),
+        label: index === 0 ? "草稿订单" : object.label,
+        status: "DRAFT",
+      })),
+    });
+
+    expect(repository.getPublishedOntology().version).toBe(1);
+    expect(repository.getPublishedOntology().objects[0].label).toBe("订单");
+    expect(repository.getDraftOntology()?.version).toBe(2);
+    expect(repository.getDraftOntology()?.objects[0].label).toBe("草稿订单");
     repository.close();
   });
 });

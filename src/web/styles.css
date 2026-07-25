@@ -38,6 +38,7 @@ body {
 
 button,
 input,
+select,
 textarea {
   color: inherit;
   font: inherit;
@@ -50,6 +51,7 @@ button {
 
 button:focus-visible,
 input:focus-visible,
+select:focus-visible,
 textarea:focus-visible {
   outline: 2px solid color-mix(in oklab, var(--blue), white 15%);
   outline-offset: 2px;
@@ -1346,6 +1348,10 @@ tbody tr:hover {
   gap: 14px;
 }
 
+.ontology-grid.editing {
+  grid-template-columns: 220px minmax(620px, 1fr) 250px;
+}
+
 .panel-heading {
   display: flex;
   align-items: center;
@@ -1646,6 +1652,347 @@ tbody tr:hover {
 .draft-panel > button {
   width: calc(100% - 24px);
   margin: 8px 12px 0;
+}
+
+.danger-text {
+  color: var(--danger);
+}
+
+.danger-text:hover:not(:disabled) {
+  border-color: color-mix(in oklab, var(--danger), white 65%);
+  color: var(--danger);
+}
+
+.validation-summary {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 10px 12px 0;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 10px;
+}
+
+.validation-summary.valid {
+  border-color: color-mix(in oklab, var(--success), white 70%);
+  background: color-mix(in oklab, var(--success), white 95%);
+}
+
+.validation-summary.invalid {
+  border-color: color-mix(in oklab, var(--danger), white 72%);
+  background: color-mix(in oklab, var(--danger), white 96%);
+}
+
+.validation-summary strong {
+  font-size: 10px;
+}
+
+.validation-summary span,
+.validation-summary small {
+  color: var(--muted);
+  font-size: 8px;
+  line-height: 1.45;
+}
+
+.ontology-editor {
+  min-width: 0;
+}
+
+.editor-toolbar {
+  display: flex;
+  min-height: 52px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid var(--border);
+  padding: 0 14px;
+}
+
+.editor-tabs {
+  display: flex;
+  align-self: stretch;
+  gap: 2px;
+}
+
+.editor-tabs button {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  padding: 0 9px;
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.editor-tabs button:hover,
+.editor-tabs button.active {
+  color: var(--blue);
+}
+
+.editor-tabs button.active {
+  border-bottom-color: var(--blue);
+}
+
+.editor-tabs button span {
+  display: grid;
+  min-width: 17px;
+  height: 17px;
+  place-items: center;
+  border-radius: 5px;
+  background: #f2f4f7;
+  color: #667085;
+  font-size: 8px;
+}
+
+.save-state {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.save-state > span {
+  color: var(--muted);
+  font-size: 8px;
+}
+
+.save-state > span.dirty {
+  color: var(--warning);
+}
+
+.save-state .primary-button {
+  min-height: 32px;
+  padding: 0 11px;
+  font-size: 10px;
+}
+
+.editor-section {
+  padding: 16px;
+}
+
+.ontology-form-grid {
+  margin-top: 0;
+}
+
+.ontology-form-grid input,
+.ontology-form-grid select,
+.ontology-form-grid textarea {
+  width: 100%;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  background: white;
+  outline: 0;
+  padding: 8px 10px;
+  font-size: 10px;
+}
+
+.ontology-form-grid input,
+.ontology-form-grid select {
+  min-height: 36px;
+}
+
+.ontology-form-grid select[multiple] {
+  min-height: 82px;
+}
+
+.ontology-form-grid textarea {
+  resize: vertical;
+  line-height: 1.55;
+}
+
+.ontology-form-grid input:focus,
+.ontology-form-grid select:focus,
+.ontology-form-grid textarea:focus {
+  border-color: var(--blue);
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--blue), transparent 90%);
+}
+
+.ontology-form-grid input:disabled,
+.ontology-form-grid select:disabled {
+  background: #f6f8fb;
+  color: var(--muted);
+}
+
+.editor-help {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  margin-bottom: 12px;
+  border: 1px solid color-mix(in oklab, var(--blue), white 76%);
+  border-radius: 7px;
+  background: var(--blue-soft);
+  color: #475467;
+  padding: 9px 11px;
+  font-size: 9px;
+  line-height: 1.5;
+}
+
+.property-edit-table {
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.property-edit-row {
+  display: grid;
+  grid-template-columns: 1.1fr 1fr 0.85fr 1fr;
+  gap: 8px;
+  align-items: center;
+  border-top: 1px solid var(--border);
+  padding: 9px;
+}
+
+.property-edit-row.header {
+  border-top: 0;
+  background: #f8fafc;
+  color: var(--muted);
+  font-size: 8px;
+  font-weight: 700;
+}
+
+.property-edit-row input,
+.property-edit-row select,
+.property-edit-row textarea {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: white;
+  outline: 0;
+  padding: 7px 8px;
+  font-size: 9px;
+}
+
+.property-edit-row textarea {
+  grid-column: span 2;
+  resize: vertical;
+}
+
+.physical-field {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.physical-field code {
+  overflow: hidden;
+  color: #344054;
+  font-size: 9px;
+  text-overflow: ellipsis;
+}
+
+.physical-field small {
+  color: var(--muted);
+  font-size: 8px;
+}
+
+.inline-check {
+  display: flex !important;
+  flex-direction: row !important;
+  align-items: center;
+  gap: 6px !important;
+  color: #475467;
+  font-size: 9px;
+}
+
+.inline-check input {
+  width: 14px !important;
+  min-height: 14px !important;
+  height: 14px !important;
+  padding: 0 !important;
+  accent-color: var(--blue);
+}
+
+.split-editor {
+  display: grid;
+  min-height: 430px;
+  grid-template-columns: 190px minmax(0, 1fr);
+  gap: 14px;
+  padding: 0;
+}
+
+.entity-list {
+  border-right: 1px solid var(--border);
+  padding: 12px 8px;
+}
+
+.entity-list > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 4px 8px;
+}
+
+.entity-list > div > strong {
+  font-size: 10px;
+}
+
+.entity-list > button:not(.subtle-button) {
+  display: flex;
+  width: 100%;
+  flex-direction: column;
+  gap: 3px;
+  border-radius: 6px;
+  background: transparent;
+  padding: 8px;
+  text-align: left;
+}
+
+.entity-list > button:hover,
+.entity-list > button.selected {
+  background: var(--blue-soft);
+}
+
+.entity-list > button strong {
+  font-size: 9px;
+}
+
+.entity-list > button small,
+.entity-list > p {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 8px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.entity-form {
+  min-width: 0;
+  padding: 14px;
+}
+
+.entity-form-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.entity-form-heading > strong {
+  font-size: 11px;
+}
+
+.entity-empty {
+  display: grid;
+  min-height: 260px;
+  place-items: center;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.expression-preview {
+  display: block;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: #f8fafc;
+  color: #344054;
+  padding: 10px;
+  font-size: 9px;
+  white-space: pre-wrap;
 }
 
 .compact-empty {

@@ -1,16 +1,14 @@
 import {
   AgentLoop,
   ContextBuilder,
-  OpenAIModel,
   PermissionGate,
   SessionManager,
   SessionStore,
   ToolRegistry,
   defaultPolicy,
-  type AgentMessage,
+  resolveConfiguredModel,
+  type ConfiguredModelRuntime,
   type AgentReporter,
-  type AgentResponse,
-  type ModelClient,
   type Tool,
   type ToolOutcome,
 } from "montane-code";
@@ -19,7 +17,6 @@ import type {
   ResultArtifact,
   Turn,
 } from "../shared/types.js";
-import { createId } from "./id.js";
 import { Repository } from "./repository.js";
 import { SemanticIndex } from "./semantic-index.js";
 import type { QueryResult } from "./selectdb.js";
@@ -62,6 +59,7 @@ type ManagedSession = Awaited<ReturnType<SessionManager["create"]>>;
 export class DataAgentHarness {
   private readonly sessionManager: SessionManager;
   private readonly sessions = new Map<string, ManagedSession>();
+  private modelRuntimePromise?: Promise<ConfiguredModelRuntime>;
 
   constructor(
     private readonly workspaceRoot: string,
@@ -70,9 +68,11 @@ export class DataAgentHarness {
       sql: string,
       maxRows: number,
     ) => Promise<QueryResult>,
+    private readonly resolveModelRuntime: () => Promise<ConfiguredModelRuntime> =
+      () => resolveConfiguredModel({ workspaceRoot }),
   ) {
     this.sessionManager = new SessionManager(workspaceRoot, {
-      model: process.env.OPENAI_MODEL || "insightflow-local-router",
+      model: "montane-configured",
     });
   }
 
@@ -83,10 +83,7 @@ export class DataAgentHarness {
   ): Promise<HarnessRunResult> {
     const managed = await this.getOrCreateSession(conversation);
     const source = this.repository.getDataSource();
-    const modelConfigured = Boolean(
-      process.env.OPENAI_API_KEY && process.env.OPENAI_MODEL,
-    );
-    const analysisReady = Boolean(source.configured && modelConfigured);
+    const runtime = await this.getModelRuntime();
     let captured: CapturedAnalysis | null = null;
     const tools = new ToolRegistry();
     tools.register(this.ontologySearchTool());
@@ -107,16 +104,13 @@ export class DataAgentHarness {
         await managed.updateLastSequence(event.sequence);
       },
     );
-    const model = analysisReady
-      ? this.createLiveModel()
-      : new LocalRoutingModel(source.configured, modelConfigured);
     const context = new ContextBuilder(
       this.workspaceRoot,
       60,
       DATA_AGENT_SYSTEM_PROMPT,
     );
     const loop = new AgentLoop(
-      model,
+      runtime.client,
       tools,
       permissions,
       context,
@@ -144,7 +138,7 @@ export class DataAgentHarness {
     const asksForData = isLikelyDataQuestion(turn.question);
     const responseKind: HarnessRunResult["responseKind"] = completed
       ? "analysis"
-      : asksForData && !analysisReady
+      : asksForData && !source.configured
         ? "configuration_required"
         : asksForData
           ? "clarification"
@@ -166,6 +160,42 @@ export class DataAgentHarness {
   async close(): Promise<void> {
     await Promise.all([...this.sessions.values()].map((session) => session.release()));
     this.sessions.clear();
+  }
+
+  async runtimeStatus(): Promise<{
+    configured: boolean;
+    provider?: string;
+    model?: string;
+    error?: string;
+  }> {
+    try {
+      const runtime = await this.getModelRuntime();
+      return {
+        configured: true,
+        provider: runtime.provider,
+        model: runtime.model,
+      };
+    } catch (error) {
+      return {
+        configured: false,
+        error:
+          error instanceof Error
+            ? error.message
+            : "Montane 模型运行时不可用",
+      };
+    }
+  }
+
+  private async getModelRuntime(): Promise<ConfiguredModelRuntime> {
+    if (!this.modelRuntimePromise) {
+      this.modelRuntimePromise = this.resolveModelRuntime();
+    }
+    try {
+      return await this.modelRuntimePromise;
+    } catch (error) {
+      this.modelRuntimePromise = undefined;
+      throw error;
+    }
   }
 
   private async getOrCreateSession(conversation: Conversation): Promise<ManagedSession> {
@@ -191,14 +221,6 @@ export class DataAgentHarness {
       });
     }
     return managed;
-  }
-
-  private createLiveModel(): ModelClient {
-    return new OpenAIModel({
-      apiKey: process.env.OPENAI_API_KEY!,
-      model: process.env.OPENAI_MODEL!,
-      baseUrl: process.env.OPENAI_BASE_URL,
-    });
   }
 
   private ontologySearchTool(): Tool {
@@ -342,79 +364,10 @@ export class DataAgentHarness {
   }
 }
 
-class LocalRoutingModel implements ModelClient {
-  readonly capabilities = {
-    contextWindow: 32_000,
-    maxOutputTokens: 2_000,
-    supportsStreaming: true,
-    supportsToolUse: true,
-    supportsImages: false,
-  };
-
-  constructor(
-    private readonly sourceConfigured: boolean,
-    private readonly modelConfigured: boolean,
-  ) {}
-
-  async complete(options: {
-    messages: AgentMessage[];
-    tools: Array<Record<string, unknown>>;
-    onTextDelta?: (delta: string) => void;
-  }): Promise<AgentResponse> {
-    const current = currentTurnMessages(options.messages);
-    const question =
-      [...current].reverse().find((message) => message.role === "user")?.content ?? "";
-    const finalText = isLikelyDataQuestion(question)
-      ? this.configurationMessage()
-      : conversationalReply(question);
-    options.onTextDelta?.(finalText);
-    return {
-      finalText,
-      stopReason: "end_turn",
-      usage: {
-        inputTokens: 0,
-        outputTokens: 0,
-      },
-      requestId: createId("local_request"),
-    };
-  }
-
-  private configurationMessage(): string {
-    if (!this.sourceConfigured && !this.modelConfigured) {
-      return "我还不能执行真实问数。请先在「数据管理」配置 SelectDB 并扫描 Schema，然后设置 OPENAI_API_KEY 和 OPENAI_MODEL。配置完成前我不会生成示例数据或虚构分析结论。";
-    }
-    if (!this.sourceConfigured) {
-      return "模型已经配置，但还没有可查询的 SelectDB 数据源。请先在「数据管理」完成连接、扫描 Schema，并发布至少一个本体对象。";
-    }
-    return "SelectDB 已连接，但分析模型尚未配置。请设置 OPENAI_API_KEY 和 OPENAI_MODEL 后重启服务；在此之前我不会用演示结果代替真实查询。";
-  }
-}
-
-function currentTurnMessages(messages: AgentMessage[]): AgentMessage[] {
-  let lastUserIndex = -1;
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    if (messages[index]?.role === "user") {
-      lastUserIndex = index;
-      break;
-    }
-  }
-  return lastUserIndex >= 0 ? messages.slice(lastUserIndex) : messages;
-}
-
 function isLikelyDataQuestion(question: string): boolean {
   return /分析|数据|指标|销售|订单|成交|收入|营收|金额|客户|会员|商品|品类|门店|区域|趋势|增长|下降|环比|同比|对比|排名|占比|多少|几|哪些|最高|最低|平均|总计|汇总|明细|GMV|AOV|TOP\s*\d*/i.test(
     question,
   );
-}
-
-function conversationalReply(question: string): string {
-  if (/^(你好|您好|嗨|哈喽|hello|hi|hey)[！!。.，,\s]*$/i.test(question)) {
-    return "你好，我是 InsightFlow Data Agent。你可以问我业务指标、趋势、对比和明细问题；只有在真实数据源与模型都就绪后，我才会执行查询并返回结论。";
-  }
-  if (/你是谁|能做什么|怎么用|帮助|help/i.test(question)) {
-    return "我负责基于已发布业务本体查询 SelectDB，并逐轮展示语义绑定、关系路径、SQL 与执行结果。你可以先在「数据管理」连接业务库，再到「本体」选择表进行建模。";
-  }
-  return "我是面向业务数据分析的 Data Agent。目前这条消息不需要查询数据；如果你要问数，请说明指标、分析维度和时间范围。";
 }
 
 function createLiveResult(title: string, query: QueryResult): ResultArtifact {

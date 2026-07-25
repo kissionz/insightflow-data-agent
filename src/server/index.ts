@@ -52,17 +52,20 @@ app.get("/api/health", async () => ({ ok: true, version: "0.1.0" }));
 
 app.get("/api/bootstrap", async () => {
   const dataSource = repository.getDataSource();
-  const modelConfigured = Boolean(
-    process.env.OPENAI_API_KEY && process.env.OPENAI_MODEL,
-  );
+  const montaneRuntime = await harness.runtimeStatus();
   return {
     conversations: repository.getConversations(),
     ontology: repository.getOntology(),
     tables: repository.getTables(),
     dataSource,
     runtime: {
-      modelConfigured,
-      analysisReady: Boolean(dataSource.configured && modelConfigured),
+      modelConfigured: montaneRuntime.configured,
+      analysisReady: Boolean(
+        dataSource.configured && montaneRuntime.configured,
+      ),
+      provider: montaneRuntime.provider,
+      model: montaneRuntime.model,
+      modelError: montaneRuntime.error,
       credentialStore: credentialStoreKind(),
     },
   };
@@ -170,8 +173,14 @@ app.put<{ Body: DataSourceInput }>("/api/data-source", async (request, reply) =>
 app.post("/api/schema/scan", async (_request, reply) => {
   const source = repository.getDataSource();
   const password = await keychain.getPassword();
-  if (!source.configured || !source.database || !password) {
+  if (!source.configured || !source.database) {
     return reply.code(409).send({ message: "请先在数据管理中完成 SelectDB 配置" });
+  }
+  if (!password) {
+    return reply.code(409).send({
+      message:
+        "SelectDB 连接参数已保存，但无法读取密码。请重新打开连接配置并保存密码后再扫描。",
+    });
   }
   try {
     await selectDb.configure(source, password);

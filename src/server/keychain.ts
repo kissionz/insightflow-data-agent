@@ -12,6 +12,7 @@ function accountFor(workspaceRoot: string): string {
 
 export class KeychainStore {
   private readonly windowsCredentialPath: string;
+  private cachedPassword: string | null = null;
 
   constructor(
     private readonly workspaceRoot: string,
@@ -36,6 +37,7 @@ export class KeychainStore {
         "-w",
         password,
       ]);
+      this.cachedPassword = password;
       return;
     }
 
@@ -50,6 +52,11 @@ $secure = ConvertTo-SecureString -String $plain -AsPlainText -Force
 $encrypted = ConvertFrom-SecureString -SecureString $secure
 [IO.File]::WriteAllText(${powerShellLiteral(this.windowsCredentialPath)}, $encrypted)
 `);
+      const verified = await this.readWindowsPassword();
+      if (verified !== password) {
+        throw new Error("Windows DPAPI 凭据写入后回读校验失败");
+      }
+      this.cachedPassword = password;
       return;
     }
 
@@ -61,6 +68,9 @@ $encrypted = ConvertFrom-SecureString -SecureString $secure
   async getPassword(): Promise<string | null> {
     if (process.env.SELECTDB_PASSWORD) {
       return process.env.SELECTDB_PASSWORD;
+    }
+    if (this.cachedPassword) {
+      return this.cachedPassword;
     }
 
     if (process.platform === "darwin") {
@@ -81,8 +91,21 @@ $encrypted = ConvertFrom-SecureString -SecureString $secure
 
     if (process.platform === "win32") {
       try {
-        const encoded = await runPowerShell(`
+        const password = await this.readWindowsPassword();
+        this.cachedPassword = password;
+        return password;
+      } catch {
+        return null;
+      }
+    }
+
+    return null;
+  }
+
+  private async readWindowsPassword(): Promise<string> {
+    const encoded = await runPowerShell(`
 $ErrorActionPreference = 'Stop'
+$OutputEncoding = [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 $encrypted = [IO.File]::ReadAllText(${powerShellLiteral(this.windowsCredentialPath)})
 $secure = ConvertTo-SecureString -String $encrypted
 $pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
@@ -93,13 +116,7 @@ try {
   [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer)
 }
 `);
-        return Buffer.from(encoded.trim(), "base64").toString("utf8");
-      } catch {
-        return null;
-      }
-    }
-
-    return null;
+    return Buffer.from(encoded.trim(), "base64").toString("utf8");
   }
 }
 

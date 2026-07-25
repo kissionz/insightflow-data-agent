@@ -45,20 +45,15 @@ AgentLoop
   -> AgentReporter
 ```
 
-配置 `OPENAI_API_KEY`、`OPENAI_MODEL` 和 SelectDB 后才允许真实查询。一般
-对话仍通过 AgentLoop 返回文本响应；分析运行条件不完整时会明确指出缺失配置，
-不会生成固定图表、示例数据或虚构结论。每轮仍保留完整追踪，未执行的语义与
-SQL 步骤会标记为“未执行”。`.montane/sessions/` 中会保留原始 Harness 事件记录。
+InsightFlow 不单独配置或调用大模型。它通过 Montane SDK 读取与 CLI 完全相同
+的用户配置、provider、模型、Base URL 和可信 env-file，再把所有理解、规划、
+SQL 生成和结果解释交给同一个 Montane AgentLoop。只要 Montane CLI 本身能够
+正常回答问题，InsightFlow 会自动复用该运行时。
 
-Windows PowerShell 可以在启动前设置模型环境：
-
-```powershell
-$env:OPENAI_API_KEY="..."
-$env:OPENAI_MODEL="..."
-npm start
-```
-
-「设置」页会显示真实问数链路是否已经就绪。
+SelectDB 或 Montane 运行条件不完整时会明确指出原因，不会生成固定图表、示例
+数据或虚构结论。每轮仍保留完整追踪，未执行的语义与 SQL 步骤会标记为“未执行”。
+`.montane/sessions/` 中会保留原始 Harness 事件记录；「设置」页会显示实际复用
+的 Montane provider 与模型。
 
 ## 验证
 

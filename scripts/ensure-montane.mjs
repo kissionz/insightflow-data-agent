@@ -11,10 +11,10 @@ const REQUIRED_EXPORTS = [
   "ToolRegistry",
   "PermissionGate",
   "defaultPolicy",
-  "OpenAIModel",
+  "resolveConfiguredModel",
 ];
 const REMOTE_SPEC =
-  "git+https://github.com/kissionz/data-engineer.git#a8672f8f78bcb0ab5351698659a5a8e706835867";
+  "git+https://github.com/kissionz/data-engineer.git#418e4e10b32cfac66339d8679f61683dcc813ffa";
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 if (await isUsableMontane("montane-code")) {

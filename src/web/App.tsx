@@ -1296,10 +1296,10 @@ function SettingsPage({ runtime }: { runtime: BootstrapPayload["runtime"] }) {
           <h2>真实问数链路</h2>
           <p>
             {runtime.analysisReady
-              ? "SelectDB 与分析模型均已就绪，可以执行真实查询。"
+              ? `SelectDB 与 Montane 已就绪，当前使用 ${runtime.provider || "已配置 provider"} / ${runtime.model || "默认模型"}。`
               : runtime.modelConfigured
-                ? "分析模型已加载，请确认 SelectDB 连接与本体已发布。"
-                : "尚未加载分析模型，请在启动环境中设置 OPENAI_API_KEY 和 OPENAI_MODEL。"}
+                ? `Montane 已加载 ${runtime.provider || "模型运行时"}，请确认 SelectDB 连接与本体已发布。`
+                : runtime.modelError || "Montane CLI 模型运行时不可用，请先确认 Montane 本身可以正常回答问题。"}
           </p>
         </div>
         <span className={`status-pill ${runtime.analysisReady ? "success" : "warning"}`}>

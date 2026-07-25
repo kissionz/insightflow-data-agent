@@ -216,6 +216,9 @@ export interface BootstrapPayload {
   runtime: {
     modelConfigured: boolean;
     analysisReady: boolean;
+    provider?: string;
+    model?: string;
+    modelError?: string;
     credentialStore: "macos_keychain" | "windows_dpapi" | "environment";
   };
 }

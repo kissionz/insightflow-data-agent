@@ -26,7 +26,7 @@
     "@phosphor-icons/react": "^2.1.10",
     "echarts": "^6.0.0",
     "fastify": "^5.6.1",
-    "montane-code": "git+https://github.com/kissionz/data-engineer.git#418e4e10b32cfac66339d8679f61683dcc813ffa",
+    "montane-code": "git+https://github.com/kissionz/data-engineer.git#c5135996b1eea5ffc546b5203025363ecf694774",
     "mysql2": "^3.15.3",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",

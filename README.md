@@ -26,8 +26,9 @@ Web 应用运行在 `http://127.0.0.1:4311`，本地 API 运行在
 
 首次启动为空工作区，不会预置业务表、本体对象、会话或分析结果。先在「数据
 管理」配置真实 SelectDB 连接并扫描 Schema，再到「本体」选择未建模表生成
-草稿。Windows 使用当前用户的 DPAPI 加密保存密码，macOS 使用系统钥匙串；
-也可以通过 `SELECTDB_PASSWORD` 环境变量注入密码。本体、版本和会话保存在：
+草稿。Windows 通过 `ProtectedData` 使用当前用户的 DPAPI 加密保存密码，支持
+Unicode 路径和密码；macOS 使用系统钥匙串。也可以通过 `SELECTDB_PASSWORD`
+环境变量注入密码。本体、版本和会话保存在：
 
 ```text
 <workspace>/.montane/data-agent/ontology.sqlite
@@ -48,7 +49,8 @@ AgentLoop
 InsightFlow 不单独配置或调用大模型。它通过 Montane SDK 读取与 CLI 完全相同
 的用户配置、provider、模型、Base URL 和可信 env-file，再把所有理解、规划、
 SQL 生成和结果解释交给同一个 Montane AgentLoop。只要 Montane CLI 本身能够
-正常回答问题，InsightFlow 会自动复用该运行时。
+正常回答问题，SDK 会自动复用默认用户配置以及全局安装或 `npm link` 的 CLI
+运行环境；InsightFlow 不要求再配置一份 API Key。
 
 SelectDB 或 Montane 运行条件不完整时会明确指出原因，不会生成固定图表、示例
 数据或虚构结论。每轮仍保留完整追踪，未执行的语义与 SQL 步骤会标记为“未执行”。

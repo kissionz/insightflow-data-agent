@@ -14,7 +14,7 @@ const REQUIRED_EXPORTS = [
   "resolveConfiguredModel",
 ];
 const REMOTE_SPEC =
-  "git+https://github.com/kissionz/data-engineer.git#418e4e10b32cfac66339d8679f61683dcc813ffa";
+  "git+https://github.com/kissionz/data-engineer.git#c5135996b1eea5ffc546b5203025363ecf694774";
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 if (await isUsableMontane("montane-code")) {

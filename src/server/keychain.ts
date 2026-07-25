@@ -13,11 +13,22 @@ function accountFor(workspaceRoot: string): string {
 export class KeychainStore {
   private readonly windowsCredentialPath: string;
   private cachedPassword: string | null = null;
+  private readonly platform: NodeJS.Platform;
+  private readonly executePowerShell: (
+    script: string,
+    input?: string,
+  ) => Promise<string>;
 
   constructor(
     private readonly workspaceRoot: string,
     stateRoot: string,
+    options: {
+      platform?: NodeJS.Platform;
+      executePowerShell?: (script: string, input?: string) => Promise<string>;
+    } = {},
   ) {
+    this.platform = options.platform ?? process.platform;
+    this.executePowerShell = options.executePowerShell ?? runPowerShell;
     this.windowsCredentialPath = path.join(
       stateRoot,
       "data-agent",
@@ -26,7 +37,7 @@ export class KeychainStore {
   }
 
   async setPassword(password: string): Promise<void> {
-    if (process.platform === "darwin") {
+    if (this.platform === "darwin") {
       await execFileAsync("security", [
         "add-generic-password",
         "-U",
@@ -41,17 +52,33 @@ export class KeychainStore {
       return;
     }
 
-    if (process.platform === "win32") {
+    if (this.platform === "win32") {
       fs.mkdirSync(path.dirname(this.windowsCredentialPath), { recursive: true });
       const encodedPassword = Buffer.from(password, "utf8").toString("base64");
-      await runPowerShell(`
+      const encodedPath = Buffer.from(this.windowsCredentialPath, "utf8").toString(
+        "base64",
+      );
+      await this.executePowerShell(
+        `
 $ErrorActionPreference = 'Stop'
-$bytes = [Convert]::FromBase64String('${encodedPassword}')
-$plain = [Text.Encoding]::UTF8.GetString($bytes)
-$secure = ConvertTo-SecureString -String $plain -AsPlainText -Force
-$encrypted = ConvertFrom-SecureString -SecureString $secure
-[IO.File]::WriteAllText(${powerShellLiteral(this.windowsCredentialPath)}, $encrypted)
-`);
+Add-Type -AssemblyName System.Security
+$path = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encodedPath}'))
+$plain = [Convert]::FromBase64String([Console]::In.ReadToEnd())
+$encrypted = [Security.Cryptography.ProtectedData]::Protect(
+  $plain,
+  $null,
+  [Security.Cryptography.DataProtectionScope]::CurrentUser
+)
+$temporaryPath = "$path.$PID.tmp"
+[IO.File]::WriteAllBytes($temporaryPath, $encrypted)
+if ([IO.File]::Exists($path)) {
+  [IO.File]::Replace($temporaryPath, $path, $null)
+} else {
+  [IO.File]::Move($temporaryPath, $path)
+}
+`,
+        encodedPassword,
+      );
       const verified = await this.readWindowsPassword();
       if (verified !== password) {
         throw new Error("Windows DPAPI 凭据写入后回读校验失败");
@@ -73,7 +100,7 @@ $encrypted = ConvertFrom-SecureString -SecureString $secure
       return this.cachedPassword;
     }
 
-    if (process.platform === "darwin") {
+    if (this.platform === "darwin") {
       try {
         const { stdout } = await execFileAsync("security", [
           "find-generic-password",
@@ -89,7 +116,7 @@ $encrypted = ConvertFrom-SecureString -SecureString $secure
       }
     }
 
-    if (process.platform === "win32") {
+    if (this.platform === "win32") {
       try {
         const password = await this.readWindowsPassword();
         this.cachedPassword = password;
@@ -103,20 +130,23 @@ $encrypted = ConvertFrom-SecureString -SecureString $secure
   }
 
   private async readWindowsPassword(): Promise<string> {
-    const encoded = await runPowerShell(`
+    const encodedPath = Buffer.from(this.windowsCredentialPath, "utf8").toString(
+      "base64",
+    );
+    const encoded = await this.executePowerShell(`
 $ErrorActionPreference = 'Stop'
-$OutputEncoding = [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
-$encrypted = [IO.File]::ReadAllText(${powerShellLiteral(this.windowsCredentialPath)})
-$secure = ConvertTo-SecureString -String $encrypted
-$pointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
-try {
-  $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($pointer)
-  [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($plain))
-} finally {
-  [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($pointer)
-}
+Add-Type -AssemblyName System.Security
+$path = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encodedPath}'))
+$encrypted = [IO.File]::ReadAllBytes($path)
+$plain = [Security.Cryptography.ProtectedData]::Unprotect(
+  $encrypted,
+  $null,
+  [Security.Cryptography.DataProtectionScope]::CurrentUser
+)
+[Console]::Out.Write([Convert]::ToBase64String($plain))
 `);
-    return Buffer.from(encoded.trim(), "base64").toString("utf8");
+    const payload = encoded.trim().split(/\r?\n/).at(-1) ?? "";
+    return Buffer.from(payload, "base64").toString("utf8");
   }
 }
 
@@ -129,15 +159,18 @@ export function credentialStoreKind():
   return "environment";
 }
 
-function powerShellLiteral(value: string): string {
-  return `'${value.replaceAll("'", "''")}'`;
-}
-
-function runPowerShell(script: string): Promise<string> {
+function runPowerShell(script: string, input = ""): Promise<string> {
   return new Promise((resolve, reject) => {
+    const encodedCommand = Buffer.from(script, "utf16le").toString("base64");
     const child = spawn(
       "powershell.exe",
-      ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "-"],
+      [
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-EncodedCommand",
+        encodedCommand,
+      ],
       { stdio: ["pipe", "pipe", "pipe"], windowsHide: true },
     );
     let stdout = "";
@@ -155,6 +188,6 @@ function runPowerShell(script: string): Promise<string> {
       if (code === 0) resolve(stdout);
       else reject(new Error(stderr.trim() || `PowerShell 执行失败（${code}）`));
     });
-    child.stdin.end(script);
+    child.stdin.end(input);
   });
 }

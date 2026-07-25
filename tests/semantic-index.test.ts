@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { SemanticIndex } from "../src/server/semantic-index.js";
-import { demoOntology } from "../src/server/seed.js";
+import { testOntology } from "./fixtures.js";
 
 describe("SemanticIndex", () => {
-  const index = new SemanticIndex(demoOntology);
+  const index = new SemanticIndex(testOntology);
 
   it("matches Chinese synonyms to published metrics", () => {
     const matches = index.search("本月销售额怎么样");

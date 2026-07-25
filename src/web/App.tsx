@@ -256,7 +256,7 @@ function ConversationRail({
         <span className="health-dot" />
         <div>
           <strong>语义服务正常</strong>
-          <small>本体 v4 · 本地运行</small>
+          <small>Montane Harness · 本地运行</small>
         </div>
       </div>
     </aside>
@@ -392,7 +392,9 @@ function TurnCard({ turn }: { turn: Turn }) {
     setTraceOpen(!isTerminal(turn.status));
   }, [turn.status]);
   const completed = turn.trace.filter((step) => step.status === "completed").length;
+  const skipped = turn.trace.filter((step) => step.status === "skipped").length;
   const activeStep = turn.trace.find((step) => step.status === "running");
+  const terminal = isTerminal(turn.status);
 
   return (
     <article className="turn-card">
@@ -407,20 +409,32 @@ function TurnCard({ turn }: { turn: Turn }) {
       <button className="trace-summary" onClick={() => setTraceOpen((value) => !value)}>
         <span
           className={`trace-orb ${
-            turn.status === "completed" ? "done" : turn.status === "failed" ? "failed" : ""
+            turn.status === "completed"
+              ? "done"
+              : turn.status === "failed"
+                ? "failed"
+                : turn.status === "needs_clarification"
+                  ? "waiting"
+                  : ""
           }`}
         >
-          {turn.status === "completed" ? <Check size={14} weight="bold" /> : <Brain size={15} />}
+          {turn.status === "completed" ? (
+            <Check size={14} weight="bold" />
+          ) : turn.status === "needs_clarification" ? (
+            <Info size={15} />
+          ) : (
+            <Brain size={15} />
+          )}
         </span>
         <span className="trace-summary-copy">
           <strong>
-            {turn.status === "completed"
+            {terminal
               ? "推理与查询追踪"
               : activeStep?.label || "正在准备分析"}
           </strong>
           <small>
-            {turn.status === "completed"
-              ? `${completed} 个步骤已完成 · 本体 v${turn.ontologyVersion}`
+            {terminal
+              ? `${completed} 个完成${skipped ? ` · ${skipped} 个未执行` : ""} · 本体 v${turn.ontologyVersion}`
               : `${activeStep?.summary || "初始化上下文"} · ${completed}/${turn.trace.length}`}
           </small>
         </span>
@@ -428,7 +442,13 @@ function TurnCard({ turn }: { turn: Turn }) {
         {traceOpen ? <CaretDown size={16} /> : <CaretRight size={16} />}
       </button>
       {traceOpen && <TraceTimeline trace={turn.trace} />}
-      {turn.result ? <ResultCard turn={turn} /> : <RunningResult status={turn.status} />}
+      {turn.result ? (
+        <ResultCard turn={turn} />
+      ) : turn.answer && terminal ? (
+        <TextAnswer turn={turn} />
+      ) : (
+        <RunningResult status={turn.status} />
+      )}
     </article>
   );
 }
@@ -442,6 +462,8 @@ function TraceTimeline({ trace }: { trace: TraceStep[] }) {
             <span>
               {step.status === "completed" ? (
                 <Check size={12} weight="bold" />
+              ) : step.status === "skipped" ? (
+                "–"
               ) : step.status === "running" ? (
                 <span className="spinner" />
               ) : (
@@ -500,12 +522,8 @@ function ResultCard({ turn }: { turn: Turn }) {
           <span className="message-label">InsightFlow</span>
           <strong>分析完成</strong>
         </div>
-        <span className={`completed-chip ${result.mode === "demo" ? "demo" : ""}`}>
-          {result.mode === "demo" ? (
-            <><Info size={15} /> 示例模式</>
-          ) : (
-            <><CheckCircle size={15} weight="fill" /> 真实查询</>
-          )}
+        <span className="completed-chip">
+          <CheckCircle size={15} weight="fill" /> 真实查询
         </span>
       </div>
       <p className="conclusion">{result.conclusion}</p>
@@ -563,6 +581,23 @@ function ResultCard({ turn }: { turn: Turn }) {
   );
 }
 
+function TextAnswer({ turn }: { turn: Turn }) {
+  const needsConfiguration = turn.responseKind === "configuration_required";
+  return (
+    <div className={`text-answer ${needsConfiguration ? "configuration" : ""}`}>
+      <div className="agent-avatar">
+        {needsConfiguration ? <GearSix size={17} /> : <Sparkle size={17} weight="fill" />}
+      </div>
+      <div>
+        <span className="message-label">
+          {needsConfiguration ? "运行条件未就绪" : "InsightFlow"}
+        </span>
+        <p>{turn.answer}</p>
+      </div>
+    </div>
+  );
+}
+
 function RunningResult({ status }: { status: Turn["status"] }) {
   if (status === "failed") {
     return (
@@ -592,6 +627,9 @@ function ContextPanel({
   ontology: OntologySnapshot;
 }) {
   const turn = conversation?.turns.at(-1);
+  const semantic = turn?.trace.find((step) => step.kind === "semantic_binding");
+  const relation = turn?.trace.find((step) => step.kind === "relation_path");
+  const execution = turn?.trace.find((step) => step.kind === "execution");
   return (
     <aside className="context-panel">
       <header>
@@ -599,30 +637,41 @@ function ContextPanel({
         <Info size={17} />
       </header>
       <section>
-        <h3>当前口径</h3>
-        <div className="context-chips">
-          <span>时间 · 本月</span>
-          <span>区域 · 华东</span>
-          <span>币种 · CNY</span>
-        </div>
+        <h3>当前问题</h3>
+        <p className="context-question">
+          {turn?.question || "发送问题后，这里会显示本轮实际分析上下文。"}
+        </p>
       </section>
       <section>
-        <h3>绑定语义</h3>
-        <ContextItem icon={CirclesFour} label="业务对象" value="订单 · 门店" />
-        <ContextItem icon={ChartBar} label="核心指标" value="成交金额 · 订单量" />
-        <ContextItem icon={GitBranch} label="关系路径" value="订单 → 门店" />
+        <h3>本轮追踪</h3>
+        <ContextItem
+          icon={CirclesFour}
+          label="语义绑定"
+          value={semantic?.summary || "尚未执行"}
+        />
+        <ContextItem
+          icon={GitBranch}
+          label="关系路径"
+          value={relation?.summary || "尚未执行"}
+        />
+        <ContextItem
+          icon={Database}
+          label="查询执行"
+          value={execution?.summary || "尚未执行"}
+        />
       </section>
       <section>
-        <h3>可信度</h3>
-        <div className="confidence">
-          <div>
-            <strong>92</strong>
-            <span>/ 100</span>
-          </div>
-          <div className="confidence-bar">
-            <span />
-          </div>
-          <small>口径和关系路径均已发布</small>
+        <h3>结果类型</h3>
+        <div className={`context-result-kind ${turn?.result ? "verified" : ""}`}>
+          {turn?.result ? <SealCheck size={18} weight="fill" /> : <Info size={18} />}
+          <span>
+            <strong>{turn?.result ? "真实查询结果" : "未产生数据结果"}</strong>
+            <small>
+              {turn?.result
+                ? "结论来自本轮 SelectDB 返回数据"
+                : "一般对话或运行条件不足时不会生成图表"}
+            </small>
+          </span>
         </div>
       </section>
       <section className="context-version">
@@ -738,8 +787,18 @@ function OntologyPage({
   onError: (message: string) => void;
 }) {
   const [selected, setSelected] = useState<string[]>([]);
+  const [focusedId, setFocusedId] = useState(ontology.objects[0]?.id ?? "");
   const available = tables.filter((table) => table.status === "UNMODELED");
   const drafting = ontology.status === "DRAFT";
+  const focusedObject =
+    ontology.objects.find((object) => object.id === focusedId) ??
+    ontology.objects[0] ??
+    null;
+  useEffect(() => {
+    if (!focusedObject && ontology.objects[0]) {
+      setFocusedId(ontology.objects[0].id);
+    }
+  }, [focusedObject, ontology.objects]);
   async function draft() {
     try {
       const result = await api.createDrafts(selected);
@@ -773,50 +832,67 @@ function OntologyPage({
         <section className="panel ontology-list">
           <div className="panel-heading">
             <div>
-              <span className="section-kicker">已发布语义</span>
+              <span className="section-kicker">业务语义</span>
               <h2>对象目录</h2>
             </div>
             <span className={`status-pill ${drafting ? "warning" : "success"}`}>
               {drafting ? "草稿待发布" : "已发布"}
             </span>
           </div>
-          {ontology.objects.map((object) => (
-            <button className="ontology-object" key={object.id}>
-              <span className="object-icon">
-                <CirclesFour size={18} />
-              </span>
-              <span>
-                <strong>{object.label}</strong>
-                <small>{object.name} · {object.properties.length} 个属性</small>
-              </span>
-              <CaretRight size={16} />
-            </button>
-          ))}
+          {ontology.objects.length ? (
+            ontology.objects.map((object) => (
+              <button
+                className={`ontology-object ${
+                  focusedObject?.id === object.id ? "selected" : ""
+                }`}
+                key={object.id}
+                onClick={() => setFocusedId(object.id)}
+                aria-pressed={focusedObject?.id === object.id}
+              >
+                <span className="object-icon">
+                  <CirclesFour size={18} />
+                </span>
+                <span>
+                  <strong>{object.label}</strong>
+                  <small>{object.name} · {object.properties.length} 个属性</small>
+                </span>
+                <CaretRight size={16} />
+              </button>
+            ))
+          ) : (
+            <div className="ontology-empty">
+              <CirclesFour size={24} />
+              <strong>还没有本体对象</strong>
+              <p>先到数据管理扫描 Schema，再勾选待建模表生成草稿。</p>
+            </div>
+          )}
         </section>
-        <section className="panel relation-canvas">
+        <section className="panel object-inspector">
           <div className="panel-heading">
             <div>
-              <span className="section-kicker">关系图谱</span>
-              <h2>核心业务路径</h2>
+              <span className="section-kicker">对象定义</span>
+              <h2>{focusedObject?.label || "对象详情"}</h2>
             </div>
-            <button className="subtle-button">全屏查看</button>
+            {focusedObject && (
+              <span className={`status-pill ${focusedObject.status === "DRAFT" ? "warning" : "success"}`}>
+                {ontologyStatusLabel(focusedObject.status)}
+              </span>
+            )}
           </div>
-          <div className="graph">
-            <GraphNode className="node-order" label="订单" detail="核心事件" />
-            <GraphNode className="node-customer" label="客户" detail="业务主体" />
-            <GraphNode className="node-product" label="商品" detail="业务对象" />
-            <GraphNode className="node-store" label="门店" detail="经营主体" />
-            <span className="graph-line line-a" />
-            <span className="graph-line line-b" />
-            <span className="graph-line line-c" />
-            <span className="graph-label label-a">属于 · M:1</span>
-            <span className="graph-label label-b">包含 · M:N</span>
-            <span className="graph-label label-c">发生于 · M:1</span>
-          </div>
-          <div className="relation-legend">
-            <span><i className="safe" />安全聚合路径</span>
-            <span><i className="risk" />存在扇出风险</span>
-          </div>
+          {focusedObject ? (
+            <OntologyObjectInspector
+              object={focusedObject}
+              ontology={ontology}
+              tables={tables}
+              onSelectObject={setFocusedId}
+            />
+          ) : (
+            <div className="inspector-empty">
+              <Database size={28} />
+              <strong>等待 Schema 建模</strong>
+              <p>对象生成后可在这里检查来源表、属性、指标和关系。</p>
+            </div>
+          )}
         </section>
         <section className="panel draft-panel">
           <div className="panel-heading">
@@ -875,19 +951,107 @@ function OntologyPage({
   );
 }
 
-function GraphNode({
-  className,
-  label,
-  detail,
+function OntologyObjectInspector({
+  object,
+  ontology,
+  tables,
+  onSelectObject,
 }: {
-  className: string;
-  label: string;
-  detail: string;
+  object: OntologySnapshot["objects"][number];
+  ontology: OntologySnapshot;
+  tables: PhysicalTable[];
+  onSelectObject: (id: string) => void;
 }) {
+  const source = tables.find((table) => table.id === object.sourceTableId);
+  const metrics = ontology.metrics.filter((metric) => metric.objectId === object.id);
+  const relations = ontology.relations.filter(
+    (relation) =>
+      relation.sourceObjectId === object.id || relation.targetObjectId === object.id,
+  );
   return (
-    <div className={`graph-node ${className}`}>
-      <CirclesFour size={17} />
-      <span><strong>{label}</strong><small>{detail}</small></span>
+    <div className="object-detail">
+      <div className="object-summary">
+        <div>
+          <span>对象标识</span>
+          <strong>{object.name}</strong>
+        </div>
+        <div>
+          <span>来源表</span>
+          <strong>{source ? `${source.database}.${source.name}` : "来源表不可用"}</strong>
+        </div>
+        <div>
+          <span>同义词</span>
+          <strong>{object.synonyms.length ? object.synonyms.join("、") : "未配置"}</strong>
+        </div>
+      </div>
+      <p className="object-description">{object.description || "暂无业务描述"}</p>
+      <div className="detail-section-heading">
+        <h3>属性</h3>
+        <span>{object.properties.length}</span>
+      </div>
+      <div className="property-table-wrap">
+        <table className="property-table">
+          <thead>
+            <tr>
+              <th>业务名称</th>
+              <th>物理字段</th>
+              <th>类型</th>
+              <th>敏感</th>
+            </tr>
+          </thead>
+          <tbody>
+            {object.properties.map((property) => (
+              <tr key={property.id}>
+                <td><strong>{property.label}</strong><small>{property.name}</small></td>
+                <td>{property.sourceColumn}</td>
+                <td><code>{property.dataType}</code></td>
+                <td>{property.sensitive ? "是" : "否"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div className="inspector-columns">
+        <section>
+          <div className="detail-section-heading">
+            <h3>指标</h3>
+            <span>{metrics.length}</span>
+          </div>
+          <div className="semantic-list">
+            {metrics.length ? metrics.map((metric) => (
+              <div key={metric.id}>
+                <ChartBar size={16} />
+                <span><strong>{metric.label}</strong><small>{metric.expression}</small></span>
+              </div>
+            )) : <p>该对象暂未定义指标</p>}
+          </div>
+        </section>
+        <section>
+          <div className="detail-section-heading">
+            <h3>关系</h3>
+            <span>{relations.length}</span>
+          </div>
+          <div className="semantic-list">
+            {relations.length ? relations.map((relation) => {
+              const peerId =
+                relation.sourceObjectId === object.id
+                  ? relation.targetObjectId
+                  : relation.sourceObjectId;
+              const peer = ontology.objects.find((item) => item.id === peerId);
+              return (
+                <button key={relation.id} onClick={() => onSelectObject(peerId)}>
+                  <LinkIcon size={16} />
+                  <span>
+                    <strong>{relation.name}</strong>
+                    <small>{peer?.label || peerId} · {cardinalityLabel(relation.cardinality)}</small>
+                  </span>
+                  <CaretRight size={14} />
+                </button>
+              );
+            }) : <p>该对象暂未定义关系</p>}
+          </div>
+        </section>
+      </div>
     </div>
   );
 }
@@ -1055,7 +1219,8 @@ function DataSourceDialog({
           </button>
         </div>
         <p className="dialog-note">
-          密码仅保存到 macOS 钥匙串，SQLite 中只保留非敏感连接参数。
+          Windows 使用当前用户的 DPAPI 加密保存密码，macOS 使用系统钥匙串；SQLite
+          只保留非敏感连接参数。
         </p>
         <div className="form-grid">
           <Field label="主机地址" wide>
@@ -1127,7 +1292,7 @@ function SettingsPage() {
     <div className="management-content settings-grid">
       <section className="panel setting-card">
         <div className="setting-icon"><Clock size={20} /></div>
-        <div><h2>查询执行</h2><p>最大超时 180 秒，结果最多返回 10,000 行。</p></div>
+        <div><h2>查询执行</h2><p>最大超时 180 秒，聚合最多 200 行，明细最多 50 行。</p></div>
         <span className="status-pill success">已启用</span>
       </section>
       <section className="panel setting-card">
@@ -1166,8 +1331,37 @@ function TableStatus({ status }: { status: PhysicalTable["status"] }) {
 }
 
 function StatusBadge({ status }: { status: Turn["status"] }) {
-  const label = status === "completed" ? "已完成" : status === "failed" ? "失败" : "执行中";
+  const label =
+    status === "completed"
+      ? "已完成"
+      : status === "failed"
+        ? "失败"
+        : status === "needs_clarification"
+          ? "待补充"
+          : "执行中";
   return <span className={`turn-status ${status}`}>{label}</span>;
+}
+
+function ontologyStatusLabel(status: OntologySnapshot["status"]): string {
+  const labels: Record<OntologySnapshot["status"], string> = {
+    DRAFT: "草稿",
+    VERIFIED: "已校验",
+    PUBLISHED: "已发布",
+    DEPRECATED: "已停用",
+  };
+  return labels[status];
+}
+
+function cardinalityLabel(
+  cardinality: OntologySnapshot["relations"][number]["cardinality"],
+): string {
+  const labels: Record<typeof cardinality, string> = {
+    ONE_TO_ONE: "1:1",
+    ONE_TO_MANY: "1:N",
+    MANY_TO_ONE: "N:1",
+    MANY_TO_MANY: "N:N",
+  };
+  return labels[cardinality];
 }
 
 function Toast({ message, onClose }: { message: string; onClose: () => void }) {

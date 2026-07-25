@@ -12,13 +12,31 @@ afterEach(() => {
 });
 
 describe("Repository schema reconciliation", () => {
+  it("starts with an empty real workspace instead of runtime demo fixtures", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-repo-"));
+    roots.push(root);
+    const repository = new Repository(path.join(root, "ontology.sqlite"));
+
+    expect(repository.getConversations()).toEqual([]);
+    expect(repository.getTables()).toEqual([]);
+    expect(repository.getOntology()).toMatchObject({
+      version: 0,
+      status: "PUBLISHED",
+      objects: [],
+      relations: [],
+      metrics: [],
+    });
+    repository.close();
+  });
+
   it("keeps modeled tables, identifies changes, and adds only new tables", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-repo-"));
     roots.push(root);
     const repository = new Repository(path.join(root, "ontology.sqlite"));
-    const existing = repository.getTables();
-    const modeled = existing.find((table) => table.id === "t_orders")!;
-    const unmodeled = existing.find((table) => table.id === "t_refunds")!;
+    const modeled = { ...scannedTable("t_orders", "fact_orders"), status: "MODELED" as const };
+    const unmodeled = scannedTable("t_refunds", "fact_refunds");
+    repository.upsertScannedTables([modeled, unmodeled, scannedTable("t_customer", "dim_customers")]);
+    repository.updateTableStatuses([modeled.id], "MODELED");
 
     const next = repository.upsertScannedTables([
       { ...modeled },
@@ -31,7 +49,7 @@ describe("Repository schema reconciliation", () => {
     expect(next.find((table) => table.name === "fact_shipments")?.status).toBe(
       "UNMODELED",
     );
-    expect(next.find((table) => table.id === "t_customers")?.status).toBe("REMOVED");
+    expect(next.find((table) => table.id === "t_customer")?.status).toBe("REMOVED");
     repository.close();
   });
 
@@ -39,7 +57,9 @@ describe("Repository schema reconciliation", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-repo-"));
     roots.push(root);
     const repository = new Repository(path.join(root, "ontology.sqlite"));
-    const modeled = repository.getTables().find((table) => table.id === "t_orders")!;
+    const modeled = scannedTable("t_orders", "fact_orders");
+    repository.upsertScannedTables([modeled]);
+    repository.updateTableStatuses([modeled.id], "MODELED");
 
     const next = repository.upsertScannedTables([
       { ...modeled, fingerprint: "fact_orders:v2" },

@@ -1,14 +1,9 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type {
-  AgentReporter,
-  ToolCall,
-  ToolOutcome,
-  ToolStatus,
-} from "montane-code";
+import type { AgentReporter, ToolCall, ToolOutcome, ToolStatus } from "montane-code";
 import { afterEach, describe, expect, it } from "vitest";
-import type { Turn } from "../src/shared/types.js";
+import type { Conversation, Turn } from "../src/shared/types.js";
 import { DataAgentHarness } from "../src/server/harness.js";
 import { Repository } from "../src/server/repository.js";
 
@@ -19,16 +14,16 @@ afterEach(() => {
 });
 
 describe("DataAgentHarness", () => {
-  it("runs the demo analysis through AgentLoop, domain tools, and SessionStore", async () => {
+  it("answers a greeting through AgentLoop without fabricating an analysis", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-harness-"));
     roots.push(root);
     const repository = new Repository(path.join(root, ".montane/data-agent/ontology.sqlite"));
-    const conversation = repository.getConversation("conv_demo")!;
+    const conversation = createConversation();
+    repository.saveConversation(conversation);
     const turn: Turn = {
       id: "turn_harness_test",
       conversationId: conversation.id,
-      parentTurnId: conversation.turns.at(-1)?.id,
-      question: "哪些商品品类增长最快？",
+      question: "你好",
       status: "planning",
       createdAt: new Date().toISOString(),
       ontologyVersion: repository.getOntology().version,
@@ -43,22 +38,16 @@ describe("DataAgentHarness", () => {
       },
     };
     const harness = new DataAgentHarness(root, repository, async () => {
-      throw new Error("demo mode must not access SelectDB");
+      throw new Error("greeting must not access SelectDB");
     });
 
     const output = await harness.run(conversation, turn, reporter);
     await harness.close();
 
-    expect(output.result.mode).toBe("demo");
-    expect(output.result.conclusion).toContain("家居品类本月增长最快");
-    expect(toolStatuses).toEqual(
-      expect.arrayContaining([
-        { name: "OntologySearch", status: "running" },
-        { name: "OntologySearch", status: "succeeded" },
-        { name: "SelectDBQuery", status: "running" },
-        { name: "SelectDBQuery", status: "succeeded" },
-      ]),
-    );
+    expect(output.responseKind).toBe("conversation");
+    expect(output.result).toBeUndefined();
+    expect(output.answer).toContain("你好");
+    expect(toolStatuses).toEqual([]);
     expect(repository.getConversation(conversation.id)?.harnessSessionId).toBe(
       output.sessionId,
     );
@@ -71,10 +60,51 @@ describe("DataAgentHarness", () => {
       "events.jsonl",
     );
     const events = fs.readFileSync(eventPath, "utf8");
-    expect(events).toContain('"type":"assistant_tool_calls"');
-    expect(events).toContain('"name":"OntologySearch"');
-    expect(events).toContain('"name":"SelectDBQuery"');
     expect(events).toContain('"type":"assistant_final"');
     repository.close();
   });
+
+  it("blocks an analysis honestly when real runtime configuration is missing", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-harness-"));
+    roots.push(root);
+    const repository = new Repository(path.join(root, ".montane/data-agent/ontology.sqlite"));
+    const conversation = createConversation();
+    repository.saveConversation(conversation);
+    const turn: Turn = {
+      id: "turn_unconfigured_test",
+      conversationId: conversation.id,
+      question: "分析本月订单增长",
+      status: "planning",
+      createdAt: new Date().toISOString(),
+      ontologyVersion: 0,
+      trace: [],
+    };
+    const harness = new DataAgentHarness(root, repository, async () => {
+      throw new Error("unconfigured mode must not access SelectDB");
+    });
+
+    const output = await harness.run(conversation, turn, {
+      onTextDelta() {},
+      onTextEnd() {},
+      onToolStatus() {},
+    });
+    await harness.close();
+
+    expect(output.responseKind).toBe("configuration_required");
+    expect(output.result).toBeUndefined();
+    expect(output.answer).toContain("不会生成示例数据");
+    repository.close();
+  });
 });
+
+function createConversation(): Conversation {
+  const now = new Date().toISOString();
+  return {
+    id: "conv_test",
+    title: "测试会话",
+    createdAt: now,
+    updatedAt: now,
+    status: "active",
+    turns: [],
+  };
+}

@@ -29,18 +29,26 @@ const DATA_AGENT_SYSTEM_PROMPT = `
 你是 InsightFlow Data Agent，运行在 Montane Harness 中。
 
 必须遵循以下执行协议：
-1. 每轮先调用 OntologySearch，将用户问题绑定到已发布业务对象、属性、指标和关系。
-2. 只能根据 OntologySearch 返回的语义生成查询，不得猜测表名、字段或关系。
-3. 然后调用 SelectDBQuery 执行一条只读 SQL；只允许 SELECT 或 WITH ... SELECT。
-4. 必须检查关系基数、扇出风险和分析粒度。
-5. 最终使用中文给出简洁、可验证的结论，只能引用工具返回的数据。
-6. 不得在最终答案中暴露数据源地址、用户名、密码或内部配置。
-7. 不得调用未提供的工具，也不得省略查询执行直接编造结果。
+1. 先判断用户是在打招呼、询问能力，还是提出数据分析请求。
+2. 打招呼或询问能力时直接简短回答，不调用数据工具，不生成图表或业务结论。
+3. 数据分析请求必须先调用 OntologySearch，将问题绑定到已发布业务对象、属性、指标和关系。
+4. 只能根据 OntologySearch 返回的语义生成查询，不得猜测表名、字段或关系。
+5. 然后调用 SelectDBQuery 执行一条只读 SQL；只允许 SELECT 或 WITH ... SELECT。
+6. 必须检查关系基数、扇出风险和分析粒度。
+7. 最终使用中文给出简洁、可验证的结论，只能引用工具返回的数据。
+8. 信息不足时向用户说明需要补充的条件，不得编造默认业务结果。
+9. 不得在最终答案中暴露数据源地址、用户名、密码或内部配置。
+10. 不得调用未提供的工具，也不得省略查询执行直接编造结果。
 `.trim();
 
 interface HarnessRunResult {
   answer: string;
-  result: ResultArtifact;
+  result?: ResultArtifact;
+  responseKind:
+    | "analysis"
+    | "conversation"
+    | "configuration_required"
+    | "clarification";
   sessionId: string;
 }
 
@@ -64,7 +72,7 @@ export class DataAgentHarness {
     ) => Promise<QueryResult>,
   ) {
     this.sessionManager = new SessionManager(workspaceRoot, {
-      model: process.env.OPENAI_MODEL || "insightflow-demo-harness",
+      model: process.env.OPENAI_MODEL || "insightflow-local-router",
     });
   }
 
@@ -75,14 +83,15 @@ export class DataAgentHarness {
   ): Promise<HarnessRunResult> {
     const managed = await this.getOrCreateSession(conversation);
     const source = this.repository.getDataSource();
-    const liveMode = Boolean(
-      source.configured && process.env.OPENAI_API_KEY && process.env.OPENAI_MODEL,
+    const modelConfigured = Boolean(
+      process.env.OPENAI_API_KEY && process.env.OPENAI_MODEL,
     );
+    const analysisReady = Boolean(source.configured && modelConfigured);
     let captured: CapturedAnalysis | null = null;
     const tools = new ToolRegistry();
     tools.register(this.ontologySearchTool());
     tools.register(
-      this.selectDbQueryTool(turn.question, liveMode, (analysis) => {
+      this.selectDbQueryTool((analysis) => {
         captured = analysis;
       }),
     );
@@ -98,7 +107,9 @@ export class DataAgentHarness {
         await managed.updateLastSequence(event.sequence);
       },
     );
-    const model = liveMode ? this.createLiveModel() : new DemoHarnessModel();
+    const model = analysisReady
+      ? this.createLiveModel()
+      : new LocalRoutingModel(source.configured, modelConfigured);
     const context = new ContextBuilder(
       this.workspaceRoot,
       60,
@@ -130,16 +141,24 @@ export class DataAgentHarness {
 
     const answer = await loop.run(turn.question);
     const completed = captured as CapturedAnalysis | null;
-    if (!completed) {
-      throw new Error("Harness 未执行 SelectDBQuery，无法生成可信分析结果");
-    }
+    const asksForData = isLikelyDataQuestion(turn.question);
+    const responseKind: HarnessRunResult["responseKind"] = completed
+      ? "analysis"
+      : asksForData && !analysisReady
+        ? "configuration_required"
+        : asksForData
+          ? "clarification"
+          : "conversation";
 
     return {
       answer,
-      result: {
-        ...completed.artifact,
-        conclusion: answer,
-      },
+      result: completed
+        ? {
+            ...completed.artifact,
+            conclusion: answer,
+          }
+        : undefined,
+      responseKind,
       sessionId: managed.id,
     };
   }
@@ -261,8 +280,6 @@ export class DataAgentHarness {
   }
 
   private selectDbQueryTool(
-    question: string,
-    liveMode: boolean,
     capture: (analysis: CapturedAnalysis) => void,
   ): Tool {
     return {
@@ -297,12 +314,10 @@ export class DataAgentHarness {
         const maxRows = resultKind === "detail" ? 50 : 200;
         guardReadOnlySql(sql, maxRows);
 
-        const artifact = liveMode
-          ? createLiveResult(
-              title,
-              await this.executeLiveQuery(sql, maxRows),
-            )
-          : createDemoResult(question);
+        const artifact = createLiveResult(
+          title,
+          await this.executeLiveQuery(sql, maxRows),
+        );
         capture({ artifact, sql });
         return {
           ok: true,
@@ -327,7 +342,7 @@ export class DataAgentHarness {
   }
 }
 
-class DemoHarnessModel implements ModelClient {
+class LocalRoutingModel implements ModelClient {
   readonly capabilities = {
     contextWindow: 32_000,
     maxOutputTokens: 2_000,
@@ -335,6 +350,11 @@ class DemoHarnessModel implements ModelClient {
     supportsToolUse: true,
     supportsImages: false,
   };
+
+  constructor(
+    private readonly sourceConfigured: boolean,
+    private readonly modelConfigured: boolean,
+  ) {}
 
   async complete(options: {
     messages: AgentMessage[];
@@ -344,54 +364,29 @@ class DemoHarnessModel implements ModelClient {
     const current = currentTurnMessages(options.messages);
     const question =
       [...current].reverse().find((message) => message.role === "user")?.content ?? "";
-    const toolResults = current
-      .filter((message) => message.role === "tool")
-      .map((message) => message.toolResult);
-
-    if (!toolResults.some((result) => result?.name === "OntologySearch")) {
-      return {
-        toolCalls: [
-          {
-            id: createId("tool"),
-            name: "OntologySearch",
-            args: { query: question },
-          },
-        ],
-        stopReason: "tool_use",
-      };
-    }
-
-    if (!toolResults.some((result) => result?.name === "SelectDBQuery")) {
-      const category = /品类|商品|类目/.test(question);
-      return {
-        toolCalls: [
-          {
-            id: createId("tool"),
-            name: "SelectDBQuery",
-            args: {
-              sql: category
-                ? "SELECT category_name, SUM(pay_amount) AS gmv FROM fact_orders GROUP BY category_name ORDER BY gmv DESC"
-                : "SELECT region_name, SUM(pay_amount) AS gmv, COUNT(DISTINCT order_id) AS order_count FROM fact_orders GROUP BY region_name ORDER BY gmv DESC",
-              result_kind: "aggregate",
-              title: category ? "本月各品类成交金额" : "区域经营表现",
-            },
-          },
-        ],
-        stopReason: "tool_use",
-      };
-    }
-
-    const finalText = createDemoResult(question).conclusion;
+    const finalText = isLikelyDataQuestion(question)
+      ? this.configurationMessage()
+      : conversationalReply(question);
     options.onTextDelta?.(finalText);
     return {
       finalText,
       stopReason: "end_turn",
       usage: {
-        inputTokens: 420,
-        outputTokens: 96,
+        inputTokens: 0,
+        outputTokens: 0,
       },
-      requestId: createId("demo_request"),
+      requestId: createId("local_request"),
     };
+  }
+
+  private configurationMessage(): string {
+    if (!this.sourceConfigured && !this.modelConfigured) {
+      return "我还不能执行真实问数。请先在「数据管理」配置 SelectDB 并扫描 Schema，然后设置 OPENAI_API_KEY 和 OPENAI_MODEL。配置完成前我不会生成示例数据或虚构分析结论。";
+    }
+    if (!this.sourceConfigured) {
+      return "模型已经配置，但还没有可查询的 SelectDB 数据源。请先在「数据管理」完成连接、扫描 Schema，并发布至少一个本体对象。";
+    }
+    return "SelectDB 已连接，但分析模型尚未配置。请设置 OPENAI_API_KEY 和 OPENAI_MODEL 后重启服务；在此之前我不会用演示结果代替真实查询。";
   }
 }
 
@@ -406,62 +401,20 @@ function currentTurnMessages(messages: AgentMessage[]): AgentMessage[] {
   return lastUserIndex >= 0 ? messages.slice(lastUserIndex) : messages;
 }
 
-function createDemoResult(question: string): ResultArtifact {
-  if (/品类|商品|类目/.test(question)) {
-    return {
-      kind: "analysis",
-      mode: "demo",
-      conclusion:
-        "家居品类本月增长最快，成交金额环比提升 31.2%；数码品类规模最大，但增速回落至 6.8%。建议继续跟踪家居活动带来的新增客户留存。",
-      kpis: [
-        { label: "品类成交金额", value: "¥8.62M", change: "+15.4%" },
-        { label: "增长最快", value: "家居", change: "+31.2%" },
-        { label: "贡献最高", value: "数码", change: "38.6%" },
-      ],
-      chart: {
-        title: "本月各品类成交金额",
-        type: "bar",
-        categories: ["数码", "家居", "服饰", "美妆", "食品"],
-        series: [{ name: "成交金额（百万元）", data: [3.33, 2.04, 1.42, 1.08, 0.75] }],
-      },
-      columns: ["品类", "成交金额", "环比", "订单量"],
-      rows: [
-        { 品类: "数码", 成交金额: "¥3.33M", 环比: "+6.8%", 订单量: 6482 },
-        { 品类: "家居", 成交金额: "¥2.04M", 环比: "+31.2%", 订单量: 9237 },
-        { 品类: "服饰", 成交金额: "¥1.42M", 环比: "+12.7%", 订单量: 7821 },
-        { 品类: "美妆", 成交金额: "¥1.08M", 环比: "+18.1%", 订单量: 6318 },
-      ],
-      rowCount: 5,
-      truncated: false,
-    };
-  }
+function isLikelyDataQuestion(question: string): boolean {
+  return /分析|数据|指标|销售|订单|成交|收入|营收|金额|客户|会员|商品|品类|门店|区域|趋势|增长|下降|环比|同比|对比|排名|占比|多少|几|哪些|最高|最低|平均|总计|汇总|明细|GMV|AOV|TOP\s*\d*/i.test(
+    question,
+  );
+}
 
-  return {
-    kind: "analysis",
-    mode: "demo",
-    conclusion:
-      "华东区本月成交金额为 ¥12.84M，较上月增长 18.6%。杭州湖滨店与上海静安店合计贡献增量的 61%，是本月增长的主要来源。",
-    kpis: [
-      { label: "成交金额", value: "¥12.84M", change: "+18.6%" },
-      { label: "订单量", value: "38,420", change: "+11.2%" },
-      { label: "客单价", value: "¥334", change: "+6.6%" },
-    ],
-    chart: {
-      title: "华东区近 6 个月成交金额",
-      type: "bar",
-      categories: ["2月", "3月", "4月", "5月", "6月", "7月"],
-      series: [{ name: "成交金额（百万元）", data: [8.6, 9.2, 9.8, 10.4, 10.83, 12.84] }],
-    },
-    columns: ["门店", "成交金额", "环比", "订单量"],
-    rows: [
-      { 门店: "杭州湖滨店", 成交金额: "¥3.26M", 环比: "+28.4%", 订单量: 9221 },
-      { 门店: "上海静安店", 成交金额: "¥2.91M", 环比: "+22.7%", 订单量: 8346 },
-      { 门店: "南京新街口店", 成交金额: "¥2.18M", 环比: "+14.3%", 订单量: 6759 },
-      { 门店: "苏州中心店", 成交金额: "¥1.76M", 环比: "+9.8%", 订单量: 5287 },
-    ],
-    rowCount: 18,
-    truncated: false,
-  };
+function conversationalReply(question: string): string {
+  if (/^(你好|您好|嗨|哈喽|hello|hi|hey)[！!。.，,\s]*$/i.test(question)) {
+    return "你好，我是 InsightFlow Data Agent。你可以问我业务指标、趋势、对比和明细问题；只有在真实数据源与模型都就绪后，我才会执行查询并返回结论。";
+  }
+  if (/你是谁|能做什么|怎么用|帮助|help/i.test(question)) {
+    return "我负责基于已发布业务本体查询 SelectDB，并逐轮展示语义绑定、关系路径、SQL 与执行结果。你可以先在「数据管理」连接业务库，再到「本体」选择表进行建模。";
+  }
+  return "我是面向业务数据分析的 Data Agent。目前这条消息不需要查询数据；如果你要问数，请说明指标、分析维度和时间范围。";
 }
 
 function createLiveResult(title: string, query: QueryResult): ResultArtifact {

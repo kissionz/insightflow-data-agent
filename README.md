@@ -24,8 +24,10 @@ Web 应用运行在 `http://127.0.0.1:4311`，本地 API 运行在
 - 本机存在 `MONTANE_CODE_PATH`、同级 `data-engineer` 或全局安装：发现后接入。
 - 都不存在：从 GitHub 自动安装固定版本，并输出可执行的错误提示。
 
-首次启动会创建一个本地演示工作区。可在「数据管理」中配置真实 SelectDB
-连接；密码只写入 macOS 钥匙串。本体、版本和会话保存在：
+首次启动为空工作区，不会预置业务表、本体对象、会话或分析结果。先在「数据
+管理」配置真实 SelectDB 连接并扫描 Schema，再到「本体」选择未建模表生成
+草稿。Windows 使用当前用户的 DPAPI 加密保存密码，macOS 使用系统钥匙串；
+也可以通过 `SELECTDB_PASSWORD` 环境变量注入密码。本体、版本和会话保存在：
 
 ```text
 <workspace>/.montane/data-agent/ontology.sqlite
@@ -43,9 +45,10 @@ AgentLoop
   -> AgentReporter
 ```
 
-配置 `OPENAI_API_KEY`、`OPENAI_MODEL` 和 SelectDB 后进入真实查询模式。未配置
-模型或数据源时仍通过同一 AgentLoop 和工具链运行演示模型，不会把示例结果
-标记成真实查询。`.montane/sessions/` 中会保留原始 Harness 事件记录。
+配置 `OPENAI_API_KEY`、`OPENAI_MODEL` 和 SelectDB 后才允许真实查询。一般
+对话仍通过 AgentLoop 返回文本响应；分析运行条件不完整时会明确指出缺失配置，
+不会生成固定图表、示例数据或虚构结论。每轮仍保留完整追踪，未执行的语义与
+SQL 步骤会标记为“未执行”。`.montane/sessions/` 中会保留原始 Harness 事件记录。
 
 ## 验证
 

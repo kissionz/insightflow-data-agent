@@ -4,7 +4,7 @@ import type {
   ToolOutcome,
   ToolStatus,
 } from "montane-code";
-import type { TraceStep, Turn, TurnStatus } from "../shared/types.js";
+import type { TraceStep, Turn } from "../shared/types.js";
 import { EventHub } from "./events.js";
 import { DataAgentHarness } from "./harness.js";
 import { createId } from "./id.js";
@@ -99,7 +99,7 @@ export class DataAgent {
         summary,
         detail,
         completedAt:
-          status === "completed" || status === "failed"
+          status === "completed" || status === "skipped" || status === "failed"
             ? new Date().toISOString()
             : undefined,
       };
@@ -120,11 +120,6 @@ export class DataAgent {
           : "SessionManager 已创建新的 Harness 会话",
       );
       turn.status = "planning";
-      updateStep(
-        "query_plan",
-        "running",
-        "AgentLoop 正在选择受控工具并生成执行计划",
-      );
 
       const conversation = this.repository.getConversation(turn.conversationId);
       if (!conversation) throw new Error("会话不存在");
@@ -135,8 +130,14 @@ export class DataAgent {
         },
       );
       const output = await this.harness.run(conversation, turn, reporter);
-      turn.status = "completed";
+      completeUnusedTrace(turn, output.responseKind);
+      turn.status =
+        output.responseKind === "configuration_required" ||
+        output.responseKind === "clarification"
+          ? "needs_clarification"
+          : "completed";
       turn.answer = output.answer;
+      turn.responseKind = output.responseKind;
       turn.result = output.result;
       turn.completedAt = new Date().toISOString();
       turn = structuredClone(turn);
@@ -185,7 +186,7 @@ class HarnessTurnReporter implements AgentReporter {
     this.update(
       "interpretation",
       "running",
-      "AgentLoop 正在基于工具结果生成最终解释",
+      "AgentLoop 正在生成本轮响应",
     );
   }
 
@@ -195,7 +196,7 @@ class HarnessTurnReporter implements AgentReporter {
     this.update(
       "interpretation",
       "completed",
-      "最终结论已写入 Harness SessionStore",
+      "本轮响应已写入 Harness SessionStore",
     );
   }
 
@@ -296,11 +297,10 @@ class HarnessTurnReporter implements AgentReporter {
     }
     if (status === "succeeded") {
       const rowCount = Number(result?.data?.rowCount ?? 0);
-      const mode = result?.data?.mode === "live" ? "真实查询" : "示例查询";
       this.update(
         "execution",
         "completed",
-        `${mode}完成，返回 ${rowCount} 行`,
+        `真实查询完成，返回 ${rowCount} 行`,
       );
       return;
     }
@@ -316,4 +316,27 @@ class HarnessTurnReporter implements AgentReporter {
 
 function isFailure(status: ToolStatus): boolean {
   return ["failed", "rejected", "denied"].includes(status);
+}
+
+function completeUnusedTrace(
+  turn: Turn,
+  responseKind: NonNullable<Turn["responseKind"]>,
+): void {
+  const now = new Date().toISOString();
+  const skippedSummary =
+    responseKind === "conversation"
+      ? "本轮为一般对话，无需执行数据分析步骤"
+      : responseKind === "configuration_required"
+        ? "真实分析运行条件未就绪，本步骤未执行"
+        : "需要补充分析条件，本步骤未执行";
+
+  turn.trace = turn.trace.map((step) => {
+    if (step.status === "completed" || step.status === "failed") return step;
+    return {
+      ...step,
+      status: "skipped",
+      summary: skippedSummary,
+      completedAt: now,
+    };
+  });
 }

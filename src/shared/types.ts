@@ -44,7 +44,7 @@ export interface ResultSeries {
 
 export interface ResultArtifact {
   kind: "analysis";
-  mode?: "demo" | "live";
+  mode: "live";
   conclusion: string;
   kpis: Array<{
     label: string;
@@ -74,6 +74,7 @@ export interface Turn {
   completedAt?: string;
   ontologyVersion: number;
   trace: TraceStep[];
+  responseKind?: "analysis" | "conversation" | "configuration_required" | "clarification";
   result?: ResultArtifact;
 }
 
@@ -212,6 +213,11 @@ export interface BootstrapPayload {
   ontology: OntologySnapshot;
   tables: PhysicalTable[];
   dataSource: SafeDataSourceConfig;
+  runtime: {
+    modelConfigured: boolean;
+    analysisReady: boolean;
+    credentialStore: "macos_keychain" | "windows_dpapi" | "environment";
+  };
 }
 
 export interface DataAgentEvent {

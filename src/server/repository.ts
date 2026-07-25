@@ -8,7 +8,6 @@ import type {
   SafeDataSourceConfig,
   Turn,
 } from "../shared/types.js";
-import { demoConversation, demoOntology, demoTables } from "./seed.js";
 
 interface JsonRow {
   payload: string;
@@ -22,7 +21,8 @@ export class Repository {
     this.db = new DatabaseSync(databasePath);
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
     this.migrate();
-    this.seed();
+    this.initialize();
+    this.removeLegacyDemoFixtures();
   }
 
   getConversations(): Conversation[] {
@@ -188,26 +188,74 @@ export class Repository {
     `);
   }
 
-  private seed(): void {
+  private initialize(): void {
     const ontologyCount = (
       this.db.prepare("SELECT COUNT(*) AS count FROM ontology_versions").get() as {
         count: number;
       }
     ).count;
-    if (ontologyCount === 0) this.saveOntology(demoOntology);
-
-    const tableCount = (
-      this.db.prepare("SELECT COUNT(*) AS count FROM physical_tables").get() as {
-        count: number;
-      }
-    ).count;
-    if (tableCount === 0) demoTables.forEach((table) => this.saveTable(table));
-
-    const conversationCount = (
-      this.db.prepare("SELECT COUNT(*) AS count FROM conversations").get() as {
-        count: number;
-      }
-    ).count;
-    if (conversationCount === 0) this.saveConversation(demoConversation);
+    if (ontologyCount === 0) this.saveOntology(emptyOntology());
   }
+
+  private removeLegacyDemoFixtures(): void {
+    const demoObjectIds = new Set(["o_order", "o_customer", "o_product", "o_store"]);
+    const ontology = this.getOntology();
+    const isUntouchedDemoOntology =
+      ontology.version === 4 &&
+      ontology.objects.length === demoObjectIds.size &&
+      ontology.objects.every((object) => demoObjectIds.has(object.id)) &&
+      ontology.publishedAt === "2026-07-25T02:18:00.000Z";
+    if (isUntouchedDemoOntology) {
+      this.db.prepare("DELETE FROM ontology_versions").run();
+      this.saveOntology(emptyOntology());
+    }
+
+    const demoTableIds = new Set([
+      "t_orders",
+      "t_customers",
+      "t_products",
+      "t_stores",
+      "t_order_items",
+      "t_campaigns",
+      "t_refunds",
+    ]);
+    const tables = this.getTables();
+    const isUntouchedDemoCatalog =
+      tables.length === demoTableIds.size &&
+      tables.every(
+        (table) =>
+          demoTableIds.has(table.id) &&
+          table.scannedAt === "2026-07-25T02:18:00.000Z" &&
+          table.fingerprint === `${table.name}:v1`,
+      );
+    if (isUntouchedDemoCatalog) {
+      this.db.prepare("DELETE FROM physical_tables").run();
+    }
+
+    const demoConversation = this.getConversation("conv_demo");
+    if (demoConversation) {
+      const userTurns = demoConversation.turns.filter((turn) => turn.id !== "turn_demo");
+      if (userTurns.length === 0) {
+        this.db.prepare("DELETE FROM conversations WHERE id = ?").run("conv_demo");
+      } else if (userTurns.length !== demoConversation.turns.length) {
+        this.saveConversation({
+          ...demoConversation,
+          title: "新分析",
+          turns: userTurns,
+          updatedAt: new Date().toISOString(),
+        });
+      }
+    }
+  }
+}
+
+function emptyOntology(): OntologySnapshot {
+  return {
+    version: 0,
+    status: "PUBLISHED",
+    publishedAt: new Date().toISOString(),
+    objects: [],
+    relations: [],
+    metrics: [],
+  };
 }

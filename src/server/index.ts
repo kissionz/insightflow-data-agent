@@ -15,14 +15,14 @@ import { loadConfig } from "./config.js";
 import { EventHub } from "./events.js";
 import { DataAgentHarness } from "./harness.js";
 import { createId } from "./id.js";
-import { KeychainStore } from "./keychain.js";
+import { credentialStoreKind, KeychainStore } from "./keychain.js";
 import { Repository } from "./repository.js";
 import { SelectDbClient } from "./selectdb.js";
 
 const config = loadConfig();
 const repository = new Repository(config.databasePath);
 const events = new EventHub();
-const keychain = new KeychainStore(config.workspaceRoot);
+const keychain = new KeychainStore(config.workspaceRoot, config.stateRoot);
 const selectDb = new SelectDbClient();
 const harness = new DataAgentHarness(
   config.workspaceRoot,
@@ -50,12 +50,23 @@ const dataSourceSchema = z.object({
 
 app.get("/api/health", async () => ({ ok: true, version: "0.1.0" }));
 
-app.get("/api/bootstrap", async () => ({
-  conversations: repository.getConversations(),
-  ontology: repository.getOntology(),
-  tables: repository.getTables(),
-  dataSource: repository.getDataSource(),
-}));
+app.get("/api/bootstrap", async () => {
+  const dataSource = repository.getDataSource();
+  const modelConfigured = Boolean(
+    process.env.OPENAI_API_KEY && process.env.OPENAI_MODEL,
+  );
+  return {
+    conversations: repository.getConversations(),
+    ontology: repository.getOntology(),
+    tables: repository.getTables(),
+    dataSource,
+    runtime: {
+      modelConfigured,
+      analysisReady: Boolean(dataSource.configured && modelConfigured),
+      credentialStore: credentialStoreKind(),
+    },
+  };
+});
 
 app.get<{ Params: { id: string } }>("/api/conversations/:id", async (request, reply) => {
   const conversation = repository.getConversation(request.params.id);

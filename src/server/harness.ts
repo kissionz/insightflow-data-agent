@@ -17,6 +17,7 @@ import type {
   AnalysisIntent,
   Conversation,
   OntologyObject,
+  OntologySnapshot,
   QuestionLanguageFrame,
   ResultArtifact,
   Turn,
@@ -34,10 +35,10 @@ const DATA_AGENT_SYSTEM_PROMPT = `
 必须遵循以下执行协议：
 1. 先判断用户是在打招呼、询问能力，还是提出数据分析请求。
 2. 打招呼或询问能力时直接简短回答，不调用数据工具，不生成图表或业务结论。
-3. 数据分析请求必须先调用 SubmitQuestionFrame，把原问题按时间、指标、对象、完整业务值、分组、计算方式和展现方式结构化；不得先猜字段归属。
-4. 随后调用 OntologySearch。业务值短语不参与属性名称词形检索；OntologySearch 的词形匹配只是候选证据，不能证明用户词一定是属性名称。
+3. 数据分析请求必须先调用一次 SubmitQuestionFrame，把原问题按时间、指标、对象、完整业务值、分组、计算方式和展现方式结构化；不得先猜字段归属，也不得在同一轮重复提交或改写问题框架。
+4. 随后调用 OntologySearch。业务值短语不参与属性名称词形检索；OntologySearch 的词形匹配只是候选证据，不能证明用户词一定是属性名称。相同问题框架只能调用一次 OntologySearch；若没有可用候选，应澄清而不是重复调用。
 5. question_frame.business_value_terms 中的每个完整短语都必须调用 PropertyValueSearch。具体值的真实字段归属以全局已发布值索引为准。工具返回 resolved 时，后续筛选只能把 selectedMatch.valueBindingId 提交为 value_binding_id，不得重新选择 property_id 或改写值；返回 ambiguous 时必须让用户澄清。
-6. 你不能生成 SQL。完成语义理解后，必须调用 ExecuteAnalysisPlan，提交本体返回的对象、指标和维度属性 ID；业务值筛选只提交 value_binding_id。measure_ids 只能使用 metrics 中的指标 ID。
+6. 你不能生成 SQL。完成语义理解后，必须调用 ExecuteAnalysisPlan，提交本体返回的对象、度量和维度属性 ID；业务值筛选只提交 value_binding_id。measure_ids 只能使用 metrics 中返回的 ID，其中既可能是正式指标，也可能是带默认聚合规则的数字属性。
 7. ExecuteAnalysisPlan 是唯一查询入口，它会通过规则引擎生成 IR、校验关系与粒度、编译参数化 Doris SQL 并执行查询。
 8. 不得猜测或创造对象 ID、指标 ID、属性 ID、数据库值、绑定 ID 或关系。
 9. 最终使用中文给出简洁、可验证的结论，只能引用 ExecuteAnalysisPlan 返回的数据。
@@ -114,11 +115,17 @@ export class DataAgentHarness {
     let captured: CapturedAnalysis | null = null;
     let questionFrame: QuestionLanguageFrame | undefined;
     const valueBindings = new Map<string, ResolvedValueBinding>();
+    const ontologySearchCache = new Map<string, ToolOutcome>();
     const tools = new ToolRegistry();
-    tools.register(this.questionFrameTool(turn.question, (frame) => {
-      questionFrame = frame;
-    }));
-    tools.register(this.ontologySearchTool(() => questionFrame));
+    tools.register(
+      this.questionFrameTool(turn.question, (frame) => {
+        questionFrame ??= frame;
+        return questionFrame;
+      }),
+    );
+    tools.register(
+      this.ontologySearchTool(() => questionFrame, ontologySearchCache),
+    );
     tools.register(this.propertyValueSearchTool(valueBindings));
     tools.register(
       this.executeAnalysisPlanTool(
@@ -263,7 +270,7 @@ export class DataAgentHarness {
 
   private questionFrameTool(
     expectedQuestion: string,
-    capture: (frame: QuestionLanguageFrame) => void,
+    capture: (frame: QuestionLanguageFrame) => QuestionLanguageFrame,
   ): Tool {
     return {
       name: "SubmitQuestionFrame",
@@ -360,15 +367,15 @@ export class DataAgentHarness {
             content: "original_question 必须原样保留当前用户问题",
           };
         }
-        capture(frame);
+        const acceptedFrame = capture(frame);
         return {
           ok: true,
           content: JSON.stringify({
             accepted: true,
-            frame,
+            frame: acceptedFrame,
             next: "调用 OntologySearch；对每个 businessValueTerm 调用 PropertyValueSearch",
           }),
-          data: { frame },
+          data: { frame: acceptedFrame },
         };
       },
     };
@@ -376,6 +383,7 @@ export class DataAgentHarness {
 
   private ontologySearchTool(
     getQuestionFrame: () => QuestionLanguageFrame | undefined,
+    cache: Map<string, ToolOutcome> = new Map(),
   ): Tool {
     return {
       name: "OntologySearch",
@@ -398,12 +406,36 @@ export class DataAgentHarness {
         const ontology = this.repository.getOntology();
         const index = new SemanticIndex(ontology);
         const frame = getQuestionFrame();
+        const cacheKey = JSON.stringify({
+          ontologyVersion: ontology.version,
+          question: normalizePropertyValue(frame?.originalQuestion ?? query),
+        });
+        const cached = cache.get(cacheKey);
+        if (cached) {
+          const cachedPayload = JSON.parse(cached.content) as Record<
+            string,
+            unknown
+          >;
+          return {
+            ...cached,
+            content: JSON.stringify({
+              ...cachedPayload,
+              duplicateSuppressed: true,
+              duplicateInstruction:
+                "这是同一问题的既有检索结果。禁止继续调用 OntologySearch；请使用当前候选执行计划或向用户澄清。",
+            }),
+            data: {
+              ...((cached.data as Record<string, unknown> | undefined) ?? {}),
+              duplicateSuppressed: true,
+            },
+          };
+        }
         const roleSearches = frame
           ? [
               ...frame.metricTerms.map((term) => ({
                 role: "metric",
                 term,
-                kinds: ["metric"] as const,
+                kinds: ["metric", "property"] as const,
               })),
               ...frame.objectTerms.map((term) => ({
                 role: "object",
@@ -425,11 +457,18 @@ export class DataAgentHarness {
                   term,
                   6,
                   kinds ? [...kinds] : undefined,
-                ).map((match) => ({
-                  ...match,
-                  sourceRole: role,
-                  sourceText: term,
-                })),
+                )
+                  .filter(
+                    (match) =>
+                      role !== "metric" ||
+                      match.kind === "metric" ||
+                      isAggregatableProperty(ontology, match.id),
+                  )
+                  .map((match) => ({
+                    ...match,
+                    sourceRole: role,
+                    sourceText: term,
+                  })),
               )
               .map((match) => [
                 `${match.sourceRole}:${match.sourceText}:${match.kind}:${match.id}`,
@@ -454,6 +493,33 @@ export class DataAgentHarness {
         const metrics = ontology.metrics.filter((metric) =>
           matches.some((match) => match.id === metric.id),
         );
+        const propertyMeasures = matches.flatMap((match) => {
+          if (match.kind !== "property" || match.sourceRole !== "metric") return [];
+          const binding = findPropertyBinding(ontology, match.id);
+          const aggregation = binding?.property.numericSpec?.defaultAggregation;
+          if (
+            !binding ||
+            binding.property.meaning !== "NUMBER" ||
+            !aggregation ||
+            aggregation === "NONE"
+          ) {
+            return [];
+          }
+          return [{
+            id: binding.property.id,
+            objectId: binding.object.id,
+            label: binding.property.label,
+            aggregation,
+            sourcePropertyId: binding.property.id,
+            timePropertyId: binding.object.defaultTimePropertyId,
+            measureKind: "PROPERTY" as const,
+            numericKind: binding.property.numericSpec?.kind,
+            unit:
+              binding.property.numericSpec?.kind === "CURRENCY"
+                ? binding.property.numericSpec.currency
+                : binding.property.numericSpec?.unit,
+          }];
+        });
         const relations = ontology.relations.filter(
           (relation) =>
             relation.enabled &&
@@ -525,14 +591,18 @@ export class DataAgentHarness {
                 bindingPriority: property.bindingPriority,
               })),
           })),
-          metrics: metrics.map((metric) => ({
-            id: metric.id,
-            objectId: metric.objectId,
-            label: metric.label,
-            aggregation: metric.aggregation,
-            sourcePropertyId: metric.sourcePropertyId,
-            timePropertyId: metric.timePropertyId,
-          })),
+          metrics: [
+            ...metrics.map((metric) => ({
+              id: metric.id,
+              objectId: metric.objectId,
+              label: metric.label,
+              aggregation: metric.aggregation,
+              sourcePropertyId: metric.sourcePropertyId,
+              timePropertyId: metric.timePropertyId,
+              measureKind: "METRIC" as const,
+            })),
+            ...propertyMeasures,
+          ],
           relations: relations.map((relation) => ({
             id: relation.id,
             name: relation.name,
@@ -545,10 +615,11 @@ export class DataAgentHarness {
           instructions: [
             "matches 是词形候选，不代表具体业务值的字段归属",
             "具体值必须调用 PropertyValueSearch 做全局值索引验证",
-            "measure_ids 只能使用 metrics[].id",
+            "measure_ids 只能使用 metrics[].id；measureKind=PROPERTY 表示由数字属性默认聚合生成的受控度量",
+            "不得对相同问题重复调用 OntologySearch；没有候选时应向用户澄清",
           ],
         };
-        return {
+        const outcome: ToolOutcome = {
           ok: true,
           content: JSON.stringify(payload),
           data: {
@@ -557,6 +628,8 @@ export class DataAgentHarness {
             relations,
           },
         };
+        cache.set(cacheKey, outcome);
+        return outcome;
       },
     };
   }
@@ -840,7 +913,7 @@ export class DataAgentHarness {
             type: "array",
             items: { type: "string" },
             description:
-              "只能填写 OntologySearch 的 metrics[].id。严禁填写 properties[].id；属性只能用于 dimension_property_ids、filters 或 time_range.property_id",
+              "只能填写 OntologySearch 的 metrics[].id。metrics 中既包含正式指标，也可能包含 measureKind=PROPERTY 的受控数字属性；未作为 metrics 返回的普通属性不能填写",
           },
           dimension_property_ids: {
             type: "array",
@@ -998,14 +1071,7 @@ export class DataAgentHarness {
             timezone,
           );
         } catch (error) {
-          const availableMetrics = this.repository
-            .getPublishedOntology()
-            .metrics.slice(0, 12)
-            .map((metric) => ({
-              id: metric.id,
-              label: metric.label,
-              sourcePropertyId: metric.sourcePropertyId,
-            }));
+          const availableMetrics = listAvailableMeasures(ontology).slice(0, 24);
           const detail =
             error instanceof Error ? error.message : "IR规则校验失败";
           return {
@@ -1015,7 +1081,7 @@ export class DataAgentHarness {
               stage: "planning",
               intent: intent as unknown as Record<string, unknown>,
               retryInstruction:
-                "根据错误重新检查 ID 类型并再次调用 ExecuteAnalysisPlan。measure_ids 只能使用 metrics[].id，属性 ID 不能充当指标。",
+                "根据错误重新检查 ID 类型并再次调用 ExecuteAnalysisPlan。measure_ids 只能使用 OntologySearch 返回的 metrics[].id，其中 measureKind=PROPERTY 的数字属性允许按默认聚合执行。",
               availableMetrics,
             },
           };
@@ -1208,6 +1274,70 @@ function effectiveGrainLabels(object: OntologyObject): string[] {
   return grainIds
     .map((id) => object.properties.find((property) => property.id === id)?.label)
     .filter((label): label is string => Boolean(label));
+}
+
+function findPropertyBinding(
+  ontology: OntologySnapshot,
+  propertyId: string,
+): {
+  object: OntologyObject;
+  property: OntologyObject["properties"][number];
+} | undefined {
+  for (const object of ontology.objects) {
+    const property = object.properties.find(
+      (candidate) => candidate.id === propertyId,
+    );
+    if (property) return { object, property };
+  }
+  return undefined;
+}
+
+function isAggregatableProperty(
+  ontology: OntologySnapshot,
+  propertyId: string,
+): boolean {
+  const binding = findPropertyBinding(ontology, propertyId);
+  return Boolean(
+    binding &&
+      binding.property.visibility === "ANALYTICAL" &&
+      !binding.property.sensitive &&
+      binding.property.meaning === "NUMBER" &&
+      binding.property.numericSpec &&
+      binding.property.numericSpec.defaultAggregation !== "NONE",
+  );
+}
+
+function listAvailableMeasures(
+  ontology: OntologySnapshot,
+): Array<{
+  id: string;
+  label: string;
+  sourcePropertyId?: string;
+  aggregation: string;
+  measureKind: "METRIC" | "PROPERTY";
+}> {
+  return [
+    ...ontology.metrics.map((metric) => ({
+      id: metric.id,
+      label: metric.label,
+      sourcePropertyId: metric.sourcePropertyId,
+      aggregation: metric.aggregation,
+      measureKind: "METRIC" as const,
+    })),
+    ...ontology.objects.flatMap((object) =>
+      object.properties.flatMap((property) =>
+        isAggregatableProperty(ontology, property.id)
+          ? [{
+              id: property.id,
+              label: property.label,
+              sourcePropertyId: property.id,
+              aggregation: property.numericSpec!.defaultAggregation,
+              measureKind: "PROPERTY" as const,
+            }]
+          : [],
+      ),
+    ),
+  ];
 }
 
 function normalizePropertyValue(value: string): string {

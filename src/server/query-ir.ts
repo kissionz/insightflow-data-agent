@@ -355,6 +355,13 @@ function resolveMeasureReference(
       source: `Montane误传属性ID，规则引擎按唯一治理映射从“${propertyBinding.property.label}”纠正为指标`,
     };
   }
+  const implicitMetric = createImplicitPropertyMetric(propertyBinding);
+  if (implicitMetric && governedMetrics.length === 0) {
+    return {
+      metric: implicitMetric,
+      source: `数字属性默认${aggregationLabel(implicitMetric.aggregation)} · IR受控聚合`,
+    };
+  }
   const availableMetrics = ontology.metrics
     .slice(0, 8)
     .map((candidate) => `${candidate.label}（${candidate.id}）`)
@@ -364,9 +371,63 @@ function resolveMeasureReference(
       `“${propertyBinding.property.label}”是属性且对应多个指标，不能自动选择。measure_ids 必须使用指标 ID：${governedMetrics.map((candidate) => `${candidate.label}（${candidate.id}）`).join("、")}`,
     );
   }
+  if (propertyBinding.property.meaning === "NUMBER") {
+    throw new Error(
+      `数字属性“${propertyBinding.property.label}”没有可用的默认聚合规则，请在本体中设置 SUM、AVG、MIN 或 MAX，或创建正式指标`,
+    );
+  }
   throw new Error(
-    `“${propertyBinding.property.label}”（${id}）是属性，不是指标。measure_ids 只能使用指标 ID${availableMetrics ? `；当前可用指标：${availableMetrics}` : ""}`,
+    `“${propertyBinding.property.label}”（${id}）不是可聚合数字属性。measure_ids 只能使用 OntologySearch 返回的 metrics[].id${availableMetrics ? `；当前可用指标：${availableMetrics}` : ""}`,
   );
+}
+
+function createImplicitPropertyMetric(
+  binding: { object: OntologyObject; property: OntologyProperty },
+): Metric | undefined {
+  const numeric = binding.property.numericSpec;
+  const aggregation = numeric?.defaultAggregation;
+  if (
+    binding.property.meaning !== "NUMBER" ||
+    binding.property.visibility !== "ANALYTICAL" ||
+    binding.property.sensitive ||
+    !aggregation ||
+    aggregation === "NONE"
+  ) {
+    return undefined;
+  }
+  return {
+    id: binding.property.id,
+    name: `implicit_${binding.property.name}`,
+    label: binding.property.label,
+    description: `${binding.property.label}按属性默认规则${aggregationLabel(aggregation)}`,
+    objectId: binding.object.id,
+    expression: `${aggregation}(${binding.property.sourceColumn})`,
+    definitionMode: "VISUAL",
+    sourcePropertyId: binding.property.id,
+    timePropertyId: binding.object.defaultTimePropertyId,
+    aggregation,
+    format:
+      numeric.kind === "CURRENCY"
+        ? "currency"
+        : numeric.kind === "RATIO"
+          ? "percent"
+          : "number",
+    unit: numeric.kind === "CURRENCY" ? numeric.currency : numeric.unit,
+    synonyms: binding.property.synonyms,
+    status: binding.object.status,
+  };
+}
+
+function aggregationLabel(aggregation: Metric["aggregation"]): string {
+  return {
+    SUM: "求和",
+    COUNT: "计数",
+    COUNT_DISTINCT: "去重计数",
+    AVG: "平均",
+    MIN: "最小值",
+    MAX: "最大值",
+    CUSTOM: "自定义计算",
+  }[aggregation];
 }
 
 function requireProperty(

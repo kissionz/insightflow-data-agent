@@ -127,6 +127,59 @@ describe("QueryIrCompiler", () => {
     );
   });
 
+  it("uses a numeric property as a governed measure through its default aggregation", () => {
+    const ontology = structuredClone(testOntology);
+    ontology.metrics = [];
+    const compiler = new QueryIrCompiler();
+    const compiled = compiler.compile(
+      {
+        rootObjectId: "o_order",
+        measureIds: ["p_order_amount"],
+        dimensionPropertyIds: [],
+        filters: [],
+        resultKind: "aggregate",
+        title: "销售金额",
+      },
+      ontology,
+      [ordersTable()],
+    );
+
+    expect(compiled.sql).toContain(
+      "SUM(t0.`pay_amount`) AS `实付金额`",
+    );
+    expect(compiled.ir.measureIds).toEqual(["p_order_amount"]);
+    expect(compiled.bindings).toContainEqual(
+      expect.objectContaining({
+        label: "指标",
+        value: "实付金额",
+        entityId: "p_order_amount",
+        source: "数字属性默认求和 · IR受控聚合",
+      }),
+    );
+  });
+
+  it("rejects a numeric property without a default aggregation", () => {
+    const ontology = structuredClone(testOntology);
+    ontology.metrics = [];
+    ontology.objects[0]!.properties[1]!.numericSpec!.defaultAggregation = "NONE";
+    const compiler = new QueryIrCompiler();
+
+    expect(() =>
+      compiler.compile(
+        {
+          rootObjectId: "o_order",
+          measureIds: ["p_order_amount"],
+          dimensionPropertyIds: [],
+          filters: [],
+          resultKind: "aggregate",
+          title: "销售金额",
+        },
+        ontology,
+        [ordersTable()],
+      ),
+    ).toThrow("没有可用的默认聚合规则");
+  });
+
   it("explains when a non-measure property is used as a metric", () => {
     const compiler = new QueryIrCompiler();
     expect(() =>
@@ -142,7 +195,7 @@ describe("QueryIrCompiler", () => {
         testOntology,
         [ordersTable()],
       ),
-    ).toThrow("是属性，不是指标");
+    ).toThrow("不是可聚合数字属性");
   });
 
   it("compiles an indexed value on a related object as a correlated EXISTS", () => {

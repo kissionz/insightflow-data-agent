@@ -7,6 +7,7 @@ import type {
   AgentResponse,
   ConfiguredModelRuntime,
   ModelClient,
+  Tool,
   ToolCall,
   ToolOutcome,
   ToolStatus,
@@ -138,7 +139,11 @@ describe("DataAgentHarness", () => {
     roots.push(root);
     const repository = new Repository(path.join(root, ".montane/data-agent/ontology.sqlite"));
     const ontology = structuredClone(testOntology);
+    ontology.metrics = [];
     const order = ontology.objects[0];
+    order.properties
+      .find((property) => property.id === "p_order_amount")!
+      .synonyms.push("销售额", "销售金额");
     order.defaultTimePropertyId = "p_paid_at";
     order.properties.push(
       {
@@ -329,6 +334,59 @@ describe("DataAgentHarness", () => {
     expect(calls[0].sql).toContain("`member_level`");
     expect(calls[0].parameters).toEqual(["VIP"]);
     expect(second.content).toContain('"source":"local-cache"');
+    await harness.close();
+    repository.close();
+  });
+
+  it("returns an aggregatable numeric property as a measure candidate", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-harness-"));
+    roots.push(root);
+    const repository = new Repository(
+      path.join(root, ".montane/data-agent/ontology.sqlite"),
+    );
+    const ontology = structuredClone(testOntology);
+    ontology.metrics = [];
+    repository.saveOntology(ontology);
+    const harness = new DataAgentHarness(
+      root,
+      repository,
+      async () => {
+        throw new Error("ontology search must not query SelectDB");
+      },
+      () => runtimeFor(new ScriptedMontaneModel()),
+    );
+    const cache = new Map<string, ToolOutcome>();
+    const tool = (
+      harness as unknown as {
+        ontologySearchTool(
+          getFrame: () => unknown,
+          cache: Map<string, ToolOutcome>,
+        ): Tool;
+      }
+    ).ontologySearchTool(
+      () => ({
+        originalQuestion: "今年销售金额",
+        metricTerms: ["实付金额"],
+        timeTerms: ["今年"],
+        objectTerms: [],
+        businessValueTerms: [],
+        groupingTerms: [],
+        calculationTerms: [],
+        presentation: { kind: "SINGLE_VALUE" },
+      }),
+      cache,
+    );
+
+    const first = await tool.execute({ query: "今年销售金额" });
+    const repeated = await tool.execute({ query: "今年销售金额" });
+
+    expect(first.ok).toBe(true);
+    expect(first.content).toContain('"id":"p_order_amount"');
+    expect(first.content).toContain('"measureKind":"PROPERTY"');
+    expect(first.content).toContain('"aggregation":"SUM"');
+    expect(repeated.data).toMatchObject({ duplicateSuppressed: true });
+    expect(repeated.content).toContain('"duplicateSuppressed":true');
+    expect(repeated.content).toContain("禁止继续调用 OntologySearch");
     await harness.close();
     repository.close();
   });
@@ -554,7 +612,7 @@ class PlanningMontaneModel implements ModelClient {
           name: "ExecuteAnalysisPlan",
           args: {
             root_object_id: "o_order",
-            measure_ids: ["m_gmv"],
+            measure_ids: ["p_order_amount"],
             dimension_property_ids: [],
             filters: [{
               value_binding_id: bindingId,

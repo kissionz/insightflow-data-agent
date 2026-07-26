@@ -185,6 +185,7 @@ export function mergeTraceFacts(
 
 class HarnessTurnReporter implements AgentReporter {
   private ontologyDiagnostics: unknown;
+  private hasResolvedValueBinding = false;
 
   constructor(
     private readonly update: (
@@ -379,6 +380,9 @@ class HarnessTurnReporter implements AgentReporter {
           }
         | undefined;
       const matches = data?.matches ?? [];
+      if (matches.some((match) => match.selectionStatus === "selected")) {
+        this.hasResolvedValueBinding = true;
+      }
       this.update("semantic_binding", "completed", {
         summary: matches.length
           ? `属性值已定位：${matches
@@ -422,6 +426,14 @@ class HarnessTurnReporter implements AgentReporter {
       return;
     }
     if (isFailure(status)) {
+      if (this.hasResolvedValueBinding) {
+        this.update("semantic_binding", "completed", {
+          summary: "属性值已成功定位；后续重复调用未改变既有绑定",
+          detail:
+            result?.content || "后续属性值检索调用失败，保留此前已确认的值绑定。",
+        });
+        return;
+      }
       this.update("semantic_binding", "failed", {
         summary: result?.content || "属性值定位失败",
       });

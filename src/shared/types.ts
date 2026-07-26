@@ -129,6 +129,25 @@ export interface PropertyValueIndexStatus {
   error?: string;
 }
 
+export interface PropertyValueIndexProperty {
+  ontologyVersion: number;
+  objectId: string;
+  objectLabel: string;
+  propertyId: string;
+  propertyLabel: string;
+  sourceColumn: string;
+  semanticMeaning: PropertyMeaning;
+  status: "ready" | "partial" | "empty" | "failed";
+  distinctValues: number;
+  coveredRows: number;
+  updatedAt: string;
+  error?: string;
+  topValues: Array<{
+    value: string;
+    frequency: number;
+  }>;
+}
+
 export interface ResultSeries {
   name: string;
   data: number[];

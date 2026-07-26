@@ -46,6 +46,9 @@ describe("PropertyValueIndexer", () => {
       "vip",
       ["p_customer_level"],
     );
+    const properties = repository.getIndexedPropertyStatuses(
+      testOntology.version,
+    );
 
     expect(status).toMatchObject({
       status: "ready",
@@ -60,6 +63,19 @@ describe("PropertyValueIndexer", () => {
         propertyId: "p_customer_level",
         displayValue: "VIP",
         frequency: 42,
+      }),
+    ]);
+    expect(properties).toEqual([
+      expect.objectContaining({
+        objectId: "o_customer",
+        propertyId: "p_customer_level",
+        status: "ready",
+        distinctValues: 2,
+        coveredRows: 60,
+        topValues: [
+          { value: "VIP", frequency: 42 },
+          { value: "普通会员", frequency: 18 },
+        ],
       }),
     ]);
     repository.close();

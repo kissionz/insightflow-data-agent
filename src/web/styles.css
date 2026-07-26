@@ -596,6 +596,11 @@ button.brand-mark {
   color: #b66b00;
 }
 
+.status-pill.danger {
+  background: color-mix(in oklab, var(--danger), white 91%);
+  color: var(--danger);
+}
+
 .table-status.drafting {
   background: var(--blue-soft);
   color: var(--blue);
@@ -2578,8 +2583,206 @@ tbody tr:hover {
   padding: 16px;
 }
 
+.value-index-section {
+  overflow: hidden;
+}
+
 .value-index-actions {
   justify-content: flex-end;
+}
+
+.index-detail-panel {
+  border-top: 1px solid var(--border);
+}
+
+.index-detail-panel > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 42px;
+  padding: 0 16px;
+  color: #344054;
+  cursor: pointer;
+  list-style: none;
+}
+
+.index-detail-panel > summary::-webkit-details-marker {
+  display: none;
+}
+
+.index-detail-panel > summary > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.index-detail-panel > summary svg {
+  transition: transform 180ms ease-out;
+}
+
+.index-detail-panel[open] > summary svg {
+  transform: rotate(90deg);
+}
+
+.index-detail-panel > summary small,
+.index-detail-toolbar > span {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.index-rule-line {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  border-top: 1px solid var(--border);
+  background: #f8faff;
+  padding: 10px 16px;
+}
+
+.index-rule-line strong {
+  margin-right: 4px;
+  color: #344054;
+  font-size: 10px;
+}
+
+.index-rule-line span {
+  border: 1px solid #d9e4f8;
+  border-radius: 5px;
+  background: white;
+  color: #475467;
+  font-size: 9px;
+  padding: 4px 7px;
+}
+
+.index-detail-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+}
+
+.index-detail-toolbar label {
+  display: flex;
+  align-items: center;
+  width: min(420px, 100%);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: white;
+  color: var(--muted);
+  padding: 0 9px;
+}
+
+.index-detail-toolbar label:focus-within {
+  border-color: var(--blue);
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--blue), transparent 90%);
+}
+
+.index-detail-toolbar input {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: #1d2939;
+  outline: 0;
+  padding: 8px;
+  font: inherit;
+  font-size: 10px;
+}
+
+.index-detail-toolbar input::placeholder {
+  color: #667085;
+}
+
+.index-table-scroll {
+  overflow-x: auto;
+  border-top: 1px solid var(--border);
+}
+
+.index-detail-table {
+  width: 100%;
+  min-width: 980px;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+
+.index-detail-table th,
+.index-detail-table td {
+  border-bottom: 1px solid #edf1f7;
+  padding: 10px 12px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.index-detail-table th {
+  background: #fbfcfe;
+  color: #667085;
+  font-size: 9px;
+  font-weight: 650;
+}
+
+.index-detail-table th:nth-child(1) { width: 140px; }
+.index-detail-table th:nth-child(2) { width: 210px; }
+.index-detail-table th:nth-child(3) { width: 78px; }
+.index-detail-table th:nth-child(4) { width: 120px; }
+.index-detail-table th:nth-child(5) { width: 340px; }
+.index-detail-table th:nth-child(6) { width: 95px; }
+
+.index-detail-table td {
+  color: #344054;
+  font-size: 10px;
+}
+
+.index-detail-table td > strong,
+.index-detail-table td > small {
+  display: block;
+}
+
+.index-detail-table td > strong {
+  font-weight: 600;
+}
+
+.index-detail-table td > small {
+  overflow: hidden;
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.index-value-list {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.index-value-list > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 155px;
+  border: 1px solid #dce5f4;
+  border-radius: 5px;
+  background: #f8faff;
+  color: #344054;
+  padding: 4px 6px;
+  white-space: nowrap;
+}
+
+.index-value-list > span > small {
+  color: #667085;
+  font-size: 8px;
+}
+
+.index-empty {
+  height: 72px;
+  color: var(--muted) !important;
+  text-align: center !important;
+  vertical-align: middle !important;
 }
 
 .setting-error {
@@ -2749,5 +2952,6 @@ tbody tr:hover {
     scroll-behavior: auto !important;
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
   }
 }

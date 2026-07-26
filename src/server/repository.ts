@@ -31,6 +31,21 @@ export interface IndexedPropertyValue extends CachedPropertyValue {
   frequency: number;
 }
 
+export interface IndexedPropertyStatus {
+  ontologyVersion: number;
+  objectId: string;
+  propertyId: string;
+  status: "ready" | "partial" | "empty" | "failed";
+  distinctValues: number;
+  coveredRows: number;
+  updatedAt: string;
+  error?: string;
+  topValues: Array<{
+    value: string;
+    frequency: number;
+  }>;
+}
+
 export class Repository {
   private readonly db: DatabaseSync;
 
@@ -271,6 +286,125 @@ export class Repository {
     }
   }
 
+  clearIndexedPropertyStatuses(ontologyVersion: number): void {
+    this.db
+      .prepare(
+        "DELETE FROM property_value_index_properties WHERE ontology_version = ?",
+      )
+      .run(ontologyVersion);
+  }
+
+  saveIndexedPropertyStatus(
+    status: Omit<IndexedPropertyStatus, "topValues">,
+  ): void {
+    this.db
+      .prepare(
+        `INSERT INTO property_value_index_properties
+           (ontology_version, object_id, property_id, status, distinct_values,
+            covered_rows, error, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(ontology_version, property_id)
+         DO UPDATE SET
+           object_id = excluded.object_id,
+           status = excluded.status,
+           distinct_values = excluded.distinct_values,
+           covered_rows = excluded.covered_rows,
+           error = excluded.error,
+           updated_at = excluded.updated_at`,
+      )
+      .run(
+        status.ontologyVersion,
+        status.objectId,
+        status.propertyId,
+        status.status,
+        status.distinctValues,
+        status.coveredRows,
+        status.error ?? null,
+        status.updatedAt,
+      );
+  }
+
+  getIndexedPropertyStatuses(
+    ontologyVersion: number,
+  ): IndexedPropertyStatus[] {
+    const statusRows = this.db
+      .prepare(
+        `SELECT ontology_version, object_id, property_id, status,
+                distinct_values, covered_rows, error, updated_at
+           FROM property_value_index_properties
+          WHERE ontology_version = ?
+          ORDER BY object_id, property_id`,
+      )
+      .all(ontologyVersion) as Array<{
+        ontology_version: number;
+        object_id: string;
+        property_id: string;
+        status: IndexedPropertyStatus["status"];
+        distinct_values: number;
+        covered_rows: number;
+        error: string | null;
+        updated_at: string;
+      }>;
+    const knownPropertyIds = new Set(
+      statusRows.map((row) => row.property_id),
+    );
+    const legacyRows = this.db
+      .prepare(
+        `SELECT ontology_version, object_id, property_id,
+                COUNT(*) AS distinct_values,
+                COALESCE(SUM(frequency), 0) AS covered_rows,
+                MAX(updated_at) AS updated_at
+           FROM property_value_index
+          WHERE ontology_version = ?
+          GROUP BY ontology_version, object_id, property_id
+          ORDER BY object_id, property_id`,
+      )
+      .all(ontologyVersion) as Array<{
+        ontology_version: number;
+        object_id: string;
+        property_id: string;
+        distinct_values: number;
+        covered_rows: number;
+        updated_at: string;
+      }>;
+    const rows = [
+      ...statusRows,
+      ...legacyRows
+        .filter((row) => !knownPropertyIds.has(row.property_id))
+        .map((row) => ({
+          ...row,
+          status: "ready" as const,
+          error: null,
+        })),
+    ];
+    const topValues = this.db.prepare(
+      `SELECT display_value, frequency
+         FROM property_value_index
+        WHERE ontology_version = ? AND property_id = ?
+        ORDER BY frequency DESC, display_value
+        LIMIT 8`,
+    );
+    return rows.map((row) => ({
+      ontologyVersion: row.ontology_version,
+      objectId: row.object_id,
+      propertyId: row.property_id,
+      status: row.status,
+      distinctValues: row.distinct_values,
+      coveredRows: row.covered_rows,
+      updatedAt: row.updated_at,
+      error: row.error ?? undefined,
+      topValues: (
+        topValues.all(ontologyVersion, row.property_id) as Array<{
+          display_value: string;
+          frequency: number;
+        }>
+      ).map((value) => ({
+        value: value.display_value,
+        frequency: value.frequency,
+      })),
+    }));
+  }
+
   getAgentConfig(): AgentPromptConfig {
     const row = this.db
       .prepare("SELECT value FROM settings WHERE key = 'agent_config'")
@@ -452,6 +586,19 @@ export class Repository {
       );
       CREATE INDEX IF NOT EXISTS property_value_index_lookup
         ON property_value_index (ontology_version, normalized_value);
+      CREATE TABLE IF NOT EXISTS property_value_index_properties (
+        ontology_version INTEGER NOT NULL,
+        object_id TEXT NOT NULL,
+        property_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        distinct_values INTEGER NOT NULL DEFAULT 0,
+        covered_rows INTEGER NOT NULL DEFAULT 0,
+        error TEXT,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (ontology_version, property_id)
+      );
+      CREATE INDEX IF NOT EXISTS property_value_index_properties_version
+        ON property_value_index_properties (ontology_version, status);
     `);
   }
 

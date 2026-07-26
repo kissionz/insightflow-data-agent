@@ -40,6 +40,7 @@ import type {
   OntologySnapshot,
   OntologyValidationResult,
   PhysicalTable,
+  PropertyValueIndexProperty,
   TraceStep,
   Turn,
 } from "../shared/types";
@@ -2856,6 +2857,29 @@ function SettingsPage({
   });
   const [saving, setSaving] = useState(false);
   const [indexing, setIndexing] = useState(valueIndex.status === "building");
+  const [indexProperties, setIndexProperties] = useState<
+    PropertyValueIndexProperty[]
+  >([]);
+  const [indexDetailsLoading, setIndexDetailsLoading] = useState(true);
+  const [indexSearch, setIndexSearch] = useState("");
+  useEffect(() => {
+    let cancelled = false;
+    setIndexDetailsLoading(true);
+    api
+      .valueIndexProperties()
+      .then((result) => {
+        if (!cancelled) setIndexProperties(result.properties);
+      })
+      .catch((reason) => {
+        if (!cancelled) onError(asMessage(reason));
+      })
+      .finally(() => {
+        if (!cancelled) setIndexDetailsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [onError, valueIndex.ontologyVersion, valueIndex.updatedAt]);
   useEffect(() => {
     if (!indexing) return;
     let cancelled = false;
@@ -2905,6 +2929,19 @@ function SettingsPage({
       setIndexing(false);
     }
   }
+  const normalizedIndexSearch = indexSearch.trim().toLocaleLowerCase("zh-CN");
+  const visibleIndexProperties = indexProperties.filter((property) => {
+    if (!normalizedIndexSearch) return true;
+    return [
+      property.objectLabel,
+      property.propertyLabel,
+      property.sourceColumn,
+      property.semanticMeaning,
+      ...property.topValues.map((value) => value.value),
+    ].some((value) =>
+      value.toLocaleLowerCase("zh-CN").includes(normalizedIndexSearch),
+    );
+  });
   return (
     <div className="management-content settings-grid">
       <section className="panel agent-config-panel">
@@ -2957,32 +2994,123 @@ function SettingsPage({
           </button>
         </div>
       </section>
-      <section className="panel value-index-panel">
-        <div className="setting-icon"><MagnifyingGlass size={20} /></div>
-        <div>
-          <h2>属性值索引</h2>
-          <p>
-            本体 v{valueIndex.ontologyVersion} · {valueIndex.indexedProperties} 个属性 ·
-            {" "}{valueIndex.indexedValues.toLocaleString()} 个值
-            {valueIndex.partialProperties
-              ? ` · ${valueIndex.partialProperties} 个高基数字段仅保留高频值`
-              : ""}
-          </p>
-          {valueIndex.error && <small className="setting-error">{valueIndex.error}</small>}
+      <section className="panel value-index-section">
+        <div className="value-index-panel">
+          <div className="setting-icon"><MagnifyingGlass size={20} /></div>
+          <div>
+            <h2>属性值索引</h2>
+            <p>
+              本体 v{valueIndex.ontologyVersion} · {valueIndex.indexedProperties} 个属性 ·
+              {" "}{valueIndex.indexedValues.toLocaleString()} 个值
+              {valueIndex.partialProperties
+                ? ` · ${valueIndex.partialProperties} 个高基数字段仅保留高频值`
+                : ""}
+            </p>
+            {valueIndex.error && <small className="setting-error">{valueIndex.error}</small>}
+          </div>
+          <div className="value-index-actions">
+            <span className={`status-pill ${valueIndexStatusTone(valueIndex.status)}`}>
+              {valueIndexStatusLabel(valueIndex.status)}
+            </span>
+            <button
+              className="secondary-button"
+              disabled={indexing}
+              onClick={() => void rebuildIndex()}
+            >
+              <ArrowClockwise size={16} className={indexing ? "rotating" : ""} />
+              {indexing ? "构建中" : "重建索引"}
+            </button>
+          </div>
         </div>
-        <div className="value-index-actions">
-          <span className={`status-pill ${valueIndexStatusTone(valueIndex.status)}`}>
-            {valueIndexStatusLabel(valueIndex.status)}
-          </span>
-          <button
-            className="secondary-button"
-            disabled={indexing}
-            onClick={() => void rebuildIndex()}
-          >
-            <ArrowClockwise size={16} className={indexing ? "rotating" : ""} />
-            {indexing ? "构建中" : "重建索引"}
-          </button>
-        </div>
+        <details className="index-detail-panel" open>
+          <summary>
+            <span><CaretRight size={14} /> 索引明细</span>
+            <small>{indexProperties.length} 个属性有构建记录</small>
+          </summary>
+          <div className="index-rule-line">
+            <strong>索引规则</strong>
+            <span>仅发布本体</span>
+            <span>允许值检索</span>
+            <span>排除敏感与隐藏属性</span>
+            <span>每个属性保留频次最高的 5,000 个值</span>
+            <span>查询时全局精确值优先，词形候选只参与排序</span>
+          </div>
+          <div className="index-detail-toolbar">
+            <label>
+              <MagnifyingGlass size={15} />
+              <input
+                aria-label="筛选索引明细"
+                value={indexSearch}
+                placeholder="搜索对象、属性、字段或样例值"
+                onChange={(event) => setIndexSearch(event.target.value)}
+              />
+            </label>
+            <span>
+              {indexDetailsLoading
+                ? "正在读取…"
+                : `显示 ${visibleIndexProperties.length} / ${indexProperties.length}`}
+            </span>
+          </div>
+          <div className="index-table-scroll">
+            <table className="index-detail-table">
+              <thead>
+                <tr>
+                  <th>对象</th>
+                  <th>属性与字段</th>
+                  <th>分类</th>
+                  <th>索引覆盖</th>
+                  <th>高频样例值</th>
+                  <th>状态</th>
+                </tr>
+              </thead>
+              <tbody>
+                {visibleIndexProperties.map((property) => (
+                  <tr key={property.propertyId}>
+                    <td>
+                      <strong>{property.objectLabel}</strong>
+                      <small>{property.objectId}</small>
+                    </td>
+                    <td>
+                      <strong>{property.propertyLabel}</strong>
+                      <small>{property.sourceColumn} · {property.propertyId}</small>
+                    </td>
+                    <td>{propertyMeaningLabel(property.semanticMeaning)}</td>
+                    <td>
+                      <strong>{property.distinctValues.toLocaleString()} 个值</strong>
+                      <small>覆盖频次 {property.coveredRows.toLocaleString()}</small>
+                    </td>
+                    <td>
+                      <div className="index-value-list">
+                        {property.topValues.length
+                          ? property.topValues.map((value) => (
+                              <span key={value.value}>
+                                {value.value}<small>{value.frequency.toLocaleString()}</small>
+                              </span>
+                            ))
+                          : <small>没有可索引值</small>}
+                      </div>
+                    </td>
+                    <td>
+                      <span className={`status-pill ${indexPropertyStatusTone(property.status)}`}>
+                        {indexPropertyStatusLabel(property.status)}
+                      </span>
+                      {property.error && <small className="setting-error">{property.error}</small>}
+                    </td>
+                  </tr>
+                ))}
+                {!indexDetailsLoading && !visibleIndexProperties.length && (
+                  <tr>
+                    <td colSpan={6} className="index-empty">
+                      {indexProperties.length
+                        ? "没有匹配的索引属性或样例值"
+                        : "尚无属性级索引记录，请先重建索引"}
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </details>
       </section>
       <section className="panel setting-card">
         <div className="setting-icon"><Brain size={20} /></div>
@@ -3319,6 +3447,25 @@ function valueIndexStatusTone(
   if (status === "ready") return "success";
   if (status === "building" || status === "partial") return "warning";
   return "";
+}
+
+function indexPropertyStatusLabel(
+  status: PropertyValueIndexProperty["status"],
+): string {
+  return {
+    ready: "已索引",
+    partial: "高频截断",
+    empty: "无值",
+    failed: "失败",
+  }[status];
+}
+
+function indexPropertyStatusTone(
+  status: PropertyValueIndexProperty["status"],
+): string {
+  if (status === "ready") return "success";
+  if (status === "partial" || status === "empty") return "warning";
+  return "danger";
 }
 
 function Toast({ message, onClose }: { message: string; onClose: () => void }) {

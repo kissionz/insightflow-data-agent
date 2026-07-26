@@ -73,6 +73,7 @@ export class PropertyValueIndexer {
       failedProperties: 0,
       updatedAt: new Date().toISOString(),
     };
+    this.repository.clearIndexedPropertyStatuses(ontology.version);
 
     for (let offset = 0; offset < candidates.length; offset += INDEX_BATCH_SIZE) {
       const batch = candidates.slice(offset, offset + INDEX_BATCH_SIZE);
@@ -106,20 +107,55 @@ LIMIT ${MAX_VALUES_PER_PROPERTY + 1}`;
             property.id,
             values,
           );
-          return { valueCount: values.length, partial };
+          return {
+            objectId: object.id,
+            propertyId: property.id,
+            valueCount: values.length,
+            coveredRows: values.reduce(
+              (total, value) => total + value.frequency,
+              0,
+            ),
+            partial,
+          };
         }),
       );
-      for (const result of results) {
+      for (const [index, result] of results.entries()) {
+        const candidate = batch[index]!;
+        const updatedAt = new Date().toISOString();
         if (result.status === "fulfilled") {
           status.indexedProperties += 1;
           status.indexedValues += result.value.valueCount;
           if (result.value.partial) status.partialProperties += 1;
+          this.repository.saveIndexedPropertyStatus({
+            ontologyVersion: ontology.version,
+            objectId: result.value.objectId,
+            propertyId: result.value.propertyId,
+            status: result.value.partial
+              ? "partial"
+              : result.value.valueCount
+                ? "ready"
+                : "empty",
+            distinctValues: result.value.valueCount,
+            coveredRows: result.value.coveredRows,
+            updatedAt,
+          });
         } else {
           status.failedProperties += 1;
-          status.error =
+          const error =
             result.reason instanceof Error
               ? result.reason.message
               : "部分属性值索引构建失败";
+          status.error = error;
+          this.repository.saveIndexedPropertyStatus({
+            ontologyVersion: ontology.version,
+            objectId: candidate.object.id,
+            propertyId: candidate.property.id,
+            status: "failed",
+            distinctValues: 0,
+            coveredRows: 0,
+            error,
+            updatedAt,
+          });
         }
       }
       status.updatedAt = new Date().toISOString();

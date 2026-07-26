@@ -8,6 +8,7 @@ import type {
   DataSourceInput,
   OntologyObject,
   OntologySnapshot,
+  PropertyValueIndexProperty,
   SafeDataSourceConfig,
 } from "../shared/types.js";
 import { DataAgent } from "./agent.js";
@@ -126,6 +127,46 @@ app.post("/api/value-index/rebuild", async (_request, reply) => {
 app.get("/api/value-index/status", async () => ({
   status: repository.getPropertyValueIndexStatus(),
 }));
+
+app.get("/api/value-index/properties", async () => {
+  const ontology = repository.getPublishedOntology();
+  const owners = new Map(
+    ontology.objects.flatMap((object) =>
+      object.properties.map((property) => [
+        property.id,
+        { object, property },
+      ] as const),
+    ),
+  );
+  const properties = repository
+    .getIndexedPropertyStatuses(ontology.version)
+    .flatMap((status): PropertyValueIndexProperty[] => {
+      const owner = owners.get(status.propertyId);
+      return owner
+        ? [{
+            ontologyVersion: status.ontologyVersion,
+            objectId: owner.object.id,
+            objectLabel: owner.object.label,
+            propertyId: owner.property.id,
+            propertyLabel: owner.property.label,
+            sourceColumn: owner.property.sourceColumn,
+            semanticMeaning: owner.property.meaning,
+            status: status.status,
+            distinctValues: status.distinctValues,
+            coveredRows: status.coveredRows,
+            updatedAt: status.updatedAt,
+            error: status.error,
+            topValues: status.topValues,
+          }]
+        : [];
+    })
+    .sort(
+      (left, right) =>
+        left.objectLabel.localeCompare(right.objectLabel, "zh-CN") ||
+        left.propertyLabel.localeCompare(right.propertyLabel, "zh-CN"),
+    );
+  return { properties };
+});
 
 app.post<{ Body: { title?: string } }>("/api/conversations", async (request) => {
   const now = new Date().toISOString();

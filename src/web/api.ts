@@ -10,6 +10,7 @@ import type {
   OntologySnapshot,
   OntologyValidationResult,
   PhysicalTable,
+  PropertyValueIndexProperty,
   PropertyValueIndexStatus,
   SafeDataSourceConfig,
   Turn,
@@ -54,6 +55,10 @@ export const api = {
     }),
   valueIndexStatus: () =>
     request<{ status: PropertyValueIndexStatus }>("/api/value-index/status"),
+  valueIndexProperties: () =>
+    request<{ properties: PropertyValueIndexProperty[] }>(
+      "/api/value-index/properties",
+    ),
   testDataSource: (input: DataSourceInput) =>
     request<{ ok: boolean; version: string }>("/api/data-source/test", {
       method: "POST",

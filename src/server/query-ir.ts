@@ -38,11 +38,10 @@ export class QueryIrCompiler {
     const propertyOwners = ontology.objects.flatMap((object) =>
       object.properties.map((property) => ({ object, property })),
     );
-    const measures = intent.measureIds.map((id) => {
-      const metric = metricById.get(id);
-      if (!metric) throw new Error(`查询计划引用了不存在的指标：${id}`);
-      return metric;
-    });
+    const measureBindings = intent.measureIds.map((id) =>
+      resolveMeasureReference(id, ontology, propertyOwners),
+    );
+    const measures = measureBindings.map((binding) => binding.metric);
     const dimensions = intent.dimensionPropertyIds.map((id) =>
       requireProperty(propertyOwners, id, "分析维度"),
     );
@@ -243,10 +242,10 @@ export class QueryIrCompiler {
         source: "本体对象",
         entityId: root.id,
       },
-      ...measures.map((metric) => ({
+      ...measureBindings.map(({ metric, source }) => ({
         label: "指标",
         value: metric.label,
-        source: "指标ID精确绑定",
+        source,
         entityId: metric.id,
       })),
       ...dimensions.map(({ property }) => ({
@@ -281,6 +280,44 @@ export class QueryIrCompiler {
       planSummary: `${root.label} · ${grain} · ${measures.length} 个指标 · ${filters.length + (resolvedTime ? 1 : 0)} 个条件`,
     };
   }
+}
+
+function resolveMeasureReference(
+  id: string,
+  ontology: OntologySnapshot,
+  owners: Array<{ object: OntologyObject; property: OntologyProperty }>,
+): { metric: Metric; source: string } {
+  const metric = ontology.metrics.find((candidate) => candidate.id === id);
+  if (metric) {
+    return { metric, source: "指标ID精确绑定" };
+  }
+  const propertyBinding = owners.find(
+    (candidate) => candidate.property.id === id,
+  );
+  if (!propertyBinding) {
+    throw new Error(`查询计划引用了不存在的指标：${id}`);
+  }
+  const governedMetrics = ontology.metrics.filter(
+    (candidate) => candidate.sourcePropertyId === id,
+  );
+  if (governedMetrics.length === 1) {
+    return {
+      metric: governedMetrics[0]!,
+      source: `Montane误传属性ID，规则引擎按唯一治理映射从“${propertyBinding.property.label}”纠正为指标`,
+    };
+  }
+  const availableMetrics = ontology.metrics
+    .slice(0, 8)
+    .map((candidate) => `${candidate.label}（${candidate.id}）`)
+    .join("、");
+  if (governedMetrics.length > 1) {
+    throw new Error(
+      `“${propertyBinding.property.label}”是属性且对应多个指标，不能自动选择。measure_ids 必须使用指标 ID：${governedMetrics.map((candidate) => `${candidate.label}（${candidate.id}）`).join("、")}`,
+    );
+  }
+  throw new Error(
+    `“${propertyBinding.property.label}”（${id}）是属性，不是指标。measure_ids 只能使用指标 ID${availableMetrics ? `；当前可用指标：${availableMetrics}` : ""}`,
+  );
 }
 
 function requireProperty(

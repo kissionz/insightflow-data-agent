@@ -331,6 +331,114 @@ describe("DataAgentHarness", () => {
     await harness.close();
     repository.close();
   });
+
+  it("uses global exact value evidence even when lexical property hints are wrong", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-harness-"));
+    roots.push(root);
+    const repository = new Repository(
+      path.join(root, ".montane/data-agent/ontology.sqlite"),
+    );
+    const ontology = structuredClone(testOntology);
+    ontology.version = 2;
+    ontology.objects[0]!.properties.push({
+      id: "p_channel_nature",
+      name: "channel_nature",
+      label: "渠道性质",
+      description: "渠道分类性质",
+      dataType: "VARCHAR",
+      sourceColumn: "channel_nature",
+      sensitive: false,
+      meaning: "CATEGORY",
+      unique: false,
+      valueSearchable: true,
+      visibility: "ANALYTICAL",
+      synonyms: ["渠道"],
+      defaultDisplay: true,
+      exportable: true,
+    });
+    ontology.objects[2]!.properties.push({
+      id: "p_org_unit",
+      name: "org_unit",
+      label: "组织单元",
+      description: "销售归属组织单元",
+      dataType: "VARCHAR",
+      sourceColumn: "org_unit",
+      sensitive: false,
+      meaning: "CATEGORY",
+      unique: false,
+      valueSearchable: true,
+      visibility: "ANALYTICAL",
+      synonyms: ["组织"],
+      defaultDisplay: true,
+      exportable: true,
+    });
+    repository.saveOntology(ontology);
+    repository.upsertScannedTables([
+      {
+        id: "t_orders",
+        catalog: "internal",
+        database: "retail",
+        name: "fact_orders",
+        type: "TABLE",
+        status: "MODELED",
+        columns: [],
+        fingerprint: "fact_orders:v4",
+        scannedAt: "2026-07-26T00:00:00.000Z",
+      },
+      {
+        id: "t_stores",
+        catalog: "internal",
+        database: "retail",
+        name: "dim_stores",
+        type: "TABLE",
+        status: "MODELED",
+        columns: [],
+        fingerprint: "dim_stores:v2",
+        scannedAt: "2026-07-26T00:00:00.000Z",
+      },
+    ]);
+    repository.saveDataSource({
+      configured: true,
+      host: "selectdb.test",
+      port: 9030,
+      username: "reader",
+      database: "retail",
+      catalog: "internal",
+      tls: false,
+      passwordStored: true,
+    });
+    repository.replaceIndexedPropertyValues(
+      ontology.version,
+      "o_store",
+      "p_org_unit",
+      [{ displayValue: "线上渠道", frequency: 128 }],
+    );
+    const harness = new DataAgentHarness(
+      root,
+      repository,
+      async () => {
+        throw new Error("published exact index should avoid a live query");
+      },
+      () => runtimeFor(new ScriptedMontaneModel()),
+    );
+    const tool = (
+      harness as unknown as { propertyValueSearchTool(): Tool }
+    ).propertyValueSearchTool();
+
+    const outcome = await tool.execute({
+      value: "线上渠道",
+      property_ids: ["p_channel_nature"],
+      object_ids: ["o_order"],
+      match_mode: "exact",
+    });
+
+    expect(outcome.ok).toBe(true);
+    expect(outcome.content).toContain('"property":"组织单元"');
+    expect(outcome.content).not.toContain('"property":"渠道性质"');
+    expect(outcome.content).toContain("纠正了词形候选范围");
+    await harness.close();
+    repository.close();
+  });
 });
 
 class ScriptedMontaneModel implements ModelClient {

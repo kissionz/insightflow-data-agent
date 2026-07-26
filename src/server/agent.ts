@@ -91,10 +91,14 @@ export class DataAgent {
       const index = turn.trace.findIndex((step) => step.kind === kind);
       if (index < 0) return;
       const current = turn.trace[index]!;
+      const facts = patch.facts
+        ? mergeTraceFacts(current.facts, patch.facts)
+        : current.facts;
       turn.trace[index] = {
         ...current,
         status,
         ...patch,
+        facts,
         completedAt:
           status === "completed" || status === "skipped" || status === "failed"
             ? new Date().toISOString()
@@ -162,6 +166,23 @@ export class DataAgent {
   }
 }
 
+export function mergeTraceFacts(
+  current: TraceStep["facts"] = [],
+  incoming: TraceStep["facts"] = [],
+): NonNullable<TraceStep["facts"]> {
+  const merged = new Map<string, NonNullable<TraceStep["facts"]>[number]>();
+  for (const fact of [...current, ...incoming]) {
+    const key = JSON.stringify([
+      fact.label,
+      fact.value,
+      fact.source,
+      fact.entityId,
+    ]);
+    merged.set(key, fact);
+  }
+  return [...merged.values()].slice(0, 40);
+}
+
 class HarnessTurnReporter implements AgentReporter {
   constructor(
     private readonly update: (
@@ -209,7 +230,7 @@ class HarnessTurnReporter implements AgentReporter {
     if (status === "succeeded") {
       const data = result?.data as
         | {
-            matches?: Array<{ label?: string }>;
+          matches?: Array<{ label?: string }>;
             relations?: Array<{
               name?: string;
               cardinality?: string;
@@ -217,9 +238,16 @@ class HarnessTurnReporter implements AgentReporter {
             }>;
           }
         | undefined;
+      const matches = (data?.matches ?? []) as Array<{
+        kind?: string;
+        id?: string;
+        label?: string;
+        score?: number;
+        matchedBy?: string;
+      }>;
       const labels =
-        data?.matches
-          ?.map((match) => match.label)
+        matches
+          .map((match) => match.label)
           .filter((label): label is string => Boolean(label))
           .slice(0, 5) ?? [];
       const relations = data?.relations ?? [];
@@ -230,14 +258,20 @@ class HarnessTurnReporter implements AgentReporter {
           summary: labels.length
             ? `候选语义：${labels.join("、")}`
             : "未命中可用本体语义",
-          facts: labels.map((label) => ({
-            label: "候选",
-            value: label,
-            source: "名称、同义词或中文分词",
+          facts: matches.slice(0, 8).map((match) => ({
+            label:
+              match.kind === "metric"
+                ? "候选指标"
+                : match.kind === "property"
+                  ? "候选属性"
+                  : "候选对象",
+            value: match.label || "—",
+            source: `词形“${match.matchedBy || "—"}” · 匹配分 ${Math.round((match.score ?? 0) * 100)}%`,
+            entityId: match.id,
           })),
           detail: relations.length
-            ? `发现 ${relations.length} 条候选对象关系`
-            : "当前候选可在单一对象内完成",
+            ? `发现 ${relations.length} 条候选对象关系。词形候选不代表属性值归属，具体值仍由全局值索引验证。`
+            : "词形候选不代表属性值归属，具体值仍由全局值索引验证。",
         },
       );
       return;
@@ -266,9 +300,15 @@ class HarnessTurnReporter implements AgentReporter {
         | {
             status?: string;
             matches?: Array<{
+              object?: string;
+              propertyId?: string;
               property?: string;
               matchedValue?: string;
               source?: string;
+              frequency?: number;
+              matchType?: string;
+              hinted?: boolean;
+              rankingReason?: string;
             }>;
           }
         | undefined;
@@ -281,14 +321,18 @@ class HarnessTurnReporter implements AgentReporter {
               .join("、")}`
           : "属性值索引未找到可靠绑定",
         facts: matches.map((match) => ({
-          label: match.property || "属性值",
+          label: [match.object, match.property].filter(Boolean).join(" · ") || "属性值",
           value: match.matchedValue || "—",
-          source:
+          source: [
             match.source === "published-index"
-              ? "发布值索引"
+              ? `全局发布值索引${match.matchType === "prefix" ? "前缀" : "精确"}命中`
               : match.source === "local-cache"
-                ? "查询缓存"
+                ? "查询缓存命中"
                 : "SelectDB 定向验证",
+            match.frequency ? `频次 ${match.frequency}` : "",
+            match.rankingReason || "",
+          ].filter(Boolean).join(" · "),
+          entityId: match.propertyId,
         })),
       });
       return;
@@ -454,6 +498,13 @@ class HarnessTurnReporter implements AgentReporter {
             planSummary?: string;
             sql?: string;
             parameters?: unknown[];
+            intent?: Record<string, unknown>;
+            retryInstruction?: string;
+            availableMetrics?: Array<{
+              id?: string;
+              label?: string;
+              sourcePropertyId?: string;
+            }>;
           }
         | undefined;
       if (data?.stage === "execution" && data.sql) {
@@ -492,7 +543,24 @@ class HarnessTurnReporter implements AgentReporter {
       this.update(
         "query_plan",
         "failed",
-        { summary: result?.content || "分析计划执行失败" },
+        {
+          summary: result?.content?.split("\n")[0] || "分析计划执行失败",
+          detail: data?.retryInstruction,
+          facts: [
+            ...(data?.availableMetrics ?? []).slice(0, 8).map((metric) => ({
+              label: "可用指标",
+              value: metric.label || "—",
+              source: metric.id,
+              entityId: metric.id,
+            })),
+          ],
+          code: data?.intent
+            ? {
+                language: "json",
+                content: JSON.stringify(data.intent, null, 2),
+              }
+            : undefined,
+        },
       );
     }
   }

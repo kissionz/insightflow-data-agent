@@ -2,6 +2,7 @@ import {
   AgentLoop,
   ContextBuilder,
   PermissionGate,
+  SessionCompactor,
   SessionManager,
   SessionStore,
   ToolRegistry,
@@ -31,9 +32,9 @@ const DATA_AGENT_SYSTEM_PROMPT = `
 必须遵循以下执行协议：
 1. 先判断用户是在打招呼、询问能力，还是提出数据分析请求。
 2. 打招呼或询问能力时直接简短回答，不调用数据工具，不生成图表或业务结论。
-3. 数据分析请求必须先调用 OntologySearch，将问题中的业务词绑定到已发布对象、属性和指标。
-4. 当问题包含具体属性值时，调用 PropertyValueSearch，将业务值定位到属性和数据库实际值；多个候选时必须让用户澄清。
-5. 你不能生成 SQL。完成语义理解后，必须调用 ExecuteAnalysisPlan，提交本体返回的对象、指标和属性 ID，以及结构化筛选与时间表达式。
+3. 数据分析请求必须先调用 OntologySearch，将问题中的业务词绑定到已发布对象、属性和指标。OntologySearch 的词形匹配只是候选证据，不能证明用户词一定是属性名称。
+4. 当问题包含可能的具体属性值时，必须调用 PropertyValueSearch。首次检索应保留用户的完整业务短语，例如“线上渠道”应原样传入，不能先假设“渠道”是属性名而只传“线上”。属性或对象候选只能作为排序提示，具体值的真实字段归属以全局已发布值索引的精确命中为准；多个属性包含同一值时必须让用户澄清。
+5. 你不能生成 SQL。完成语义理解后，必须调用 ExecuteAnalysisPlan，提交本体返回的对象、指标和属性 ID，以及结构化筛选与时间表达式。measure_ids 只能使用 metrics 中的指标 ID，属性 ID 只能用于维度、筛选或时间字段。
 6. ExecuteAnalysisPlan 是唯一查询入口，它会通过规则引擎生成 IR、校验关系与粒度、编译参数化 Doris SQL 并执行查询。
 7. 不得猜测或创造对象 ID、指标 ID、属性 ID、数据库值或关系。
 8. 最终使用中文给出简洁、可验证的结论，只能引用 ExecuteAnalysisPlan 返回的数据。
@@ -121,9 +122,10 @@ export class DataAgentHarness {
     );
     const context = new ContextBuilder(
       this.workspaceRoot,
-      60,
+      36,
       buildSystemPrompt(agentConfig.businessInstructions, agentConfig.timezone),
     );
+    const compactor = new SessionCompactor(session, 30, 18_000);
     const loop = new AgentLoop(
       runtime.client,
       tools,
@@ -133,7 +135,7 @@ export class DataAgentHarness {
       8,
       async () => "reject" as const,
       reporter,
-      undefined,
+      compactor,
       undefined,
       async (status) => {
         await managed.updateStatus(status);
@@ -141,14 +143,14 @@ export class DataAgentHarness {
       {
         maxTurns: 8,
         maxWallTimeMs: 190_000,
-        maxInputTokens: 120_000,
+        maxInputTokens: 240_000,
         maxOutputTokens: 12_000,
         maxToolCalls: 8,
         maxModelRetries: 2,
       },
     );
 
-    const answer = await loop.run(turn.question);
+    const answer = localizeHarnessStop(await loop.run(turn.question));
     const completed = captured as CapturedAnalysis | null;
     const asksForData = isLikelyDataQuestion(turn.question);
     const responseKind: HarnessRunResult["responseKind"] = completed
@@ -268,7 +270,9 @@ export class DataAgentHarness {
           )
           .filter((id): id is string => Boolean(id));
         const relevantIds = new Set([...objectIds, ...metricObjectIds]);
-        const objects = ontology.objects.filter((object) => relevantIds.has(object.id));
+        const objects = ontology.objects
+          .filter((object) => relevantIds.has(object.id))
+          .slice(0, 6);
         const metrics = ontology.metrics.filter((metric) =>
           matches.some((match) => match.id === metric.id),
         );
@@ -277,44 +281,64 @@ export class DataAgentHarness {
             relation.enabled &&
             (relevantIds.has(relation.sourceObjectId) ||
               relevantIds.has(relation.targetObjectId)),
+        ).slice(0, 12);
+        const relevantPropertyIds = new Set(
+          matches
+            .filter((match) => match.kind === "property")
+            .map((match) => match.id),
         );
-        const tables = this.repository.getTables();
+        for (const object of objects) {
+          for (const propertyId of [
+            ...object.grainPropertyIds,
+            object.defaultTimePropertyId,
+          ]) {
+            if (propertyId) relevantPropertyIds.add(propertyId);
+          }
+        }
+        for (const metric of metrics) {
+          if (metric.sourcePropertyId) {
+            relevantPropertyIds.add(metric.sourcePropertyId);
+          }
+          if (metric.timePropertyId) {
+            relevantPropertyIds.add(metric.timePropertyId);
+          }
+        }
         const payload = {
           ontologyVersion: ontology.version,
-          matches,
+          matches: matches.map((match) => ({
+            kind: match.kind,
+            id: match.id,
+            objectId: match.objectId,
+            label: match.label,
+            score: match.score,
+            matchedBy: match.matchedBy,
+          })),
           objects: objects.map((object) => ({
             id: object.id,
             label: object.label,
-            description: object.description,
             objectType: object.objectType,
-            table: tables.find((table) => table.id === object.sourceTableId)?.name,
             grain: effectiveGrainLabels(object),
             defaultTimePropertyId: object.defaultTimePropertyId,
             properties: object.properties
-              .filter((property) => property.visibility === "ANALYTICAL")
+              .filter(
+                (property) =>
+                  property.visibility === "ANALYTICAL" &&
+                  relevantPropertyIds.has(property.id),
+              )
+              .slice(0, 12)
               .map((property) => ({
                 id: property.id,
                 label: property.label,
-                description: property.description,
-                column: property.sourceColumn,
-                dataType: property.dataType,
-                sensitive: property.sensitive,
                 meaning: property.meaning,
-                unique: property.unique,
                 valueSearchable: property.valueSearchable,
-                numericSpec: property.numericSpec,
-                synonyms: property.synonyms,
               })),
           })),
           metrics: metrics.map((metric) => ({
             id: metric.id,
             objectId: metric.objectId,
             label: metric.label,
-            description: metric.description,
-            expression: metric.expression,
             aggregation: metric.aggregation,
             sourcePropertyId: metric.sourcePropertyId,
-            filterExpression: metric.filterExpression,
             timePropertyId: metric.timePropertyId,
           })),
           relations: relations.map((relation) => ({
@@ -326,11 +350,20 @@ export class DataAgentHarness {
             cardinality: relation.cardinality,
             fanoutRisk: relation.fanoutRisk,
           })),
+          instructions: [
+            "matches 是词形候选，不代表具体业务值的字段归属",
+            "具体值必须调用 PropertyValueSearch 做全局值索引验证",
+            "measure_ids 只能使用 metrics[].id",
+          ],
         };
         return {
           ok: true,
           content: JSON.stringify(payload),
-          data: payload,
+          data: {
+            ontologyVersion: ontology.version,
+            matches,
+            relations,
+          },
         };
       },
     };
@@ -340,7 +373,7 @@ export class DataAgentHarness {
     return {
       name: "PropertyValueSearch",
       description:
-        "在用户允许的非敏感属性中定位具体业务值属于哪个对象和字段。优先使用 OntologySearch 返回的 property_ids 或 object_ids 缩小范围。",
+        "通过全局已发布属性值索引定位具体业务值属于哪个对象和字段。OntologySearch 返回的属性或对象仅作为排序提示，不会排除其他字段的精确值命中。",
       effect: "readonly",
       timeoutMs: 35_000,
       inputSchema: {
@@ -349,17 +382,18 @@ export class DataAgentHarness {
         properties: {
           value: {
             type: "string",
-            description: "需要定位字段归属的原始业务值，例如华东、VIP、上海门店",
+            description:
+              "需要定位字段归属的完整原始业务短语。例如用户说“线上渠道”时先原样传“线上渠道”，不要先拆成“线上”和属性“渠道”",
           },
           property_ids: {
             type: "array",
             items: { type: "string" },
-            description: "OntologySearch 返回的候选属性 ID",
+            description: "可选的候选属性 ID，仅用于排序，不能证明值属于这些属性",
           },
           object_ids: {
             type: "array",
             items: { type: "string" },
-            description: "OntologySearch 返回的候选对象 ID",
+            description: "可选的候选对象 ID，仅用于排序，不会限制全局精确值检索",
           },
           match_mode: {
             type: "string",
@@ -372,12 +406,6 @@ export class DataAgentHarness {
         const value = String(args.value ?? "").trim();
         if (!value) {
           return { ok: false, content: "属性值不能为空" };
-        }
-        if (!this.repository.getDataSource().configured) {
-          return {
-            ok: false,
-            content: "SelectDB 尚未配置，无法定位真实属性值。",
-          };
         }
         const ontology = this.repository.getPublishedOntology();
         const propertyIds = new Set(
@@ -392,20 +420,20 @@ export class DataAgentHarness {
           this.repository.getTables().map((table) => [table.id, table]),
         );
         const candidates = ontology.objects
-          .filter((object) => !objectIds.size || objectIds.has(object.id))
           .flatMap((object) =>
             object.properties
               .filter(
                 (property) =>
                   property.visibility === "ANALYTICAL" &&
                   property.valueSearchable &&
-                  !property.sensitive &&
-                  (!propertyIds.size || propertyIds.has(property.id)),
+                  !property.sensitive,
               )
               .map((property) => ({
                 object,
                 property,
                 table: tables.get(object.sourceTableId),
+                hinted:
+                  propertyIds.has(property.id) || objectIds.has(object.id),
               })),
           )
           .filter(
@@ -418,12 +446,22 @@ export class DataAgentHarness {
           ;
 
         const normalizedValue = normalizePropertyValue(value);
-        const indexed = this.repository.findIndexedPropertyValues(
+        let indexedMatchType: "exact" | "prefix" = "exact";
+        let indexed = this.repository.findIndexedPropertyValues(
           ontology.version,
           normalizedValue,
           candidates.map((candidate) => candidate.property.id),
-          args.match_mode === "prefix" ? "prefix" : "exact",
+          "exact",
         );
+        if (!indexed.length) {
+          indexedMatchType = "prefix";
+          indexed = this.repository.findIndexedPropertyValues(
+            ontology.version,
+            normalizedValue,
+            candidates.map((candidate) => candidate.property.id),
+            "prefix",
+          );
+        }
         if (indexed.length) {
           const matches = indexed.flatMap((entry) => {
             const candidate = candidates.find(
@@ -438,9 +476,15 @@ export class DataAgentHarness {
                   column: candidate.property.sourceColumn,
                   matchedValue: entry.displayValue,
                   source: "published-index",
+                  frequency: entry.frequency,
+                  matchType: indexedMatchType,
+                  hinted: candidate.hinted,
+                  rankingReason: candidate.hinted
+                    ? `全局值${indexedMatchType === "exact" ? "精确" : "前缀"}命中，且词形候选一致`
+                    : `全局值${indexedMatchType === "exact" ? "精确" : "前缀"}命中，纠正了词形候选范围`,
                 }]
               : [];
-          });
+          }).sort(compareValueMatches);
           return valueSearchOutcome(value, matches);
         }
         const cached = this.repository.findCachedPropertyValues(
@@ -462,10 +506,19 @@ export class DataAgentHarness {
                   column: candidate.property.sourceColumn,
                   matchedValue: entry.displayValue,
                   source: "local-cache",
+                  matchType: "exact" as const,
+                  hinted: candidate.hinted,
+                  rankingReason: candidate.hinted
+                    ? "查询缓存命中，且词形候选一致"
+                    : "查询缓存命中，纠正了词形候选范围",
                 }]
               : [];
-          });
+          }).sort(compareValueMatches);
           return valueSearchOutcome(value, matches);
+        }
+
+        if (!this.repository.getDataSource().configured) {
+          return valueSearchOutcome(value, []);
         }
 
         const matches: Array<{
@@ -476,10 +529,15 @@ export class DataAgentHarness {
           column: string;
           matchedValue: string;
           source: "selectdb";
+          matchType: "exact" | "prefix";
+          hinted: boolean;
+          rankingReason: string;
         }> = [];
-        const fallbackCandidates = candidates.slice(0, 4);
+        const fallbackCandidates = [...candidates]
+          .sort((left, right) => Number(right.hinted) - Number(left.hinted))
+          .slice(0, 4);
         const results = await Promise.allSettled(
-          fallbackCandidates.map(async ({ object, property, table }) => {
+          fallbackCandidates.map(async ({ object, property, table, hinted }) => {
               const column = quoteIdentifier(property.sourceColumn);
               const tableName = `${quoteIdentifier(table.database)}.${quoteIdentifier(table.name)}`;
               const prefix = args.match_mode === "prefix";
@@ -498,6 +556,11 @@ export class DataAgentHarness {
                 column: property.sourceColumn,
                 matchedValue: String(row.matched_value ?? value),
                 source: "selectdb" as const,
+                matchType: prefix ? "prefix" as const : "exact" as const,
+                hinted,
+                rankingReason: hinted
+                  ? "词形候选优先进行 SelectDB 定向验证"
+                  : "SelectDB 全局兜底验证",
               }));
             }),
         );
@@ -512,7 +575,7 @@ export class DataAgentHarness {
               match,
             ]),
           ).values(),
-        ].slice(0, 8);
+        ].sort(compareValueMatches).slice(0, 8);
         const now = new Date().toISOString();
         for (const match of deduplicated) {
           this.repository.cachePropertyValue({
@@ -550,7 +613,8 @@ export class DataAgentHarness {
           measure_ids: {
             type: "array",
             items: { type: "string" },
-            description: "OntologySearch 返回的指标 ID",
+            description:
+              "只能填写 OntologySearch 的 metrics[].id。严禁填写 properties[].id；属性只能用于 dimension_property_ids、filters 或 time_range.property_id",
           },
           dimension_property_ids: {
             type: "array",
@@ -658,15 +722,25 @@ export class DataAgentHarness {
             timezone,
           );
         } catch (error) {
+          const availableMetrics = this.repository
+            .getPublishedOntology()
+            .metrics.slice(0, 12)
+            .map((metric) => ({
+              id: metric.id,
+              label: metric.label,
+              sourcePropertyId: metric.sourcePropertyId,
+            }));
+          const detail =
+            error instanceof Error ? error.message : "IR规则校验失败";
           return {
             ok: false,
-            content:
-              error instanceof Error
-                ? `IR规则校验失败：${error.message}`
-                : "IR规则校验失败",
+            content: `IR规则校验失败：${detail}\n请根据错误修正 ID 类型后再次调用 ExecuteAnalysisPlan。measure_ids 只能使用 metrics[].id。可用指标：${JSON.stringify(availableMetrics)}`,
             data: {
               stage: "planning",
               intent: intent as unknown as Record<string, unknown>,
+              retryInstruction:
+                "根据错误重新检查 ID 类型并再次调用 ExecuteAnalysisPlan。measure_ids 只能使用 metrics[].id，属性 ID 不能充当指标。",
+              availableMetrics,
             },
           };
         }
@@ -754,6 +828,19 @@ function describeMontaneRuntimeError(error: unknown): string {
   return `Montane CLI 模型运行时不可用：${detail}`;
 }
 
+function localizeHarnessStop(answer: string): string {
+  if (/Stopped: token budget reached\./i.test(answer)) {
+    return "本轮分析上下文超过 Montane 运行预算，已停止执行且未生成业务结论。请重新提问，系统会保留已确认的本体条件。";
+  }
+  if (/Stopped: turn budget reached\./i.test(answer)) {
+    return "本轮分析步骤超过 Montane 运行上限，已停止执行且未生成业务结论。请补充或简化条件后重试。";
+  }
+  if (/Stopped: tool-call budget reached\./i.test(answer)) {
+    return "本轮工具调用超过 Montane 运行上限，已停止执行且未生成业务结论。请补充明确的指标或筛选字段后重试。";
+  }
+  return answer;
+}
+
 function normalizeAnalysisIntent(args: Record<string, unknown>): AnalysisIntent {
   const filters = Array.isArray(args.filters)
     ? args.filters.map((raw) => {
@@ -833,6 +920,10 @@ function valueSearchOutcome(
     column: string;
     matchedValue: string;
     source: string;
+    frequency?: number;
+    matchType?: "exact" | "prefix";
+    hinted?: boolean;
+    rankingReason?: string;
   }>,
 ): ToolOutcome {
   const ambiguous = new Set(matches.map((match) => match.propertyId)).size > 1;
@@ -844,19 +935,42 @@ function valueSearchOutcome(
         : !ambiguous
           ? "resolved"
           : "ambiguous",
+    searchScope: "all_published_searchable_properties",
     matches,
     instruction:
       ambiguous
         ? "多个属性包含该值，必须向用户澄清，不得自行选择。"
         : matches.length === 0
           ? "没有找到可靠属性绑定，请向用户补充字段或业务对象。"
-          : "已定位属性，可使用返回的对象、列和属性值生成查询。",
+          : "已通过全局值证据定位属性，可使用返回的对象、属性 ID 和实际值生成查询。",
   };
   return {
     ok: true,
     content: JSON.stringify(payload),
     data: payload,
   };
+}
+
+function compareValueMatches(
+  left: {
+    hinted?: boolean;
+    frequency?: number;
+    propertyId: string;
+    matchedValue: string;
+  },
+  right: {
+    hinted?: boolean;
+    frequency?: number;
+    propertyId: string;
+    matchedValue: string;
+  },
+): number {
+  return (
+    Number(right.hinted) - Number(left.hinted) ||
+    (right.frequency ?? 0) - (left.frequency ?? 0) ||
+    left.propertyId.localeCompare(right.propertyId) ||
+    left.matchedValue.localeCompare(right.matchedValue, "zh-CN")
+  );
 }
 
 function isLikelyDataQuestion(question: string): boolean {

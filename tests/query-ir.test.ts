@@ -100,6 +100,50 @@ describe("QueryIrCompiler", () => {
       ),
     ).toThrow("不存在的指标");
   });
+
+  it("repairs a property measure reference only through a unique governed metric", () => {
+    const compiler = new QueryIrCompiler();
+    const compiled = compiler.compile(
+      {
+        rootObjectId: "o_order",
+        measureIds: ["p_order_amount"],
+        dimensionPropertyIds: [],
+        filters: [],
+        resultKind: "aggregate",
+        title: "成交金额",
+      },
+      testOntology,
+      [ordersTable()],
+    );
+
+    expect(compiled.ir.measureIds).toEqual(["m_gmv"]);
+    expect(compiled.bindings).toContainEqual(
+      expect.objectContaining({
+        label: "指标",
+        value: "成交金额",
+        entityId: "m_gmv",
+        source: expect.stringContaining("Montane误传属性ID"),
+      }),
+    );
+  });
+
+  it("explains when a non-measure property is used as a metric", () => {
+    const compiler = new QueryIrCompiler();
+    expect(() =>
+      compiler.compile(
+        {
+          rootObjectId: "o_customer",
+          measureIds: ["p_customer_level"],
+          dimensionPropertyIds: [],
+          filters: [],
+          resultKind: "aggregate",
+          title: "错误指标",
+        },
+        testOntology,
+        [ordersTable()],
+      ),
+    ).toThrow("是属性，不是指标");
+  });
 });
 
 function ordersTable(): PhysicalTable {

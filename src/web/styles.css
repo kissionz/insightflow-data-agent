@@ -1291,6 +1291,13 @@ tbody tr:hover {
   padding: 28px 32px 48px;
 }
 
+.ontology-management-content {
+  width: 100%;
+  max-width: none;
+  margin: 0;
+  padding: 20px 20px 44px;
+}
+
 .stats-row {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
@@ -1349,7 +1356,7 @@ tbody tr:hover {
 }
 
 .ontology-grid.editing {
-  grid-template-columns: 220px minmax(620px, 1fr) 250px;
+  grid-template-columns: 205px minmax(0, 1fr) 230px;
 }
 
 .panel-heading {
@@ -1903,26 +1910,46 @@ tbody tr:hover {
 }
 
 .property-edit-table {
-  overflow: hidden;
+  overflow-x: auto;
+  overflow-y: hidden;
   border: 1px solid var(--border);
   border-radius: 8px;
+  outline: 0;
+  overscroll-behavior-inline: contain;
+  scrollbar-color: #b9c5d5 #f4f7fa;
+  scrollbar-gutter: stable;
+}
+
+.property-edit-table:focus-visible {
+  border-color: var(--blue);
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--blue), transparent 90%);
+}
+
+.property-edit-grid {
+  min-width: 1870px;
 }
 
 .property-edit-row {
   display: grid;
-  grid-template-columns: 1.05fr 0.9fr 0.85fr 0.95fr 0.95fr;
+  grid-template-columns:
+    150px 130px 122px 205px 125px 410px 210px 165px 92px 92px
+    72px;
   gap: 8px;
   align-items: center;
   border-top: 1px solid var(--border);
-  padding: 9px;
+  padding: 8px 9px;
+}
+
+.property-edit-row > * {
+  min-width: 0;
 }
 
 .property-constraint-cell {
   display: flex;
   min-width: 0;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 4px;
+  align-items: center;
+  gap: 7px;
+  white-space: nowrap;
 }
 
 .property-constraint-cell select {
@@ -1963,6 +1990,7 @@ tbody tr:hover {
   color: var(--muted);
   font-size: 8px;
   font-weight: 700;
+  white-space: nowrap;
 }
 
 .property-edit-row input,
@@ -1977,40 +2005,29 @@ tbody tr:hover {
   font-size: 9px;
 }
 
-.property-edit-row textarea {
-  resize: vertical;
-}
-
-.property-row-details {
-  display: grid;
-  grid-column: 1 / -1;
-  grid-template-columns: minmax(180px, 1.4fr) minmax(150px, 1fr);
-  gap: 8px;
-  align-items: start;
-  border-top: 1px dashed var(--border);
-  padding-top: 9px;
-}
-
 .numeric-rule-grid {
   display: grid;
-  grid-column: 1 / -1;
-  grid-template-columns: repeat(4, minmax(110px, 1fr));
-  gap: 8px;
+  grid-template-columns: 92px 92px 106px 105px;
+  gap: 5px;
 }
 
-.property-behavior-checks {
+.property-toggle-cell {
   display: flex;
-  grid-column: 1 / -1;
-  flex-wrap: wrap;
   align-items: center;
-  gap: 14px;
+  justify-content: center;
+}
+
+.property-not-applicable {
+  color: var(--muted-2);
+  font-size: 8px;
 }
 
 .physical-field {
   display: flex;
   min-width: 0;
-  flex-direction: column;
-  gap: 2px;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
 }
 
 .physical-field code {
@@ -2021,7 +2038,11 @@ tbody tr:hover {
 }
 
 .physical-field small {
+  flex: 0 0 auto;
+  border-radius: 4px;
+  background: #f2f4f7;
   color: var(--muted);
+  padding: 2px 4px;
   font-size: 8px;
 }
 
@@ -2032,6 +2053,7 @@ tbody tr:hover {
   gap: 6px !important;
   color: #475467;
   font-size: 9px;
+  white-space: nowrap;
 }
 
 .inline-check input {
@@ -2516,8 +2538,13 @@ tbody tr:hover {
     grid-column: 2 / -1;
   }
 
-  .ontology-grid {
-    grid-template-columns: 240px minmax(420px, 1fr);
+  .ontology-management-content {
+    padding-inline: 14px;
+  }
+
+  .ontology-grid,
+  .ontology-grid.editing {
+    grid-template-columns: 210px minmax(0, 1fr);
   }
 
   .draft-panel {

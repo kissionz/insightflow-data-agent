@@ -907,7 +907,7 @@ function OntologyPage({
     }
   }
   return (
-    <div className="management-content">
+    <div className="management-content ontology-management-content">
       <div className="stats-row">
         <StatCard label="业务对象" value={working.objects.length} icon={CirclesFour} />
         <StatCard label="对象关系" value={working.relations.length} icon={GitBranch} />
@@ -1714,11 +1714,26 @@ function OntologyObjectEditor({
             <Info size={16} />
             字段含义只保留会影响检索、SQL 或校验的业务语义。ID 表示当前对象，关联实体表示它指向的其他对象。
           </div>
-          <div className="property-edit-table">
-            <div className="property-edit-row header">
-              <span>业务名称</span><span>物理字段</span><span>字段含义</span><span>查询约束</span><span>可用范围</span>
-            </div>
-            {draftObject.properties.map((property) => {
+          <div
+            className="property-edit-table"
+            tabIndex={0}
+            aria-label="属性配置表，可横向滚动查看更多配置"
+          >
+            <div className="property-edit-grid">
+              <div className="property-edit-row header">
+                <span>业务名称</span>
+                <span>物理字段</span>
+                <span>字段含义</span>
+                <span>查询约束</span>
+                <span>可用范围</span>
+                <span>数字规则（类型 / 可加性 / 默认聚合 / 单位）</span>
+                <span>口径说明</span>
+                <span>同义词</span>
+                <span>值定位</span>
+                <span>明细展示</span>
+                <span>导出</span>
+              </div>
+              {draftObject.properties.map((property) => {
               const sourceRelation = draftRelations.find(
                 (relation) =>
                   relation.sourceObjectId === draftObject.id &&
@@ -1831,165 +1846,172 @@ function OntologyObjectEditor({
                   >
                     <option value="ANALYTICAL">分析属性</option>
                     <option value="DETAIL_ONLY">仅明细展示</option>
-                      <option value="HIDDEN">完全隐藏</option>
+                    <option value="HIDDEN">完全隐藏</option>
                   </select>
-                  <div className="property-row-details">
-                    <textarea
-                      rows={2}
-                      value={property.description}
-                      placeholder="属性口径说明"
-                      onChange={(event) =>
-                        changeProperty(property.id, { description: event.target.value })
-                      }
-                    />
-                    <input
-                      value={property.synonyms.join("、")}
-                      placeholder="同义词"
-                      disabled={property.visibility !== "ANALYTICAL"}
-                      onChange={(event) =>
-                        changeProperty(property.id, {
-                          synonyms: splitTerms(event.target.value),
-                        })
-                      }
-                    />
-                    {property.meaning === "NUMBER" && property.numericSpec && (
-                      <div className="numeric-rule-grid">
-                        <select
-                          aria-label={`${property.label}数字类型`}
-                          value={property.numericSpec.kind}
-                          onChange={(event) =>
-                            changeProperty(property.id, {
-                              numericSpec: {
-                                ...property.numericSpec!,
-                                kind: event.target.value as NonNullable<
-                                  typeof property.numericSpec
-                                >["kind"],
-                                aggregationBehavior:
-                                  event.target.value === "RATIO"
-                                    ? "NON_ADDITIVE"
-                                    : property.numericSpec!.aggregationBehavior,
-                              },
-                            })
-                          }
-                        >
-                          <option value="GENERAL">一般数字</option>
-                          <option value="CURRENCY">货币</option>
-                          <option value="RATIO">比率</option>
-                        </select>
-                        <select
-                          aria-label={`${property.label}聚合性质`}
-                          value={property.numericSpec.aggregationBehavior}
-                          onChange={(event) =>
-                            changeProperty(property.id, {
-                              numericSpec: {
-                                ...property.numericSpec!,
-                                aggregationBehavior: event.target
-                                  .value as NonNullable<
-                                  typeof property.numericSpec
-                                >["aggregationBehavior"],
-                              },
-                            })
-                          }
-                        >
-                          <option value="ADDITIVE">可加</option>
-                          <option value="SEMI_ADDITIVE">半可加</option>
-                          <option value="NON_ADDITIVE">不可加</option>
-                        </select>
-                        <select
-                          aria-label={`${property.label}默认聚合`}
-                          value={property.numericSpec.defaultAggregation}
-                          onChange={(event) =>
-                            changeProperty(property.id, {
-                              numericSpec: {
-                                ...property.numericSpec!,
-                                defaultAggregation: event.target
-                                  .value as NonNullable<
-                                  typeof property.numericSpec
-                                >["defaultAggregation"],
-                              },
-                            })
-                          }
-                        >
-                          <option value="NONE">不默认聚合</option>
-                          <option value="SUM">求和</option>
-                          <option value="AVG">平均</option>
-                          <option value="MIN">最小值</option>
-                          <option value="MAX">最大值</option>
-                        </select>
-                        <input
-                          value={
-                            property.numericSpec.kind === "CURRENCY"
-                              ? property.numericSpec.currency ?? ""
-                              : property.numericSpec.unit ?? ""
-                          }
-                          placeholder={
-                            property.numericSpec.kind === "CURRENCY"
-                              ? "币种，例如 CNY"
-                              : "单位，例如 分、kg"
-                          }
-                          onChange={(event) =>
-                            changeProperty(property.id, {
-                              numericSpec: {
-                                ...property.numericSpec!,
-                                ...(property.numericSpec!.kind === "CURRENCY"
-                                  ? { currency: event.target.value }
-                                  : { unit: event.target.value }),
-                              },
-                            })
-                          }
-                        />
-                      </div>
-                    )}
-                    <div className="property-behavior-checks">
-                      {isValueSearchableMeaning(property.meaning) && (
-                        <label className="inline-check">
-                          <input
-                            type="checkbox"
-                            checked={property.valueSearchable}
-                            disabled={
-                              property.sensitive ||
-                              property.visibility !== "ANALYTICAL"
-                            }
-                            onChange={(event) =>
-                              changeProperty(property.id, {
-                                valueSearchable: event.target.checked,
-                              })
-                            }
-                          />
-                          允许定位属性值
-                        </label>
-                      )}
-                      <label className="inline-check">
-                        <input
-                          type="checkbox"
-                          checked={property.defaultDisplay}
-                          disabled={property.visibility !== "DETAIL_ONLY"}
-                          onChange={(event) =>
-                            changeProperty(property.id, {
-                              defaultDisplay: event.target.checked,
-                            })
-                          }
-                        />
-                        明细默认展示
-                      </label>
-                      <label className="inline-check">
-                        <input
-                          type="checkbox"
-                          checked={property.exportable}
-                          disabled={property.visibility === "HIDDEN"}
-                          onChange={(event) =>
-                            changeProperty(property.id, {
-                              exportable: event.target.checked,
-                            })
-                          }
-                        />
-                        允许导出
-                      </label>
+                  {property.meaning === "NUMBER" && property.numericSpec ? (
+                    <div className="numeric-rule-grid">
+                      <select
+                        aria-label={`${property.label}数字类型`}
+                        value={property.numericSpec.kind}
+                        onChange={(event) =>
+                          changeProperty(property.id, {
+                            numericSpec: {
+                              ...property.numericSpec!,
+                              kind: event.target.value as NonNullable<
+                                typeof property.numericSpec
+                              >["kind"],
+                              aggregationBehavior:
+                                event.target.value === "RATIO"
+                                  ? "NON_ADDITIVE"
+                                  : property.numericSpec!.aggregationBehavior,
+                            },
+                          })
+                        }
+                      >
+                        <option value="GENERAL">一般数字</option>
+                        <option value="CURRENCY">货币</option>
+                        <option value="RATIO">比率</option>
+                      </select>
+                      <select
+                        aria-label={`${property.label}聚合性质`}
+                        value={property.numericSpec.aggregationBehavior}
+                        onChange={(event) =>
+                          changeProperty(property.id, {
+                            numericSpec: {
+                              ...property.numericSpec!,
+                              aggregationBehavior: event.target
+                                .value as NonNullable<
+                                typeof property.numericSpec
+                              >["aggregationBehavior"],
+                            },
+                          })
+                        }
+                      >
+                        <option value="ADDITIVE">可加</option>
+                        <option value="SEMI_ADDITIVE">半可加</option>
+                        <option value="NON_ADDITIVE">不可加</option>
+                      </select>
+                      <select
+                        aria-label={`${property.label}默认聚合`}
+                        value={property.numericSpec.defaultAggregation}
+                        onChange={(event) =>
+                          changeProperty(property.id, {
+                            numericSpec: {
+                              ...property.numericSpec!,
+                              defaultAggregation: event.target
+                                .value as NonNullable<
+                                typeof property.numericSpec
+                              >["defaultAggregation"],
+                            },
+                          })
+                        }
+                      >
+                        <option value="NONE">不默认聚合</option>
+                        <option value="SUM">求和</option>
+                        <option value="AVG">平均</option>
+                        <option value="MIN">最小值</option>
+                        <option value="MAX">最大值</option>
+                      </select>
+                      <input
+                        aria-label={`${property.label}单位或币种`}
+                        value={
+                          property.numericSpec.kind === "CURRENCY"
+                            ? property.numericSpec.currency ?? ""
+                            : property.numericSpec.unit ?? ""
+                        }
+                        placeholder={
+                          property.numericSpec.kind === "CURRENCY"
+                            ? "币种，如 CNY"
+                            : "单位，如 kg"
+                        }
+                        onChange={(event) =>
+                          changeProperty(property.id, {
+                            numericSpec: {
+                              ...property.numericSpec!,
+                              ...(property.numericSpec!.kind === "CURRENCY"
+                                ? { currency: event.target.value }
+                                : { unit: event.target.value }),
+                            },
+                          })
+                        }
+                      />
                     </div>
+                  ) : (
+                    <span className="property-not-applicable">不适用</span>
+                  )}
+                  <input
+                    value={property.description}
+                    placeholder="属性口径说明"
+                    onChange={(event) =>
+                      changeProperty(property.id, { description: event.target.value })
+                    }
+                  />
+                  <input
+                    value={property.synonyms.join("、")}
+                    placeholder="同义词"
+                    disabled={property.visibility !== "ANALYTICAL"}
+                    onChange={(event) =>
+                      changeProperty(property.id, {
+                        synonyms: splitTerms(event.target.value),
+                      })
+                    }
+                  />
+                  <div className="property-toggle-cell">
+                    {isValueSearchableMeaning(property.meaning) ? (
+                      <label className="inline-check" title="允许通过属性值定位该字段">
+                        <input
+                          type="checkbox"
+                          checked={property.valueSearchable}
+                          disabled={
+                            property.sensitive ||
+                            property.visibility !== "ANALYTICAL"
+                          }
+                          onChange={(event) =>
+                            changeProperty(property.id, {
+                              valueSearchable: event.target.checked,
+                            })
+                          }
+                        />
+                        允许
+                      </label>
+                    ) : (
+                      <span className="property-not-applicable">—</span>
+                    )}
+                  </div>
+                  <div className="property-toggle-cell">
+                    <label className="inline-check" title="查询明细时默认展示">
+                      <input
+                        type="checkbox"
+                        checked={property.defaultDisplay}
+                        disabled={property.visibility !== "DETAIL_ONLY"}
+                        onChange={(event) =>
+                          changeProperty(property.id, {
+                            defaultDisplay: event.target.checked,
+                          })
+                        }
+                      />
+                      默认
+                    </label>
+                  </div>
+                  <div className="property-toggle-cell">
+                    <label className="inline-check" title="允许导出该字段">
+                      <input
+                        type="checkbox"
+                        checked={property.exportable}
+                        disabled={property.visibility === "HIDDEN"}
+                        onChange={(event) =>
+                          changeProperty(property.id, {
+                            exportable: event.target.checked,
+                          })
+                        }
+                      />
+                      允许
+                    </label>
                   </div>
                 </div>
               );
-            })}
+              })}
+            </div>
           </div>
         </div>
       )}

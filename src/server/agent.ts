@@ -14,15 +14,11 @@ const TRACE_BLUEPRINT: Array<{
   kind: TraceStep["kind"];
   label: string;
 }> = [
-  { kind: "understanding", label: "理解问题" },
-  { kind: "inheritance", label: "继承上下文" },
-  { kind: "semantic_binding", label: "检索业务本体" },
-  { kind: "relation_path", label: "解析关系路径" },
-  { kind: "grain_check", label: "校验分析粒度" },
-  { kind: "query_plan", label: "Harness 查询规划" },
-  { kind: "sql", label: "生成只读 SQL" },
-  { kind: "execution", label: "执行 SelectDB 工具" },
-  { kind: "interpretation", label: "解释结果" },
+  { kind: "understanding", label: "问题理解" },
+  { kind: "semantic_binding", label: "语义绑定" },
+  { kind: "query_plan", label: "查询方案" },
+  { kind: "sql", label: "编译 SQL" },
+  { kind: "execution", label: "数据结果" },
 ];
 
 export class DataAgent {
@@ -38,6 +34,7 @@ export class DataAgent {
     const conversation = this.repository.getConversation(conversationId);
     if (!conversation) throw new Error("会话不存在");
     const ontology = this.repository.getOntology();
+    const agentConfig = this.repository.getAgentConfig();
     const now = new Date().toISOString();
     const turnId = createId("turn");
     const turn: Turn = {
@@ -48,6 +45,7 @@ export class DataAgent {
       status: "understanding",
       createdAt: now,
       ontologyVersion: ontology.version,
+      promptVersion: agentConfig.version,
       trace: TRACE_BLUEPRINT.map((step) => ({
         id: createId("trace"),
         turnId,
@@ -87,8 +85,8 @@ export class DataAgent {
     const updateStep = (
       kind: TraceStep["kind"],
       status: TraceStep["status"],
-      summary: string,
-      detail?: string,
+      patch: Pick<TraceStep, "summary"> &
+        Partial<Pick<TraceStep, "detail" | "facts" | "code">>,
     ) => {
       const index = turn.trace.findIndex((step) => step.kind === kind);
       if (index < 0) return;
@@ -96,8 +94,7 @@ export class DataAgent {
       turn.trace[index] = {
         ...current,
         status,
-        summary,
-        detail,
+        ...patch,
         completedAt:
           status === "completed" || status === "skipped" || status === "failed"
             ? new Date().toISOString()
@@ -109,24 +106,21 @@ export class DataAgent {
     try {
       updateStep(
         "understanding",
-        "completed",
-        `问题已提交 Montane AgentLoop：${turn.question.slice(0, 42)}`,
-      );
-      updateStep(
-        "inheritance",
-        "completed",
-        turn.parentTurnId
-          ? "SessionStore 已加载同一会话的历史事件"
-          : "SessionManager 已创建新的 Harness 会话",
+        "running",
+        {
+          summary: turn.parentTurnId
+            ? "Montane 正在结合本轮问题和会话上下文提取分析意图"
+            : "Montane 正在从问题中提取指标、维度、筛选和时间范围",
+        },
       );
       turn.status = "planning";
 
       const conversation = this.repository.getConversation(turn.conversationId);
       if (!conversation) throw new Error("会话不存在");
       const reporter = new HarnessTurnReporter(
-        (kind, status, summary, detail) => {
+        (kind, status, patch) => {
           if (kind === "execution" && status === "running") turn.status = "querying";
-          updateStep(kind, status, summary, detail);
+          updateStep(kind, status, patch);
         },
       );
       const output = await this.harness.run(conversation, turn, reporter);
@@ -151,7 +145,7 @@ export class DataAgent {
     } catch (error) {
       const message = error instanceof Error ? error.message : "Harness 分析失败";
       const running = turn.trace.find((step) => step.status === "running");
-      if (running) updateStep(running.kind, "failed", message);
+      if (running) updateStep(running.kind, "failed", { summary: message });
       turn.status = "failed";
       turn.answer = message;
       turn.completedAt = new Date().toISOString();
@@ -169,36 +163,18 @@ export class DataAgent {
 }
 
 class HarnessTurnReporter implements AgentReporter {
-  private receivedText = false;
-
   constructor(
     private readonly update: (
       kind: TraceStep["kind"],
       status: TraceStep["status"],
-      summary: string,
-      detail?: string,
+      patch: Pick<TraceStep, "summary"> &
+        Partial<Pick<TraceStep, "detail" | "facts" | "code">>,
     ) => void,
   ) {}
 
-  onTextDelta(_delta: string): void {
-    if (this.receivedText) return;
-    this.receivedText = true;
-    this.update(
-      "interpretation",
-      "running",
-      "AgentLoop 正在生成本轮响应",
-    );
-  }
+  onTextDelta(_delta: string): void {}
 
-  onTextEnd(): void {
-    if (!this.receivedText) return;
-    this.receivedText = false;
-    this.update(
-      "interpretation",
-      "completed",
-      "本轮响应已写入 Harness SessionStore",
-    );
-  }
+  onTextEnd(): void {}
 
   onToolStatus(
     call: ToolCall,
@@ -209,23 +185,25 @@ class HarnessTurnReporter implements AgentReporter {
       this.handleOntologyStatus(status, result);
       return;
     }
-    if (call.name === "SelectDBQuery") {
-      this.handleQueryStatus(call, status, result);
+    if (call.name === "PropertyValueSearch") {
+      this.handlePropertyValueStatus(status, result);
+      return;
+    }
+    if (call.name === "ExecuteAnalysisPlan") {
+      this.handlePlanStatus(call, status, result);
     }
   }
 
   private handleOntologyStatus(status: ToolStatus, result?: ToolOutcome): void {
     if (status === "running") {
       this.update(
-        "query_plan",
-        "completed",
-        "AgentLoop 已选择 OntologySearch 只读工具",
-      );
-      this.update(
-        "semantic_binding",
+        "understanding",
         "running",
-        "OntologySearch 正在检索已发布语义索引",
+        { summary: "Montane 已识别为数据问题，正在检索已发布本体" },
       );
+      this.update("semantic_binding", "running", {
+        summary: "正在匹配对象、指标、属性和同义词",
+      });
       return;
     }
     if (status === "succeeded") {
@@ -240,29 +218,27 @@ class HarnessTurnReporter implements AgentReporter {
           }
         | undefined;
       const labels =
-        data?.matches?.map((match) => match.label).filter(Boolean).slice(0, 5) ?? [];
+        data?.matches
+          ?.map((match) => match.label)
+          .filter((label): label is string => Boolean(label))
+          .slice(0, 5) ?? [];
       const relations = data?.relations ?? [];
       this.update(
         "semantic_binding",
         "completed",
-        labels.length ? `命中业务语义：${labels.join("、")}` : "完成本体检索",
-      );
-      this.update(
-        "relation_path",
-        "completed",
-        relations.length
-          ? `解析 ${relations.length} 条候选关系：${relations
-              .slice(0, 2)
-              .map((relation) => relation.name)
-              .join("、")}`
-          : "当前问题可在单一对象内完成",
-      );
-      this.update(
-        "grain_check",
-        "completed",
-        relations.some((relation) => relation.fanoutRisk === "HIGH")
-          ? "发现高扇出关系，Harness 将按去重口径生成查询"
-          : "关系基数与聚合粒度检查通过",
+        {
+          summary: labels.length
+            ? `候选语义：${labels.join("、")}`
+            : "未命中可用本体语义",
+          facts: labels.map((label) => ({
+            label: "候选",
+            value: label,
+            source: "名称、同义词或中文分词",
+          })),
+          detail: relations.length
+            ? `发现 ${relations.length} 条候选对象关系`
+            : "当前候选可在单一对象内完成",
+        },
       );
       return;
     }
@@ -270,45 +246,253 @@ class HarnessTurnReporter implements AgentReporter {
       this.update(
         "semantic_binding",
         "failed",
-        result?.content || "OntologySearch 执行失败",
+        { summary: result?.content || "OntologySearch 执行失败" },
       );
     }
   }
 
-  private handleQueryStatus(
+  private handlePropertyValueStatus(
+    status: ToolStatus,
+    result?: ToolOutcome,
+  ): void {
+    if (status === "running") {
+      this.update("semantic_binding", "running", {
+        summary: "正在通过已发布属性值索引定位业务值",
+      });
+      return;
+    }
+    if (status === "succeeded") {
+      const data = result?.data as
+        | {
+            status?: string;
+            matches?: Array<{
+              property?: string;
+              matchedValue?: string;
+              source?: string;
+            }>;
+          }
+        | undefined;
+      const matches = data?.matches ?? [];
+      this.update("semantic_binding", "completed", {
+        summary: matches.length
+          ? `属性值已定位：${matches
+              .slice(0, 3)
+              .map((match) => `${match.property} = ${match.matchedValue}`)
+              .join("、")}`
+          : "属性值索引未找到可靠绑定",
+        facts: matches.map((match) => ({
+          label: match.property || "属性值",
+          value: match.matchedValue || "—",
+          source:
+            match.source === "published-index"
+              ? "发布值索引"
+              : match.source === "local-cache"
+                ? "查询缓存"
+                : "SelectDB 定向验证",
+        })),
+      });
+      return;
+    }
+    if (isFailure(status)) {
+      this.update("semantic_binding", "failed", {
+        summary: result?.content || "属性值定位失败",
+      });
+    }
+  }
+
+  private handlePlanStatus(
     call: ToolCall,
     status: ToolStatus,
     result?: ToolOutcome,
   ): void {
-    const sql = String(call.args.sql ?? "");
     if (status === "running") {
+      const measureCount = Array.isArray(call.args.measure_ids)
+        ? call.args.measure_ids.length
+        : 0;
+      const dimensionCount = Array.isArray(call.args.dimension_property_ids)
+        ? call.args.dimension_property_ids.length
+        : 0;
+      const filterCount = Array.isArray(call.args.filters)
+        ? call.args.filters.length
+        : 0;
       this.update(
-        "sql",
+        "understanding",
         "completed",
-        "SQL 已通过 Harness 工具参数校验和只读安全检查",
-        sql,
+        {
+          summary: `${measureCount} 个指标、${dimensionCount} 个维度、${filterCount} 个筛选条件`,
+          facts: [
+            { label: "指标", value: String(measureCount), source: "Montane 结构化意图" },
+            { label: "维度", value: String(dimensionCount), source: "Montane 结构化意图" },
+            { label: "筛选", value: String(filterCount), source: "Montane 结构化意图" },
+            {
+              label: "时间",
+              value: String(
+                (call.args.time_range as Record<string, unknown> | undefined)
+                  ?.expression ?? "未指定",
+              ),
+              source: "用户原始表达",
+            },
+          ],
+        },
       );
-      this.update(
-        "execution",
-        "running",
-        "SelectDBQuery 正在执行受控查询",
-      );
+      this.update("query_plan", "running", {
+        summary: "IR规则引擎正在校验本体ID、关系路径、粒度和筛选操作符",
+      });
       return;
     }
     if (status === "succeeded") {
-      const rowCount = Number(result?.data?.rowCount ?? 0);
-      this.update(
-        "execution",
-        "completed",
-        `真实查询完成，返回 ${rowCount} 行`,
-      );
+      const data = result?.data as
+        | {
+            ir?: {
+              rootObjectId?: string;
+              grain?: string;
+              relationIds?: string[];
+              limit?: number;
+            };
+            bindings?: Array<{
+              label?: string;
+              value?: string;
+              source?: string;
+              entityId?: string;
+            }>;
+            planSummary?: string;
+            sql?: string;
+            parameters?: unknown[];
+            rowCount?: number;
+            columns?: string[];
+            truncated?: boolean;
+          }
+        | undefined;
+      const bindings = data?.bindings ?? [];
+      this.update("semantic_binding", "completed", {
+        summary: bindings.length
+          ? `已确定 ${bindings.length} 项本体绑定`
+          : "本体绑定已通过规则校验",
+        facts: bindings.map((binding) => ({
+          label: binding.label || "绑定",
+          value: binding.value || "—",
+          source: binding.source,
+          entityId: binding.entityId,
+        })),
+      });
+      this.update("query_plan", "completed", {
+        summary: data?.planSummary || "强类型 IR 已通过规则校验",
+        facts: [
+          {
+            label: "分析粒度",
+            value: data?.ir?.grain || "—",
+            source: "IR规则引擎",
+          },
+          {
+            label: "关系路径",
+            value: data?.ir?.relationIds?.length
+              ? `${data.ir.relationIds.length} 条关系`
+              : "单一对象",
+            source: "本体关系图",
+          },
+          {
+            label: "结果上限",
+            value: `${data?.ir?.limit ?? "—"} 行`,
+            source: "查询策略",
+          },
+        ],
+        code: data?.ir
+          ? { language: "json", content: JSON.stringify(data.ir, null, 2) }
+          : undefined,
+      });
+      this.update("sql", "completed", {
+        summary: "Doris SQL 已由IR编译器生成并通过只读校验",
+        facts: [{
+          label: "参数",
+          value: `${data?.parameters?.length ?? 0} 个`,
+          source: "参数化查询",
+        }],
+        code: data?.sql
+          ? {
+              language: "sql",
+              content: `${data.sql}\n\n-- 参数：${JSON.stringify(data.parameters ?? [])}`,
+            }
+          : undefined,
+      });
+      this.update("execution", "completed", {
+        summary: `SelectDB 返回 ${Number(data?.rowCount ?? 0)} 行`,
+        facts: [
+          {
+            label: "返回行数",
+            value: String(data?.rowCount ?? 0),
+            source: "SelectDB",
+          },
+          {
+            label: "字段",
+            value: data?.columns?.join("、") || "—",
+            source: "真实结果集",
+          },
+          {
+            label: "截断",
+            value: data?.truncated ? "是" : "否",
+            source: "结果限制",
+          },
+        ],
+      });
       return;
     }
     if (isFailure(status)) {
+      const data = result?.data as
+        | {
+            stage?: string;
+            ir?: {
+              grain?: string;
+              relationIds?: string[];
+              limit?: number;
+            };
+            bindings?: Array<{
+              label?: string;
+              value?: string;
+              source?: string;
+              entityId?: string;
+            }>;
+            planSummary?: string;
+            sql?: string;
+            parameters?: unknown[];
+          }
+        | undefined;
+      if (data?.stage === "execution" && data.sql) {
+        this.update("semantic_binding", "completed", {
+          summary: `已确定 ${data.bindings?.length ?? 0} 项本体绑定`,
+          facts: (data.bindings ?? []).map((binding) => ({
+            label: binding.label || "绑定",
+            value: binding.value || "—",
+            source: binding.source,
+            entityId: binding.entityId,
+          })),
+        });
+        this.update("query_plan", "completed", {
+          summary: data.planSummary || "强类型 IR 已通过规则校验",
+          facts: [{
+            label: "分析粒度",
+            value: data.ir?.grain || "—",
+            source: "IR规则引擎",
+          }],
+          code: data.ir
+            ? { language: "json", content: JSON.stringify(data.ir, null, 2) }
+            : undefined,
+        });
+        this.update("sql", "completed", {
+          summary: "Doris SQL 已编译，SelectDB执行阶段发生错误",
+          code: {
+            language: "sql",
+            content: `${data.sql}\n\n-- 参数：${JSON.stringify(data.parameters ?? [])}`,
+          },
+        });
+        this.update("execution", "failed", {
+          summary: result?.content || "SelectDB执行失败",
+        });
+        return;
+      }
       this.update(
-        "execution",
+        "query_plan",
         "failed",
-        result?.content || "SelectDBQuery 执行失败",
+        { summary: result?.content || "分析计划执行失败" },
       );
     }
   }

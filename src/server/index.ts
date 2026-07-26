@@ -27,23 +27,31 @@ import {
 } from "./ontology.js";
 import { Repository } from "./repository.js";
 import { SelectDbClient } from "./selectdb.js";
+import { PropertyValueIndexer } from "./value-indexer.js";
 
 const config = loadConfig();
 const repository = new Repository(config.databasePath);
 const events = new EventHub();
 const keychain = new KeychainStore(config.workspaceRoot, config.stateRoot);
 const selectDb = new SelectDbClient();
-const harness = new DataAgentHarness(
-  config.workspaceRoot,
-  repository,
-  async (sql, maxRows, parameters = [], timeoutMs = 180_000) => {
+const executeLiveQuery = async (
+  sql: string,
+  maxRows: number,
+  parameters: unknown[] = [],
+  timeoutMs = 180_000,
+) => {
     const source = repository.getDataSource();
     const password = await keychain.getPassword();
     if (!source.configured || !password) throw new Error("SelectDB 凭证不可用");
     await selectDb.configure(source, password);
     return selectDb.query(sql, timeoutMs, maxRows, parameters);
-  },
+};
+const harness = new DataAgentHarness(
+  config.workspaceRoot,
+  repository,
+  executeLiveQuery,
 );
+const valueIndexer = new PropertyValueIndexer(repository, executeLiveQuery);
 const agent = new DataAgent(repository, events, harness);
 const app = Fastify({ logger: true });
 
@@ -55,6 +63,15 @@ const dataSourceSchema = z.object({
   catalog: z.string().default("internal"),
   database: z.string().min(1),
   tls: z.boolean().default(false),
+});
+const agentConfigSchema = z.object({
+  businessInstructions: z.string().max(12_000),
+  timezone: z.enum([
+    "Asia/Shanghai",
+    "UTC",
+    "Asia/Hong_Kong",
+    "Asia/Singapore",
+  ]),
 });
 
 app.get("/api/health", async () => ({ ok: true, version: "0.1.0" }));
@@ -68,6 +85,8 @@ app.get("/api/bootstrap", async () => {
     ontologyDraft: repository.getDraftOntology() ?? undefined,
     tables: repository.getTables(),
     dataSource,
+    agentConfig: repository.getAgentConfig(),
+    valueIndex: repository.getPropertyValueIndexStatus(),
     runtime: {
       modelConfigured: montaneRuntime.configured,
       analysisReady: Boolean(
@@ -86,6 +105,27 @@ app.get<{ Params: { id: string } }>("/api/conversations/:id", async (request, re
   if (!conversation) return reply.code(404).send({ message: "会话不存在" });
   return conversation;
 });
+
+app.put<{ Body: unknown }>("/api/agent-config", async (request, reply) => {
+  const parsed = agentConfigSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({
+      message: parsed.error.issues[0]?.message || "Agent 配置不完整",
+    });
+  }
+  return { config: repository.saveAgentConfig(parsed.data) };
+});
+
+app.post("/api/value-index/rebuild", async (_request, reply) => {
+  if (!repository.getDataSource().configured) {
+    return reply.code(409).send({ message: "请先配置 SelectDB" });
+  }
+  return { status: valueIndexer.start() };
+});
+
+app.get("/api/value-index/status", async () => ({
+  status: repository.getPropertyValueIndexStatus(),
+}));
 
 app.post<{ Body: { title?: string } }>("/api/conversations", async (request) => {
   const now = new Date().toISOString();
@@ -331,10 +371,23 @@ app.post("/api/ontology/publish", async (_request, reply) => {
     published.objects.map((object) => object.sourceTableId),
     "MODELED",
   );
+  const valueIndex = repository.getDataSource().configured
+    ? valueIndexer.start(published)
+    : {
+        ontologyVersion: published.version,
+        status: "idle" as const,
+        indexedProperties: 0,
+        indexedValues: 0,
+        partialProperties: 0,
+        failedProperties: 0,
+        updatedAt: new Date().toISOString(),
+      };
+  repository.savePropertyValueIndexStatus(valueIndex);
   return {
     ontology: published,
     tables: repository.getTables(),
     validation,
+    valueIndex,
   };
 });
 

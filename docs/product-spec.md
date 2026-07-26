@@ -17,7 +17,7 @@
 
 InsightFlow 是基于现有 Montane Code Agent Runtime 构建的本地 Data Agent 网页应用。
 
-用户通过自然语言提出业务问题。系统基于已发布的 Ontology 理解业务对象、指标、维度和关系，生成 SelectDB SQL，执行安全校验，返回分析结论、图表和明细数据，并为每轮对话保存完整查询追踪。
+用户通过自然语言提出业务问题。系统基于已发布的 Ontology 理解业务对象、指标、维度和关系，通过强类型 IR 编译 SelectDB SQL，执行安全校验，返回分析结论、图表和明细数据，并为每轮对话保存完整分析证据链。
 
 ### 2.1 核心价值
 
@@ -32,7 +32,7 @@ InsightFlow 是基于现有 Montane Code Agent Runtime 构建的本地 Data Agen
 1. 用户可以连续提出自然语言数据问题。
 2. 系统能正确绑定已发布的指标、维度和对象。
 3. 系统只能执行符合安全约束的只读查询。
-4. 每轮对话都有完整、持久化的查询追踪。
+4. 每轮对话都有完整、持久化的分析证据链。
 5. 查询完成后优先展示结论、图表和数据表。
 6. 历史会话重新打开后，结果和追踪仍可查看。
 7. 多轮追问能明确显示继承、增加、修改和移除的条件。
@@ -80,7 +80,7 @@ InsightFlow 是基于现有 Montane Code Agent Runtime 构建的本地 Data Agen
 - Ontology 草稿、验证、发布、回滚和停用
 - 本地语义检索和关系路径选择
 - SelectDB SQL 生成、安全检查、执行和取消
-- 每轮问题理解、语义绑定、关系路径和查询追踪
+- 每轮问题理解、语义绑定、查询 IR、SQL 和结果证据
 - KPI、趋势图、柱状图、排名图和数据表
 - CSV 导出
 - 本地持久化
@@ -137,12 +137,12 @@ InsightFlow 是基于现有 Montane Code Agent Runtime 构建的本地 Data Agen
 3. 系统创建独立 `turn_id`。
 4. Agent 识别本轮意图和继承上下文。
 5. Semantic Retriever 匹配已发布 Ontology。
-6. Query Planner 选择关系路径和数据粒度。
-7. SQL Generator 生成 SelectDB SQL。
-8. SQL Guard 执行语法、权限、范围和扇出检查。
-9. 普通查询自动执行，高风险查询等待审批。
-10. 系统返回结论、图表和数据表。
-11. 本轮查询追踪完整保存。
+6. Montane 提交只包含本体 ID、操作符和业务条件的结构化意图。
+7. IR 规则引擎绑定属性值、时间、关系路径和数据粒度。
+8. Doris SQL Compiler 生成参数化 SelectDB SQL。
+9. SQL Guard 执行只读、范围和行数检查。
+10. 系统执行查询并返回结论、图表和数据表。
+11. 本轮分析证据链完整保存。
 12. 用户基于结果继续追问。
 
 ## 6. 信息架构
@@ -213,7 +213,7 @@ InsightFlow 是基于现有 Montane Code Agent Runtime 构建的本地 Data Agen
 - 敏感字段标记
 - 忽略规则
 
-## 7. 对话与查询追踪
+## 7. 对话与分析证据链
 
 ### 7.1 基本结构
 
@@ -232,7 +232,8 @@ Conversation
 └── Composer
 ```
 
-查询追踪属于每一轮，不固定展示在输入框上方。
+分析证据链属于每一轮，不固定展示在输入框上方。它展示可审计的结构化产物，
+不展示模型隐藏思维过程。
 
 ### 7.2 展示行为
 
@@ -243,18 +244,17 @@ Conversation
 - 输入框固定在页面底部。
 - 后续轮次不能覆盖前一轮追踪。
 
-### 7.3 每轮追踪步骤
+### 7.3 每轮证据步骤
 
 1. 问题理解
-2. 上下文继承
-3. 语义绑定
-4. Ontology 关系路径
-5. 指标粒度与扇出检查
-6. 查询计划
-7. SQL 生成
-8. 权限与审批
-9. 查询执行
-10. 结果解释
+2. 语义绑定
+3. 查询方案
+4. 编译 SQL
+5. 数据结果
+
+每步保存摘要、结构化事实和来源；查询方案保存强类型 IR，SQL 步骤保存最终
+SQL 与参数，数据结果保存行数、字段和截断状态。理解错误从意图层纠正，绑定
+错误从本体候选纠正，SQL 不允许绕过 IR 直接修改。
 
 ```ts
 type TraceStepStatus =
@@ -414,11 +414,13 @@ ID 只表达“当前对象是谁”。同一对象只能有一个逻辑 ID；�
 本地语义索引分别返回对象、属性和指标，不再把属性命中折叠成对象命中。Montane 遇到“华东”“VIP”“上海门店”等具体业务值时调用 `PropertyValueSearch`：
 
 1. 只搜索已发布、分析可用、非敏感且启用值定位的字段。
-2. 优先查询按 Ontology 版本隔离的 SQLite 本地值缓存。
-3. 未命中时对候选 SelectDB 列执行参数化、只读、限行查询。
-4. 命中结果以对象 ID、属性 ID、物理列和值返回给 Montane。
-5. 多个属性同时命中时必须向用户澄清，不能自行选择。
-6. 查询结果按需写入本地缓存，不对高基数字段做无边界全量扫描。
+2. 发布 Ontology 后异步构建按版本隔离的 SQLite 属性值索引。
+3. 问数时优先检索发布值索引，其次查询按需缓存。
+4. 两层均未命中时，最多对四个候选 SelectDB 列并发执行参数化、只读、限行查询。
+5. 命中结果以对象 ID、属性 ID、物理列和值返回给 Montane。
+6. 多个属性同时命中时必须向用户澄清，不能自行选择。
+7. 每个属性最多索引 5,000 个高频值，超过上限标记为部分索引。
+8. 查询结果按需写入本地缓存，不对高基数字段做无边界全量扫描。
 
 `DETAIL_ONLY`、`HIDDEN` 和敏感字段禁止建立值索引或按需定位。
 
@@ -579,22 +581,26 @@ MVP 不部署独立向量数据库。Ontology 达到更大规模后，可以通�
 - `InspectQueryResult`
 - `CreateVisualizationSpec`
 
-MVP 当前将上述职责收敛为两个组合工具：
+MVP 当前将上述职责收敛为三个组合工具：
 
-- `OntologySearch`：完成候选召回、对象/指标绑定、关系路径和扇出风险返回。
-- `SelectDBQuery`：完成 SQL 参数校验、只读防护、行数限制和 SelectDB 执行。
+- `OntologySearch`：返回已发布对象、属性、指标 ID 和候选关系。
+- `PropertyValueSearch`：通过发布值索引、缓存和小范围 SelectDB 兜底定位业务值。
+- `ExecuteAnalysisPlan`：接收结构化本体 ID，生成强类型 IR、编译参数化 Doris SQL 并执行。
 
-两者均注册到 `ToolRegistry`，由 `AgentLoop` 调用并经过 `PermissionGate`。
+三个工具均注册到 `ToolRegistry`，由 `AgentLoop` 调用并经过 `PermissionGate`。
 `AgentReporter` 将实际工具状态投影为每轮 UI 追踪，`SessionStore` 保存
-`assistant_tool_calls`、`tool_result` 和 `assistant_final` 原始事件。MVP 不再使用
-独立的直连模型查询规划器。
+`assistant_tool_calls`、`tool_result` 和 `assistant_final` 原始事件。
+
+Montane 提示词分为不可修改的核心执行协议和可配置的工作区业务指令。业务指令
+与业务时区保存在 SQLite，保存时递增版本；每个 Turn 记录实际使用的提示词版本。
+工作区指令不得覆盖只读查询、本体边界、敏感字段和 IR Schema。
 
 执行原则：
 
-- LLM 负责意图理解、语义匹配、计划和解释。
-- 确定性代码负责 SQL 安全、权限、限制和执行。
+- LLM 负责意图理解、候选选择、澄清和结果解释。
+- 确定性代码负责本体 ID 校验、IR、关系路径、粒度、SQL 编译、安全、参数和执行。
 - LLM 不能直接调用 Bash 连接数据库。
-- 查询只能通过专用 SelectDB Tool 执行。
+- Montane 不持有自由 SQL 工具，查询只能通过 `ExecuteAnalysisPlan`。
 - Agent 不得绕过已发布 Ontology 猜测字段关系。
 - SQL 和查询参数必须写入对应轮次追踪。
 
@@ -688,7 +694,7 @@ SQL 始终可以在本轮追踪中查看。
 2. KPI 摘要
 3. 推荐图表
 4. 数据表
-5. 可展开查询追踪
+5. 可展开分析证据链
 
 ### 17.2 MVP 图表
 
@@ -820,7 +826,8 @@ React Web UI
   -> Node Web BFF
   -> Montane Agent Runtime
   -> Semantic Retriever
-  -> Query Planner
+  -> Typed Query IR
+  -> Doris SQL Compiler
   -> SQL Guard
   -> SelectDB Adapter
   -> Alibaba Cloud SelectDB
@@ -1036,7 +1043,7 @@ GET    /api/events
 - Query Planner
 - SelectDB SQL 生成
 - 多轮上下文
-- 每轮查询追踪
+- 每轮分析证据链
 - 结果解释
 
 ### 阶段 5：结果与 UI

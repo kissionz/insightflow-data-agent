@@ -33,8 +33,100 @@ export interface TraceStep {
   status: TraceStatus;
   summary: string;
   detail?: string;
+  facts?: Array<{
+    label: string;
+    value: string;
+    source?: string;
+    entityId?: string;
+  }>;
+  code?: {
+    language: "json" | "sql";
+    content: string;
+  };
   createdAt: string;
   completedAt?: string;
+}
+
+export type QueryFilterOperator =
+  | "EQ"
+  | "NE"
+  | "GT"
+  | "GTE"
+  | "LT"
+  | "LTE"
+  | "IN"
+  | "CONTAINS"
+  | "PREFIX"
+  | "IS_NULL"
+  | "NOT_NULL";
+
+export interface AnalysisIntent {
+  rootObjectId?: string;
+  measureIds: string[];
+  dimensionPropertyIds: string[];
+  filters: Array<{
+    propertyId: string;
+    operator: QueryFilterOperator;
+    value?: string | string[];
+    businessValue?: string;
+  }>;
+  timeRange?: {
+    expression: string;
+    propertyId?: string;
+  };
+  sort?: Array<{
+    entityId: string;
+    direction: "ASC" | "DESC";
+  }>;
+  limit?: number;
+  resultKind: "aggregate" | "detail";
+  title: string;
+}
+
+export interface QueryIR {
+  version: 1;
+  ontologyVersion: number;
+  rootObjectId: string;
+  measureIds: string[];
+  dimensionPropertyIds: string[];
+  filters: Array<{
+    propertyId: string;
+    operator: QueryFilterOperator;
+    value?: string | string[];
+    businessValue?: string;
+  }>;
+  timeRange?: {
+    propertyId: string;
+    expression: string;
+    start: string;
+    endExclusive: string;
+  };
+  relationIds: string[];
+  grain: string;
+  resultKind: "aggregate" | "detail";
+  sort: Array<{
+    entityId: string;
+    direction: "ASC" | "DESC";
+  }>;
+  limit: number;
+}
+
+export interface AgentPromptConfig {
+  version: number;
+  businessInstructions: string;
+  timezone: string;
+  updatedAt: string;
+}
+
+export interface PropertyValueIndexStatus {
+  ontologyVersion: number;
+  status: "idle" | "building" | "ready" | "partial" | "failed";
+  indexedProperties: number;
+  indexedValues: number;
+  partialProperties: number;
+  failedProperties: number;
+  updatedAt?: string;
+  error?: string;
 }
 
 export interface ResultSeries {
@@ -73,6 +165,7 @@ export interface Turn {
   createdAt: string;
   completedAt?: string;
   ontologyVersion: number;
+  promptVersion?: number;
   trace: TraceStep[];
   responseKind?: "analysis" | "conversation" | "configuration_required" | "clarification";
   result?: ResultArtifact;
@@ -304,6 +397,8 @@ export interface BootstrapPayload {
   ontologyDraft?: OntologySnapshot;
   tables: PhysicalTable[];
   dataSource: SafeDataSourceConfig;
+  agentConfig: AgentPromptConfig;
+  valueIndex: PropertyValueIndexStatus;
   runtime: {
     modelConfigured: boolean;
     analysisReady: boolean;

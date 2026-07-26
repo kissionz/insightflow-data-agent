@@ -1,4 +1,5 @@
 import type {
+  AgentPromptConfig,
   BootstrapPayload,
   Conversation,
   DataAgentEvent,
@@ -9,6 +10,7 @@ import type {
   OntologySnapshot,
   OntologyValidationResult,
   PhysicalTable,
+  PropertyValueIndexStatus,
   SafeDataSourceConfig,
   Turn,
 } from "../shared/types";
@@ -39,6 +41,19 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ question }),
     }),
+  saveAgentConfig: (
+    input: Pick<AgentPromptConfig, "businessInstructions" | "timezone">,
+  ) =>
+    request<{ config: AgentPromptConfig }>("/api/agent-config", {
+      method: "PUT",
+      body: JSON.stringify(input),
+    }),
+  rebuildValueIndex: () =>
+    request<{ status: PropertyValueIndexStatus }>("/api/value-index/rebuild", {
+      method: "POST",
+    }),
+  valueIndexStatus: () =>
+    request<{ status: PropertyValueIndexStatus }>("/api/value-index/status"),
   testDataSource: (input: DataSourceInput) =>
     request<{ ok: boolean; version: string }>("/api/data-source/test", {
       method: "POST",
@@ -94,6 +109,7 @@ export const api = {
       ontology: OntologySnapshot;
       tables: PhysicalTable[];
       validation: OntologyValidationResult;
+      valueIndex: PropertyValueIndexStatus;
     }>(
       "/api/ontology/publish",
       { method: "POST" },

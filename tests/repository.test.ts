@@ -58,6 +58,26 @@ describe("Repository schema reconciliation", () => {
     repository.close();
   });
 
+  it("versions workspace business instructions independently from core policy", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-repo-"));
+    roots.push(root);
+    const repository = new Repository(path.join(root, "ontology.sqlite"));
+
+    expect(repository.getAgentConfig()).toMatchObject({
+      version: 1,
+      timezone: "Asia/Shanghai",
+      businessInstructions: "",
+    });
+    const saved = repository.saveAgentConfig({
+      timezone: "Asia/Shanghai",
+      businessInstructions: "销售额默认采用支付口径。",
+    });
+
+    expect(saved.version).toBe(2);
+    expect(repository.getAgentConfig()).toEqual(saved);
+    repository.close();
+  });
+
   it("keeps modeled tables, identifies changes, and adds only new tables", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-repo-"));
     roots.push(root);

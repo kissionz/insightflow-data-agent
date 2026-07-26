@@ -2,12 +2,14 @@ import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type {
+  AgentPromptConfig,
   Conversation,
   NumericPropertySpec,
   OntologyObjectType,
   OntologyProperty,
   OntologySnapshot,
   PhysicalTable,
+  PropertyValueIndexStatus,
   SafeDataSourceConfig,
   Turn,
 } from "../shared/types.js";
@@ -23,6 +25,10 @@ export interface CachedPropertyValue {
   normalizedValue: string;
   displayValue: string;
   updatedAt: string;
+}
+
+export interface IndexedPropertyValue extends CachedPropertyValue {
+  frequency: number;
 }
 
 export class Repository {
@@ -169,6 +175,156 @@ export class Repository {
       );
   }
 
+  findIndexedPropertyValues(
+    ontologyVersion: number,
+    normalizedValue: string,
+    propertyIds: string[],
+    matchMode: "exact" | "prefix" = "exact",
+  ): IndexedPropertyValue[] {
+    if (!propertyIds.length) return [];
+    const placeholders = propertyIds.map(() => "?").join(", ");
+    const comparison =
+      matchMode === "prefix"
+        ? "normalized_value LIKE ? ESCAPE '\\'"
+        : "normalized_value = ?";
+    const lookupValue =
+      matchMode === "prefix"
+        ? `${escapeSqlLike(normalizedValue)}%`
+        : normalizedValue;
+    return this.db
+      .prepare(
+        `SELECT ontology_version, object_id, property_id, normalized_value,
+                display_value, frequency, updated_at
+           FROM property_value_index
+          WHERE ontology_version = ?
+            AND ${comparison}
+            AND property_id IN (${placeholders})
+          ORDER BY frequency DESC, display_value
+          LIMIT 20`,
+      )
+      .all(ontologyVersion, lookupValue, ...propertyIds)
+      .map((row) => {
+        const value = row as {
+          ontology_version: number;
+          object_id: string;
+          property_id: string;
+          normalized_value: string;
+          display_value: string;
+          frequency: number;
+          updated_at: string;
+        };
+        return {
+          ontologyVersion: value.ontology_version,
+          objectId: value.object_id,
+          propertyId: value.property_id,
+          normalizedValue: value.normalized_value,
+          displayValue: value.display_value,
+          frequency: value.frequency,
+          updatedAt: value.updated_at,
+        };
+      });
+  }
+
+  replaceIndexedPropertyValues(
+    ontologyVersion: number,
+    objectId: string,
+    propertyId: string,
+    values: Array<{ displayValue: string; frequency: number }>,
+  ): void {
+    const now = new Date().toISOString();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db
+        .prepare(
+          `DELETE FROM property_value_index
+            WHERE ontology_version = ? AND property_id = ?`,
+        )
+        .run(ontologyVersion, propertyId);
+      const statement = this.db.prepare(
+        `INSERT INTO property_value_index
+           (ontology_version, object_id, property_id, normalized_value,
+            display_value, frequency, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(ontology_version, property_id, normalized_value)
+         DO UPDATE SET
+           display_value = excluded.display_value,
+           frequency = MAX(property_value_index.frequency, excluded.frequency),
+           updated_at = excluded.updated_at`,
+      );
+      for (const value of values) {
+        const normalizedValue = normalizePropertyValue(value.displayValue);
+        if (!normalizedValue) continue;
+        statement.run(
+          ontologyVersion,
+          objectId,
+          propertyId,
+          normalizedValue,
+          value.displayValue,
+          value.frequency,
+          now,
+        );
+      }
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  getAgentConfig(): AgentPromptConfig {
+    const row = this.db
+      .prepare("SELECT value FROM settings WHERE key = 'agent_config'")
+      .get() as { value: string } | undefined;
+    return row
+      ? (JSON.parse(row.value) as AgentPromptConfig)
+      : defaultAgentConfig();
+  }
+
+  saveAgentConfig(
+    input: Pick<AgentPromptConfig, "businessInstructions" | "timezone">,
+  ): AgentPromptConfig {
+    const previous = this.getAgentConfig();
+    const config: AgentPromptConfig = {
+      version: previous.version + 1,
+      businessInstructions: input.businessInstructions.trim(),
+      timezone: input.timezone,
+      updatedAt: new Date().toISOString(),
+    };
+    this.db
+      .prepare(
+        `INSERT INTO settings (key, value) VALUES ('agent_config', ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      )
+      .run(JSON.stringify(config));
+    return config;
+  }
+
+  getPropertyValueIndexStatus(): PropertyValueIndexStatus {
+    const row = this.db
+      .prepare("SELECT value FROM settings WHERE key = 'property_value_index_status'")
+      .get() as { value: string } | undefined;
+    return row
+      ? (JSON.parse(row.value) as PropertyValueIndexStatus)
+      : {
+          ontologyVersion: this.getPublishedOntology().version,
+          status: "idle",
+          indexedProperties: 0,
+          indexedValues: 0,
+          partialProperties: 0,
+          failedProperties: 0,
+        };
+  }
+
+  savePropertyValueIndexStatus(status: PropertyValueIndexStatus): void {
+    this.db
+      .prepare(
+        `INSERT INTO settings (key, value)
+         VALUES ('property_value_index_status', ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      )
+      .run(JSON.stringify(status));
+  }
+
   deleteDraftOntology(): void {
     this.db.prepare("DELETE FROM ontology_versions WHERE status = 'DRAFT'").run();
   }
@@ -284,6 +440,18 @@ export class Repository {
       );
       CREATE INDEX IF NOT EXISTS property_value_cache_lookup
         ON property_value_cache (ontology_version, normalized_value);
+      CREATE TABLE IF NOT EXISTS property_value_index (
+        ontology_version INTEGER NOT NULL,
+        object_id TEXT NOT NULL,
+        property_id TEXT NOT NULL,
+        normalized_value TEXT NOT NULL,
+        display_value TEXT NOT NULL,
+        frequency INTEGER NOT NULL DEFAULT 1,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (ontology_version, property_id, normalized_value)
+      );
+      CREATE INDEX IF NOT EXISTS property_value_index_lookup
+        ON property_value_index (ontology_version, normalized_value);
     `);
   }
 
@@ -346,6 +514,23 @@ export class Repository {
       }
     }
   }
+}
+
+function defaultAgentConfig(): AgentPromptConfig {
+  return {
+    version: 1,
+    businessInstructions: "",
+    timezone: "Asia/Shanghai",
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function normalizePropertyValue(value: string): string {
+  return value.trim().toLocaleLowerCase("zh-CN").replace(/\s+/g, " ");
+}
+
+function escapeSqlLike(value: string): string {
+  return value.replaceAll("\\", "\\\\").replaceAll("%", "\\%").replaceAll("_", "\\_");
 }
 
 function emptyOntology(): OntologySnapshot {

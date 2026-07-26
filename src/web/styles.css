@@ -667,6 +667,81 @@ button.brand-mark {
   line-height: 1.45;
 }
 
+.trace-facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 6px;
+  margin: 9px 0 4px;
+}
+
+.trace-facts > div {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: white;
+  padding: 7px 8px;
+}
+
+.trace-facts dt {
+  color: var(--muted-2);
+  font-size: 8px;
+}
+
+.trace-facts dd {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+  margin: 3px 0 0;
+}
+
+.trace-facts dd span {
+  overflow: hidden;
+  color: #344054;
+  font-size: 9px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trace-facts dd small {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 8px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trace-copy .trace-detail {
+  margin-top: 7px;
+}
+
+.trace-code {
+  margin-top: 8px;
+}
+
+.trace-code summary {
+  width: fit-content;
+  cursor: pointer;
+  color: var(--blue);
+  font-size: 9px;
+  font-weight: 600;
+}
+
+.trace-code pre {
+  max-height: 280px;
+  overflow: auto;
+  margin: 7px 0 3px;
+  border: 1px solid #d6dee9;
+  border-radius: 7px;
+  background: #101828;
+  color: #e4e7ec;
+  padding: 11px 12px;
+  font-size: 9px;
+  line-height: 1.55;
+  white-space: pre;
+}
+
 .trace-step.pending .trace-copy {
   opacity: 0.52;
 }
@@ -2416,6 +2491,103 @@ tbody tr:hover {
   gap: 10px;
 }
 
+.agent-config-panel {
+  padding: 18px;
+}
+
+.agent-config-heading,
+.agent-config-actions,
+.value-index-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.agent-config-heading {
+  margin-bottom: 16px;
+}
+
+.agent-config-heading h2,
+.value-index-panel h2 {
+  margin: 0;
+  font-size: 13px;
+}
+
+.agent-config-heading p,
+.value-index-panel p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.setting-field {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  color: #344054;
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.setting-field textarea,
+.setting-field select {
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: white;
+  color: #1d2939;
+  outline: 0;
+  padding: 9px 10px;
+  font: inherit;
+  font-weight: 400;
+}
+
+.setting-field textarea {
+  min-height: 118px;
+  resize: vertical;
+  line-height: 1.6;
+}
+
+.setting-field textarea:focus,
+.setting-field select:focus {
+  border-color: var(--blue);
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--blue), transparent 90%);
+}
+
+.setting-field small,
+.setting-error {
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 400;
+}
+
+.agent-config-actions {
+  align-items: flex-end;
+  margin-top: 14px;
+}
+
+.setting-field.compact {
+  width: 220px;
+}
+
+.value-index-panel {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 14px;
+  padding: 16px;
+}
+
+.value-index-actions {
+  justify-content: flex-end;
+}
+
+.setting-error {
+  display: block;
+  margin-top: 4px;
+  color: var(--danger);
+}
+
 .setting-card {
   display: grid;
   grid-template-columns: 42px minmax(0, 1fr) auto;
@@ -2545,6 +2717,24 @@ tbody tr:hover {
   .ontology-grid,
   .ontology-grid.editing {
     grid-template-columns: 210px minmax(0, 1fr);
+  }
+
+  .value-index-panel {
+    grid-template-columns: 42px minmax(0, 1fr);
+  }
+
+  .value-index-actions {
+    grid-column: 2;
+    justify-content: flex-start;
+  }
+
+  .agent-config-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .setting-field.compact {
+    width: 100%;
   }
 
   .draft-panel {

@@ -2,7 +2,7 @@
 
 InsightFlow 是一个面向阿里云 SelectDB 的本地优先 Data Agent。它在一个桌面
 Web 工作区中组合了本体语义层、受保护的只读 SQL、多轮分析，以及逐轮独立的
-推理与查询追踪。
+分析证据链。
 
 已确认的完整产品实现文档位于
 [`docs/product-spec.md`](docs/product-spec.md).
@@ -41,16 +41,25 @@ AgentLoop
   -> SessionManager / SessionStore
   -> ToolRegistry
       -> OntologySearch
-      -> SelectDBQuery
+      -> PropertyValueSearch
+      -> ExecuteAnalysisPlan
+          -> Query IR
+          -> Doris SQL Compiler
+          -> SelectDB
   -> PermissionGate
   -> AgentReporter
 ```
 
 InsightFlow 不单独配置或调用大模型。它通过 Montane SDK 读取与 CLI 完全相同
 的用户配置、provider、模型、Base URL 和可信 env-file，再把所有理解、规划、
-SQL 生成和结果解释交给同一个 Montane AgentLoop。只要 Montane CLI 本身能够
+结果解释交给同一个 Montane AgentLoop。Montane 只提交引用已发布本体 ID 的
+结构化分析意图；SQL 由确定性 IR 规则引擎编译，Montane 不持有 SQL 执行工具。只要 Montane CLI 本身能够
 正常回答问题，SDK 会自动复用默认用户配置以及全局安装或 `npm link` 的 CLI
 运行环境；InsightFlow 不要求再配置一份 API Key。
+
+发布本体后，系统会在后台为允许值定位的非敏感属性构建按本体版本隔离的
+SQLite 属性值索引。问数时优先本地命中，SelectDB 实时字段探测仅作为小范围兜底。
+「设置」页可以维护带版本号的工作区业务指令和业务时区，核心安全协议不可修改。
 
 SelectDB 或 Montane 运行条件不完整时会明确指出原因，不会生成固定图表、示例
 数据或虚构结论。每轮仍保留完整追踪，未执行的语义与 SQL 步骤会标记为“未执行”。

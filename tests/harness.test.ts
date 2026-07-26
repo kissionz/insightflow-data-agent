@@ -24,6 +24,33 @@ afterEach(() => {
 });
 
 describe("DataAgentHarness", () => {
+  it("reports missing CLI configuration without asking InsightFlow for an API key", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-harness-"));
+    roots.push(root);
+    const repository = new Repository(path.join(root, ".montane/data-agent/ontology.sqlite"));
+    const harness = new DataAgentHarness(
+      root,
+      repository,
+      async () => {
+        throw new Error("query must not run");
+      },
+      async () => {
+        throw new Error(
+          "Montane model configuration is incomplete: OPENAI_API_KEY is unavailable.",
+        );
+      },
+    );
+
+    const status = await harness.runtimeStatus();
+    await harness.close();
+
+    expect(status.configured).toBe(false);
+    expect(status.error).toContain("Montane CLI");
+    expect(status.error).toContain("无需另行配置模型密钥");
+    expect(status.error).not.toContain("API_KEY");
+    repository.close();
+  });
+
   it("answers a greeting through AgentLoop without fabricating an analysis", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-harness-"));
     roots.push(root);
@@ -103,6 +130,123 @@ describe("DataAgentHarness", () => {
     expect(output.responseKind).toBe("configuration_required");
     expect(output.result).toBeUndefined();
     expect(output.answer).toContain("请先配置 SelectDB");
+    repository.close();
+  });
+
+  it("lets Montane submit semantic intent while the IR engine owns SQL", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-harness-"));
+    roots.push(root);
+    const repository = new Repository(path.join(root, ".montane/data-agent/ontology.sqlite"));
+    const ontology = structuredClone(testOntology);
+    const order = ontology.objects[0];
+    order.defaultTimePropertyId = "p_paid_at";
+    order.properties.push(
+      {
+        id: "p_channel",
+        name: "channel_code",
+        label: "销售渠道",
+        description: "订单来源渠道",
+        dataType: "VARCHAR",
+        sourceColumn: "channel_code",
+        sensitive: false,
+        meaning: "CATEGORY",
+        unique: false,
+        valueSearchable: true,
+        visibility: "ANALYTICAL",
+        synonyms: ["渠道"],
+        defaultDisplay: true,
+        exportable: true,
+      },
+      {
+        id: "p_paid_at",
+        name: "paid_at",
+        label: "支付时间",
+        description: "支付完成时间",
+        dataType: "DATETIME",
+        sourceColumn: "paid_at",
+        sensitive: false,
+        meaning: "TIME",
+        unique: false,
+        valueSearchable: false,
+        visibility: "ANALYTICAL",
+        synonyms: [],
+        defaultDisplay: true,
+        exportable: true,
+      },
+    );
+    repository.saveOntology(ontology);
+    repository.upsertScannedTables([
+      {
+        id: "t_orders",
+        catalog: "internal",
+        database: "retail",
+        name: "fact_orders",
+        type: "TABLE",
+        status: "MODELED",
+        columns: [],
+        fingerprint: "fact_orders:v3",
+        scannedAt: "2026-07-26T00:00:00.000Z",
+      },
+    ]);
+    repository.saveDataSource({
+      configured: true,
+      host: "selectdb.test",
+      port: 9030,
+      username: "reader",
+      database: "retail",
+      catalog: "internal",
+      tls: false,
+      passwordStored: true,
+    });
+    repository.replaceIndexedPropertyValues(
+      ontology.version,
+      order.id,
+      "p_channel",
+      [{ displayValue: "ONLINE", frequency: 80 }],
+    );
+    const conversation = createConversation();
+    repository.saveConversation(conversation);
+    const turn: Turn = {
+      id: "turn_ir_harness",
+      conversationId: conversation.id,
+      question: "今年线上渠道销售额",
+      status: "planning",
+      createdAt: new Date().toISOString(),
+      ontologyVersion: ontology.version,
+      trace: [],
+    };
+    const model = new PlanningMontaneModel();
+    const queries: Array<{ sql: string; parameters?: unknown[] }> = [];
+    const harness = new DataAgentHarness(
+      root,
+      repository,
+      async (sql, _maxRows, parameters) => {
+        queries.push({ sql, parameters });
+        return {
+          columns: ["成交金额"],
+          rows: [{ 成交金额: 128000 }],
+          durationMs: 12,
+          truncated: false,
+        };
+      },
+      () => runtimeFor(model),
+    );
+
+    const output = await harness.run(conversation, turn, {
+      onTextDelta() {},
+      onTextEnd() {},
+      onToolStatus() {},
+    });
+
+    expect(model.seenTools).toContain("ExecuteAnalysisPlan");
+    expect(model.seenTools).not.toContain("SelectDBQuery");
+    expect(queries).toHaveLength(1);
+    expect(queries[0].sql).toContain("SUM(t0.`pay_amount`)");
+    expect(queries[0].sql).toContain("t0.`channel_code` = ?");
+    expect(queries[0].parameters?.[0]).toBe("ONLINE");
+    expect(output.responseKind).toBe("analysis");
+    expect(output.result?.rows).toEqual([{ 成交金额: 128000 }]);
+    await harness.close();
     repository.close();
   });
 
@@ -209,6 +353,81 @@ class ScriptedMontaneModel implements ModelClient {
     const finalText = question === "你好"
       ? "你好，我是由 Montane 执行的 InsightFlow Data Agent。"
       : "请先配置 SelectDB，再执行真实数据分析。";
+    options.onTextDelta?.(finalText);
+    return { finalText, stopReason: "end_turn" };
+  }
+}
+
+class PlanningMontaneModel implements ModelClient {
+  readonly capabilities = {
+    contextWindow: 32_000,
+    maxOutputTokens: 2_000,
+    supportsStreaming: true,
+    supportsToolUse: true,
+    supportsImages: false,
+  };
+  private step = 0;
+  seenTools: string[] = [];
+
+  async complete(options: {
+    messages: AgentMessage[];
+    tools: Array<Record<string, unknown>>;
+    onTextDelta?: (delta: string) => void;
+  }): Promise<AgentResponse> {
+    this.step += 1;
+    this.seenTools = options.tools.map((tool) => String(tool.name));
+    if (this.step === 1) {
+      return {
+        toolCalls: [{
+          id: "call_ontology",
+          name: "OntologySearch",
+          args: { query: "今年线上渠道销售额" },
+        }],
+        stopReason: "tool_use",
+      };
+    }
+    if (this.step === 2) {
+      return {
+        toolCalls: [{
+          id: "call_value",
+          name: "PropertyValueSearch",
+          args: {
+            value: "ONLINE",
+            property_ids: ["p_channel"],
+            object_ids: ["o_order"],
+            match_mode: "exact",
+          },
+        }],
+        stopReason: "tool_use",
+      };
+    }
+    if (this.step === 3) {
+      return {
+        toolCalls: [{
+          id: "call_plan",
+          name: "ExecuteAnalysisPlan",
+          args: {
+            root_object_id: "o_order",
+            measure_ids: ["m_gmv"],
+            dimension_property_ids: [],
+            filters: [{
+              property_id: "p_channel",
+              operator: "EQ",
+              business_value: "线上",
+              value: "ONLINE",
+            }],
+            time_range: {
+              expression: "今年",
+              property_id: "p_paid_at",
+            },
+            result_kind: "aggregate",
+            title: "今年线上渠道销售额",
+          },
+        }],
+        stopReason: "tool_use",
+      };
+    }
+    const finalText = "今年线上渠道销售额为 128,000 元。";
     options.onTextDelta?.(finalText);
     return { finalText, stopReason: "end_turn" };
   }

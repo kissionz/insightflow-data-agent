@@ -436,7 +436,7 @@ function TurnCard({ turn }: { turn: Turn }) {
         <span className="trace-summary-copy">
           <strong>
             {terminal
-              ? "推理与查询追踪"
+              ? "分析证据链"
               : activeStep?.label || "正在准备分析"}
           </strong>
           <small>
@@ -462,7 +462,7 @@ function TurnCard({ turn }: { turn: Turn }) {
 
 function TraceTimeline({ trace }: { trace: TraceStep[] }) {
   return (
-    <div className="trace-panel">
+    <div className="trace-panel" aria-label="本轮分析证据链">
       {trace.map((step, index) => (
         <div className={`trace-step ${step.status}`} key={step.id}>
           <div className="trace-axis">
@@ -482,6 +482,28 @@ function TraceTimeline({ trace }: { trace: TraceStep[] }) {
           <div className="trace-copy">
             <strong>{step.label}</strong>
             <p>{step.summary}</p>
+            {step.facts?.length ? (
+              <dl className="trace-facts">
+                {step.facts.map((fact, factIndex) => (
+                  <div key={`${fact.label}-${fact.entityId ?? factIndex}`}>
+                    <dt>{fact.label}</dt>
+                    <dd>
+                      <span>{fact.value}</span>
+                      {fact.source && <small>{fact.source}</small>}
+                    </dd>
+                  </div>
+                ))}
+              </dl>
+            ) : null}
+            {step.detail && <p className="trace-detail">{step.detail}</p>}
+            {step.code && (
+              <details className="trace-code">
+                <summary>
+                  查看{step.code.language === "sql" ? "编译 SQL" : "查询 IR"}
+                </summary>
+                <pre><code>{step.code.content}</code></pre>
+              </details>
+            )}
           </div>
         </div>
       ))}
@@ -635,7 +657,8 @@ function ContextPanel({
 }) {
   const turn = conversation?.turns.at(-1);
   const semantic = turn?.trace.find((step) => step.kind === "semantic_binding");
-  const relation = turn?.trace.find((step) => step.kind === "relation_path");
+  const plan = turn?.trace.find((step) => step.kind === "query_plan");
+  const sql = turn?.trace.find((step) => step.kind === "sql");
   const execution = turn?.trace.find((step) => step.kind === "execution");
   return (
     <aside className="context-panel">
@@ -658,8 +681,13 @@ function ContextPanel({
         />
         <ContextItem
           icon={GitBranch}
-          label="关系路径"
-          value={relation?.summary || "尚未执行"}
+          label="查询方案"
+          value={plan?.summary || "尚未执行"}
+        />
+        <ContextItem
+          icon={Table}
+          label="编译 SQL"
+          value={sql?.summary || "尚未执行"}
         />
         <ContextItem
           icon={Database}
@@ -778,7 +806,15 @@ function ManagementWorkspace({
         />
       )}
       {page === "audit" && <AuditPage conversations={state.conversations} />}
-      {page === "settings" && <SettingsPage runtime={state.runtime} />}
+      {page === "settings" && (
+        <SettingsPage
+          runtime={state.runtime}
+          config={state.agentConfig}
+          valueIndex={state.valueIndex}
+          onState={onState}
+          onError={onError}
+        />
+      )}
     </main>
   );
 }
@@ -872,6 +908,7 @@ function OntologyPage({
               ontology: result.ontology,
               ontologyDraft: undefined,
               tables: result.tables,
+              valueIndex: result.valueIndex,
             }
           : previous,
       );
@@ -2800,9 +2837,153 @@ function AuditPage({ conversations }: { conversations: Conversation[] }) {
   );
 }
 
-function SettingsPage({ runtime }: { runtime: BootstrapPayload["runtime"] }) {
+function SettingsPage({
+  runtime,
+  config,
+  valueIndex,
+  onState,
+  onError,
+}: {
+  runtime: BootstrapPayload["runtime"];
+  config: BootstrapPayload["agentConfig"];
+  valueIndex: BootstrapPayload["valueIndex"];
+  onState: React.Dispatch<React.SetStateAction<BootstrapPayload | null>>;
+  onError: (message: string) => void;
+}) {
+  const [form, setForm] = useState({
+    businessInstructions: config.businessInstructions,
+    timezone: config.timezone,
+  });
+  const [saving, setSaving] = useState(false);
+  const [indexing, setIndexing] = useState(valueIndex.status === "building");
+  useEffect(() => {
+    if (!indexing) return;
+    let cancelled = false;
+    async function poll() {
+      try {
+        const result = await api.valueIndexStatus();
+        if (cancelled) return;
+        onState((previous) =>
+          previous ? { ...previous, valueIndex: result.status } : previous,
+        );
+        if (result.status.status !== "building") setIndexing(false);
+      } catch (reason) {
+        if (cancelled) return;
+        setIndexing(false);
+        onError(asMessage(reason));
+      }
+    }
+    void poll();
+    const timer = window.setInterval(() => void poll(), 1_500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [indexing, onError, onState]);
+  async function save() {
+    setSaving(true);
+    try {
+      const result = await api.saveAgentConfig(form);
+      onState((previous) =>
+        previous ? { ...previous, agentConfig: result.config } : previous,
+      );
+    } catch (reason) {
+      onError(asMessage(reason));
+    } finally {
+      setSaving(false);
+    }
+  }
+  async function rebuildIndex() {
+    setIndexing(true);
+    try {
+      const result = await api.rebuildValueIndex();
+      onState((previous) =>
+        previous ? { ...previous, valueIndex: result.status } : previous,
+      );
+    } catch (reason) {
+      onError(asMessage(reason));
+      setIndexing(false);
+    }
+  }
   return (
     <div className="management-content settings-grid">
+      <section className="panel agent-config-panel">
+        <div className="agent-config-heading">
+          <div>
+            <h2>Montane业务指令</h2>
+            <p>核心安全协议和IR输出格式固定生效，这里只补充当前工作区的业务解释规则。</p>
+          </div>
+          <span className="status-pill">版本 {config.version}</span>
+        </div>
+        <label className="setting-field">
+          <span>业务指令</span>
+          <textarea
+            rows={6}
+            value={form.businessInstructions}
+            placeholder="例如：销售额默认指支付成功订单的实付金额；自然年按北京时间解释。"
+            onChange={(event) =>
+              setForm((current) => ({
+                ...current,
+                businessInstructions: event.target.value,
+              }))
+            }
+          />
+          <small>不能覆盖只读查询、敏感字段和已发布本体约束。</small>
+        </label>
+        <div className="agent-config-actions">
+          <label className="setting-field compact">
+            <span>业务时区</span>
+            <select
+              value={form.timezone}
+              onChange={(event) =>
+                setForm((current) => ({
+                  ...current,
+                  timezone: event.target.value,
+                }))
+              }
+            >
+              <option value="Asia/Shanghai">Asia/Shanghai</option>
+              <option value="UTC">UTC</option>
+              <option value="Asia/Hong_Kong">Asia/Hong_Kong</option>
+              <option value="Asia/Singapore">Asia/Singapore</option>
+            </select>
+          </label>
+          <button
+            className="primary-button"
+            disabled={saving}
+            onClick={() => void save()}
+          >
+            <FloppyDisk size={16} /> {saving ? "保存中…" : "保存业务指令"}
+          </button>
+        </div>
+      </section>
+      <section className="panel value-index-panel">
+        <div className="setting-icon"><MagnifyingGlass size={20} /></div>
+        <div>
+          <h2>属性值索引</h2>
+          <p>
+            本体 v{valueIndex.ontologyVersion} · {valueIndex.indexedProperties} 个属性 ·
+            {" "}{valueIndex.indexedValues.toLocaleString()} 个值
+            {valueIndex.partialProperties
+              ? ` · ${valueIndex.partialProperties} 个高基数字段仅保留高频值`
+              : ""}
+          </p>
+          {valueIndex.error && <small className="setting-error">{valueIndex.error}</small>}
+        </div>
+        <div className="value-index-actions">
+          <span className={`status-pill ${valueIndexStatusTone(valueIndex.status)}`}>
+            {valueIndexStatusLabel(valueIndex.status)}
+          </span>
+          <button
+            className="secondary-button"
+            disabled={indexing}
+            onClick={() => void rebuildIndex()}
+          >
+            <ArrowClockwise size={16} className={indexing ? "rotating" : ""} />
+            {indexing ? "构建中" : "重建索引"}
+          </button>
+        </div>
+      </section>
       <section className="panel setting-card">
         <div className="setting-icon"><Brain size={20} /></div>
         <div>
@@ -2812,7 +2993,7 @@ function SettingsPage({ runtime }: { runtime: BootstrapPayload["runtime"] }) {
               ? `SelectDB 与 Montane 已就绪，当前使用 ${runtime.provider || "已配置 provider"} / ${runtime.model || "默认模型"}。`
               : runtime.modelConfigured
                 ? `Montane 已加载 ${runtime.provider || "模型运行时"}，请确认 SelectDB 连接与本体已发布。`
-                : runtime.modelError || "Montane CLI 模型运行时不可用，请先确认 Montane 本身可以正常回答问题。"}
+                : runtime.modelError || "Montane CLI 模型运行时不可用；InsightFlow 不要求单独配置模型密钥。"}
           </p>
         </div>
         <span className={`status-pill ${runtime.analysisReady ? "success" : "warning"}`}>
@@ -2821,12 +3002,12 @@ function SettingsPage({ runtime }: { runtime: BootstrapPayload["runtime"] }) {
       </section>
       <section className="panel setting-card">
         <div className="setting-icon"><Clock size={20} /></div>
-        <div><h2>查询执行</h2><p>最大超时 180 秒，聚合最多 200 行，明细最多 50 行。</p></div>
+        <div><h2>IR查询执行</h2><p>规则引擎编译参数化Doris SQL，最大超时180秒，聚合最多200行，明细最多50行。</p></div>
         <span className="status-pill success">已启用</span>
       </section>
       <section className="panel setting-card">
         <div className="setting-icon"><SealCheck size={20} /></div>
-        <div><h2>安全策略</h2><p>仅允许 SELECT / WITH SELECT，敏感字段默认脱敏。</p></div>
+        <div><h2>安全策略</h2><p>Montane不持有SQL工具，只能提交本体ID和结构化分析意图。</p></div>
         <span className="status-pill success">强制</span>
       </section>
       <section className="panel setting-card">
@@ -3118,6 +3299,26 @@ function cardinalityLabel(
     MANY_TO_MANY: "N:N",
   };
   return labels[cardinality];
+}
+
+function valueIndexStatusLabel(
+  status: BootstrapPayload["valueIndex"]["status"],
+): string {
+  return {
+    idle: "尚未构建",
+    building: "构建中",
+    ready: "已就绪",
+    partial: "部分可用",
+    failed: "构建失败",
+  }[status];
+}
+
+function valueIndexStatusTone(
+  status: BootstrapPayload["valueIndex"]["status"],
+): string {
+  if (status === "ready") return "success";
+  if (status === "building" || status === "partial") return "warning";
+  return "";
 }
 
 function Toast({ message, onClose }: { message: string; onClose: () => void }) {

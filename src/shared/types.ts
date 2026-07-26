@@ -60,16 +60,47 @@ export type QueryFilterOperator =
   | "IS_NULL"
   | "NOT_NULL";
 
+export interface QuestionLanguageFrame {
+  originalQuestion: string;
+  metricTerms: string[];
+  timeTerms: string[];
+  objectTerms: string[];
+  businessValueTerms: string[];
+  groupingTerms: string[];
+  calculationTerms: string[];
+  presentation: {
+    kind: "AUTO" | "SINGLE_VALUE" | "TABLE" | "TREND" | "RANKING";
+    limit?: number;
+    sortDirection?: "ASC" | "DESC";
+  };
+}
+
+export interface DirectAnalysisFilter {
+  kind?: "DIRECT";
+  propertyId: string;
+  operator: QueryFilterOperator;
+  value?: string | string[];
+  businessValue?: string;
+}
+
+export interface BoundValueAnalysisFilter {
+  kind: "BOUND_VALUE";
+  valueBindingId: string;
+  objectId: string;
+  propertyId: string;
+  operator: QueryFilterOperator;
+  value: string;
+  businessValue: string;
+  evidenceTier: "EXACT_VALUE" | "PREFIX_VALUE";
+  objectPriority: number;
+  propertyPriority: number;
+}
+
 export interface AnalysisIntent {
   rootObjectId?: string;
   measureIds: string[];
   dimensionPropertyIds: string[];
-  filters: Array<{
-    propertyId: string;
-    operator: QueryFilterOperator;
-    value?: string | string[];
-    businessValue?: string;
-  }>;
+  filters: Array<DirectAnalysisFilter | BoundValueAnalysisFilter>;
   timeRange?: {
     expression: string;
     propertyId?: string;
@@ -89,12 +120,13 @@ export interface QueryIR {
   rootObjectId: string;
   measureIds: string[];
   dimensionPropertyIds: string[];
-  filters: Array<{
-    propertyId: string;
-    operator: QueryFilterOperator;
-    value?: string | string[];
-    businessValue?: string;
-  }>;
+  filters: Array<
+    | DirectAnalysisFilter
+    | (BoundValueAnalysisFilter & {
+        strategy: "DIRECT" | "EXISTS";
+        relationIds: string[];
+      })
+  >;
   timeRange?: {
     propertyId: string;
     expression: string;
@@ -288,6 +320,7 @@ export interface OntologyProperty {
   defaultDisplay: boolean;
   exportable: boolean;
   nullDisplay?: string;
+  bindingPriority: number;
 }
 
 export interface OntologyObject {
@@ -308,6 +341,7 @@ export interface OntologyObject {
   exampleQuestions: string[];
   properties: OntologyProperty[];
   synonyms: string[];
+  bindingPriority: number;
 }
 
 export interface OntologyRelation {

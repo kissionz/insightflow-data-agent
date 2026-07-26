@@ -795,6 +795,7 @@ function normalizeOntology(input: OntologySnapshot): OntologySnapshot {
           defaultDisplay: property.defaultDisplay ?? true,
           exportable: property.exportable ?? true,
           nullDisplay: property.nullDisplay,
+          bindingPriority: property.bindingPriority ?? 50,
         };
         return normalized;
       });
@@ -813,6 +814,7 @@ function normalizeOntology(input: OntologySnapshot): OntologySnapshot {
             properties.some((property) => property.id === id),
           ) ?? (idProperty ? [idProperty.id] : []),
         exampleQuestions: object.exampleQuestions ?? [],
+        bindingPriority: object.bindingPriority ?? 50,
         properties,
       };
     }),

@@ -3,6 +3,7 @@ import type {
   Metric,
   OntologyObject,
   OntologyProperty,
+  OntologyRelation,
   OntologySnapshot,
   PhysicalTable,
   QueryFilterOperator,
@@ -45,10 +46,13 @@ export class QueryIrCompiler {
     const dimensions = intent.dimensionPropertyIds.map((id) =>
       requireProperty(propertyOwners, id, "分析维度"),
     );
-    const filters = intent.filters.map((filter) => ({
-      ...filter,
-      binding: requireProperty(propertyOwners, filter.propertyId, "筛选条件"),
-    }));
+    const filters = intent.filters.map((filter) => {
+      const binding = requireProperty(propertyOwners, filter.propertyId, "筛选条件");
+      if (filter.kind === "BOUND_VALUE" && binding.object.id !== filter.objectId) {
+        throw new Error(`属性值绑定 ${filter.valueBindingId} 的对象与属性不一致`);
+      }
+      return { ...filter, binding };
+    });
     const inferredRootId =
       intent.rootObjectId ??
       measures[0]?.objectId ??
@@ -67,11 +71,13 @@ export class QueryIrCompiler {
       root.id,
       ...measures.map((metric) => metric.objectId),
       ...dimensions.map((binding) => binding.object.id),
-      ...filters.map((filter) => filter.binding.object.id),
+      ...filters
+        .filter((filter) => filter.kind !== "BOUND_VALUE")
+        .map((filter) => filter.binding.object.id),
       ...(timeBinding ? [timeBinding.object.id] : []),
     ]);
     const semanticIndex = new SemanticIndex(ontology);
-    const relationIds: string[] = [];
+    const outerRelationIds: string[] = [];
     const orderedObjects: OntologyObject[] = [root];
     for (const objectId of requiredObjectIds) {
       if (objectId === root.id) continue;
@@ -86,7 +92,7 @@ export class QueryIrCompiler {
         if (relation.fanoutRisk === "HIGH" || relation.cardinality === "MANY_TO_MANY") {
           throw new Error(`关系 ${relation.name} 存在高扇出风险，需要先补充聚合规则`);
         }
-        if (!relationIds.includes(relation.id)) relationIds.push(relation.id);
+        if (!outerRelationIds.includes(relation.id)) outerRelationIds.push(relation.id);
         const nextId =
           relation.sourceObjectId === currentId
             ? relation.targetObjectId
@@ -141,7 +147,7 @@ export class QueryIrCompiler {
 
     const from = `${qualifiedTable(rootTable)} AS ${aliases.get(root.id)}`;
     const joins = compileJoins(
-      relationIds,
+      outerRelationIds,
       root.id,
       ontology,
       objectById,
@@ -157,18 +163,45 @@ export class QueryIrCompiler {
         );
       }
     }
+    const filterRelationIds = new Map<string, string[]>();
     for (const filter of filters) {
-      whereParts.push(
-        compileFilter(
-          qualifiedColumn(
-            aliases.get(filter.binding.object.id)!,
-            filter.binding.property,
+      const existingAlias = aliases.get(filter.binding.object.id);
+      if (filter.kind !== "BOUND_VALUE" || existingAlias) {
+        whereParts.push(
+          compileFilter(
+            qualifiedColumn(existingAlias ?? aliases.get(root.id)!, filter.binding.property),
+            filter.operator,
+            filter.value,
+            parameters,
           ),
+        );
+        if (filter.kind === "BOUND_VALUE") {
+          filterRelationIds.set(filter.valueBindingId, []);
+        }
+        continue;
+      }
+      const path = semanticIndex.findRelationPath(root.id, filter.binding.object.id);
+      if (!path.length) {
+        throw new Error(
+          `对象 ${root.label} 与属性值所属对象 ${filter.binding.object.label} 之间没有可用关系`,
+        );
+      }
+      validateRelationPath(path);
+      whereParts.push(
+        compileRelatedValueExists(
+          root,
+          aliases.get(root.id)!,
+          filter.binding.object,
+          filter.binding.property,
           filter.operator,
           filter.value,
+          path,
+          objectById,
+          tableById,
           parameters,
         ),
       );
+      filterRelationIds.set(filter.valueBindingId, path.map((relation) => relation.id));
     }
 
     let resolvedTime: QueryIR["timeRange"];
@@ -221,13 +254,27 @@ export class QueryIrCompiler {
         : dimensions.length
           ? dimensions.map((binding) => binding.property.label).join("、")
           : "整体汇总";
+    const relationIds = [
+      ...new Set([
+        ...outerRelationIds,
+        ...[...filterRelationIds.values()].flat(),
+      ]),
+    ];
     const ir: QueryIR = {
       version: 1,
       ontologyVersion: ontology.version,
       rootObjectId: root.id,
       measureIds: measures.map((metric) => metric.id),
       dimensionPropertyIds: dimensions.map((binding) => binding.property.id),
-      filters: filters.map(({ binding: _binding, ...filter }) => filter),
+      filters: filters.map(({ binding: _binding, ...filter }) =>
+        filter.kind === "BOUND_VALUE"
+          ? {
+              ...filter,
+              strategy: aliases.has(filter.objectId) ? "DIRECT" as const : "EXISTS" as const,
+              relationIds: filterRelationIds.get(filter.valueBindingId) ?? [],
+            }
+          : filter,
+      ),
       timeRange: resolvedTime,
       relationIds,
       grain,
@@ -254,12 +301,14 @@ export class QueryIrCompiler {
         source: "属性ID精确绑定",
         entityId: property.id,
       })),
-      ...filters.map(({ binding, businessValue, value }) => ({
+      ...filters.map(({ binding, businessValue, value, ...filter }) => ({
         label: "筛选条件",
         value: `${binding.property.label} = ${businessValue ?? formatValue(value)}`,
         source:
-          businessValue && businessValue !== formatValue(value)
-            ? `属性值索引映射为 ${formatValue(value)}`
+          filter.kind === "BOUND_VALUE"
+            ? `${filter.evidenceTier === "EXACT_VALUE" ? "属性值精确索引" : "属性值前缀索引"} · ${aliases.has(binding.object.id) ? "直接筛选" : "关联对象 EXISTS"} · 优先级 ${filter.objectPriority}/${filter.propertyPriority}`
+            : businessValue && businessValue !== formatValue(value)
+              ? `属性值索引映射为 ${formatValue(value)}`
             : "属性值绑定",
         entityId: binding.property.id,
       })),
@@ -446,6 +495,98 @@ function compileJoins(
     joined.add(joinedObjectId);
   }
   return clauses;
+}
+
+function validateRelationPath(path: OntologyRelation[]): void {
+  for (const relation of path) {
+    if (relation.fanoutRisk === "HIGH" || relation.cardinality === "MANY_TO_MANY") {
+      throw new Error(`关系 ${relation.name} 存在高扇出风险，需要先补充聚合规则`);
+    }
+    if (!relation.sourcePropertyId || !relation.targetPropertyId) {
+      throw new Error(`关系 ${relation.name} 缺少可编译的关联属性`);
+    }
+  }
+}
+
+function compileRelatedValueExists(
+  root: OntologyObject,
+  rootAlias: string,
+  anchorObject: OntologyObject,
+  anchorProperty: OntologyProperty,
+  operator: QueryFilterOperator,
+  value: string | string[] | undefined,
+  path: OntologyRelation[],
+  objects: Map<string, OntologyObject>,
+  tables: Map<string, PhysicalTable>,
+  parameters: unknown[],
+): string {
+  const aliases = new Map<string, string>([[root.id, rootAlias]]);
+  const innerObjects: OntologyObject[] = [];
+  const joins: string[] = [];
+  let currentObject = root;
+  let correlation = "";
+
+  for (const [index, relation] of path.entries()) {
+    const nextObjectId =
+      relation.sourceObjectId === currentObject.id
+        ? relation.targetObjectId
+        : relation.sourceObjectId;
+    const nextObject = objects.get(nextObjectId);
+    const nextTable = nextObject ? tables.get(nextObject.sourceTableId) : undefined;
+    if (!nextObject || !nextTable) {
+      throw new Error(`关系 ${relation.name} 引用了不可用的业务对象`);
+    }
+    const nextAlias = `vf${index}`;
+    aliases.set(nextObject.id, nextAlias);
+    innerObjects.push(nextObject);
+    const source = objects.get(relation.sourceObjectId);
+    const target = objects.get(relation.targetObjectId);
+    const sourceProperty = source?.properties.find(
+      (property) => property.id === relation.sourcePropertyId,
+    );
+    const targetProperty = target?.properties.find(
+      (property) => property.id === relation.targetPropertyId,
+    );
+    if (!source || !target || !sourceProperty || !targetProperty) {
+      throw new Error(`关系 ${relation.name} 缺少可编译的关联属性`);
+    }
+    const condition = `${qualifiedColumn(aliases.get(source.id)!, sourceProperty)} = ${qualifiedColumn(aliases.get(target.id)!, targetProperty)}`;
+    if (index === 0) {
+      correlation = condition;
+    } else {
+      joins.push(`INNER JOIN ${qualifiedTable(nextTable)} AS ${nextAlias} ON ${condition}`);
+    }
+    currentObject = nextObject;
+  }
+
+  if (currentObject.id !== anchorObject.id || !innerObjects.length) {
+    throw new Error(`无法为 ${anchorObject.label}.${anchorProperty.label} 生成关联筛选路径`);
+  }
+  const firstTable = tables.get(innerObjects[0]!.sourceTableId)!;
+  const anchorAlias = aliases.get(anchorObject.id)!;
+  const predicates = [
+    correlation,
+    ...innerObjects
+      .filter((object) => object.defaultFilter?.trim())
+      .map((object) =>
+        `(${rewriteGovernedExpression(object.defaultFilter!, aliases, new Map(
+          innerObjects.map((item) => [item.id, tables.get(item.sourceTableId)!]),
+        ))})`,
+      ),
+    compileFilter(
+      qualifiedColumn(anchorAlias, anchorProperty),
+      operator,
+      value,
+      parameters,
+    ),
+  ];
+  return [
+    "EXISTS (",
+    `  SELECT 1 FROM ${qualifiedTable(firstTable)} AS ${aliases.get(innerObjects[0]!.id)}`,
+    ...joins.map((join) => `  ${join}`),
+    `  WHERE ${predicates.join("\n    AND ")}`,
+    ")",
+  ].join("\n");
 }
 
 function compileFilter(

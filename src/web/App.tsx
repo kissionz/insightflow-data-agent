@@ -500,7 +500,11 @@ function TraceTimeline({ trace }: { trace: TraceStep[] }) {
             {step.code && (
               <details className="trace-code">
                 <summary>
-                  查看{step.code.language === "sql" ? "编译 SQL" : "查询 IR"}
+                  查看{step.code.language === "sql"
+                    ? "编译 SQL"
+                    : step.kind === "semantic_binding"
+                      ? "候选诊断"
+                      : "查询 IR"}
                 </summary>
                 <pre><code>{step.code.content}</code></pre>
               </details>
@@ -1706,6 +1710,23 @@ function OntologyObjectEditor({
                 ))}
               </select>
             </EditorField>
+            <EditorField label="匹配优先级">
+              <input
+                type="number"
+                min={0}
+                max={100}
+                value={draftObject.bindingPriority}
+                title="仅在同一原文片段、同一语义角色且证据等级相同时参与裁决"
+                onChange={(event) =>
+                  changeObject({
+                    bindingPriority: Math.min(
+                      100,
+                      Math.max(0, Number(event.target.value) || 0),
+                    ),
+                  })
+                }
+              />
+            </EditorField>
             <EditorField label="业务分类">
               <input
                 value={draftObject.category ?? ""}
@@ -1762,6 +1783,7 @@ function OntologyObjectEditor({
                 <span>业务名称</span>
                 <span>物理字段</span>
                 <span>字段含义</span>
+                <span>匹配优先级</span>
                 <span>查询约束</span>
                 <span>可用范围</span>
                 <span>数字规则（类型 / 可加性 / 默认聚合 / 单位）</span>
@@ -1809,6 +1831,22 @@ function OntologyObjectEditor({
                       </option>
                     ))}
                   </select>
+                  <input
+                    type="number"
+                    min={0}
+                    max={100}
+                    aria-label={`${property.label}匹配优先级`}
+                    title="仅在同一原文片段、同一语义角色且证据等级相同时参与裁决"
+                    value={property.bindingPriority}
+                    onChange={(event) =>
+                      changeProperty(property.id, {
+                        bindingPriority: Math.min(
+                          100,
+                          Math.max(0, Number(event.target.value) || 0),
+                        ),
+                      })
+                    }
+                  />
                   <div className="property-constraint-cell">
                     {property.meaning === "ID" && (
                       <span className="identity-chip">当前对象唯一 ID</span>

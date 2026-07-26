@@ -159,6 +159,7 @@ describe("Repository schema reconciliation", () => {
     legacyObject.primaryKey = ["p_order_id"];
     delete legacyObject.objectType;
     delete legacyObject.grainPropertyIds;
+    delete (legacyObject as unknown as Record<string, unknown>).bindingPriority;
     for (const property of legacyObject.properties) {
       property.semanticType = property.id === "p_order_amount" ? "AMOUNT" : "IDENTIFIER";
       property.identityRole = "NONE";
@@ -166,6 +167,7 @@ describe("Repository schema reconciliation", () => {
       delete property.unique;
       delete property.valueSearchable;
       delete property.numericSpec;
+      delete property.bindingPriority;
     }
     repository.saveOntology(legacy as OntologySnapshot);
 
@@ -173,6 +175,8 @@ describe("Repository schema reconciliation", () => {
     expect(migrated.schemaVersion).toBe(2);
     expect(migrated.objects[0].properties[0].meaning).toBe("ID");
     expect(migrated.objects[0].properties[1].meaning).toBe("NUMBER");
+    expect(migrated.objects[0].bindingPriority).toBe(50);
+    expect(migrated.objects[0].properties[0].bindingPriority).toBe(50);
     repository.close();
   });
 });

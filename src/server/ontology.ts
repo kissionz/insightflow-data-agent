@@ -54,6 +54,7 @@ const propertySchema = z.object({
   defaultDisplay: z.boolean(),
   exportable: z.boolean(),
   nullDisplay: z.string().max(120).optional(),
+  bindingPriority: z.number().int().min(0).max(100),
 });
 
 const objectSchema = z.object({
@@ -80,6 +81,7 @@ const objectSchema = z.object({
   exampleQuestions: z.array(z.string().trim().min(1).max(500)).max(50),
   properties: z.array(propertySchema).max(2_000),
   synonyms: z.array(z.string().trim().min(1).max(120)).max(50),
+  bindingPriority: z.number().int().min(0).max(100),
 });
 
 const metricSchema = z.object({
@@ -201,6 +203,7 @@ export function addTablesToDraft(
             detailOrder: index + 1,
             defaultDisplay: true,
             exportable: !column.sensitive,
+            bindingPriority: 50,
           }),
         );
         const primaryCandidate = properties.find(
@@ -233,6 +236,7 @@ export function addTablesToDraft(
           )?.id,
           exampleQuestions: [],
           synonyms: [],
+          bindingPriority: 50,
           properties,
         };
       }),

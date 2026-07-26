@@ -45,4 +45,32 @@ describe("SemanticIndex", () => {
       isolated.search("内部展示码").some((match) => match.id === "p_order_amount"),
     ).toBe(false);
   });
+
+  it("keeps exact-label evidence above a higher-priority synonym", () => {
+    const ontology = structuredClone(testOntology);
+    ontology.objects[1]!.bindingPriority = 1;
+    ontology.objects[0]!.bindingPriority = 100;
+    ontology.objects[0]!.synonyms.push("客户");
+    const isolated = new SemanticIndex(ontology);
+
+    const matches = isolated.search("客户", 8, ["object"]);
+    expect(matches[0]).toMatchObject({
+      id: "o_customer",
+      evidenceTier: "EXACT_LABEL",
+    });
+  });
+
+  it("uses object priority to arbitrate equal evidence tiers", () => {
+    const ontology = structuredClone(testOntology);
+    ontology.objects[1]!.bindingPriority = 10;
+    ontology.objects[2]!.bindingPriority = 90;
+    ontology.objects[2]!.label = "客户";
+    const isolated = new SemanticIndex(ontology);
+
+    const matches = isolated.search("客户", 8, ["object"]);
+    expect(matches.slice(0, 2).map((match) => match.id)).toEqual([
+      "o_store",
+      "o_customer",
+    ]);
+  });
 });

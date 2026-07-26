@@ -184,6 +184,8 @@ export function mergeTraceFacts(
 }
 
 class HarnessTurnReporter implements AgentReporter {
+  private ontologyDiagnostics: unknown;
+
   constructor(
     private readonly update: (
       kind: TraceStep["kind"],
@@ -202,6 +204,10 @@ class HarnessTurnReporter implements AgentReporter {
     status: ToolStatus,
     result?: ToolOutcome,
   ): void {
+    if (call.name === "SubmitQuestionFrame") {
+      this.handleQuestionFrameStatus(status, result);
+      return;
+    }
     if (call.name === "OntologySearch") {
       this.handleOntologyStatus(status, result);
       return;
@@ -212,6 +218,59 @@ class HarnessTurnReporter implements AgentReporter {
     }
     if (call.name === "ExecuteAnalysisPlan") {
       this.handlePlanStatus(call, status, result);
+    }
+  }
+
+  private handleQuestionFrameStatus(
+    status: ToolStatus,
+    result?: ToolOutcome,
+  ): void {
+    if (status === "running") {
+      this.update("understanding", "running", {
+        summary: "正在把原问题切分为可校验的业务语言角色",
+      });
+      return;
+    }
+    if (status === "succeeded") {
+      const data = result?.data as
+        | {
+            frame?: {
+              metricTerms?: string[];
+              timeTerms?: string[];
+              objectTerms?: string[];
+              businessValueTerms?: string[];
+              groupingTerms?: string[];
+              calculationTerms?: string[];
+              presentation?: { kind?: string };
+            };
+          }
+        | undefined;
+      const frame = data?.frame;
+      const facts = [
+        ["指标", frame?.metricTerms],
+        ["时间", frame?.timeTerms],
+        ["业务对象", frame?.objectTerms],
+        ["业务值", frame?.businessValueTerms],
+        ["分组", frame?.groupingTerms],
+        ["计算方式", frame?.calculationTerms],
+        ["展现形式", frame?.presentation?.kind ? [frame.presentation.kind] : []],
+      ] as const;
+      this.update("understanding", "completed", {
+        summary: "问题语言框架已确认，开始进行本体和值证据绑定",
+        facts: facts
+          .filter(([, values]) => values?.length)
+          .map(([label, values]) => ({
+            label,
+            value: values!.join("、"),
+            source: "Montane 结构化理解",
+          })),
+      });
+      return;
+    }
+    if (isFailure(status)) {
+      this.update("understanding", "failed", {
+        summary: result?.content || "问题语言框架提交失败",
+      });
     }
   }
 
@@ -251,6 +310,10 @@ class HarnessTurnReporter implements AgentReporter {
           .filter((label): label is string => Boolean(label))
           .slice(0, 5) ?? [];
       const relations = data?.relations ?? [];
+      this.ontologyDiagnostics = {
+        candidates: matches,
+        relations,
+      };
       this.update(
         "semantic_binding",
         "completed",
@@ -258,20 +321,20 @@ class HarnessTurnReporter implements AgentReporter {
           summary: labels.length
             ? `候选语义：${labels.join("、")}`
             : "未命中可用本体语义",
-          facts: matches.slice(0, 8).map((match) => ({
-            label:
-              match.kind === "metric"
-                ? "候选指标"
-                : match.kind === "property"
-                  ? "候选属性"
-                  : "候选对象",
-            value: match.label || "—",
-            source: `词形“${match.matchedBy || "—"}” · 匹配分 ${Math.round((match.score ?? 0) * 100)}%`,
-            entityId: match.id,
-          })),
           detail: relations.length
             ? `发现 ${relations.length} 条候选对象关系。词形候选不代表属性值归属，具体值仍由全局值索引验证。`
             : "词形候选不代表属性值归属，具体值仍由全局值索引验证。",
+          code: {
+            language: "json",
+            content: JSON.stringify(
+              {
+                kind: "candidate_diagnostics",
+                ontology: this.ontologyDiagnostics,
+              },
+              null,
+              2,
+            ),
+          },
         },
       );
       return;
@@ -309,6 +372,9 @@ class HarnessTurnReporter implements AgentReporter {
               matchType?: string;
               hinted?: boolean;
               rankingReason?: string;
+              selectionStatus?: string;
+              valueBindingId?: string;
+              rejectionReason?: string;
             }>;
           }
         | undefined;
@@ -320,20 +386,38 @@ class HarnessTurnReporter implements AgentReporter {
               .map((match) => `${match.property} = ${match.matchedValue}`)
               .join("、")}`
           : "属性值索引未找到可靠绑定",
-        facts: matches.map((match) => ({
-          label: [match.object, match.property].filter(Boolean).join(" · ") || "属性值",
-          value: match.matchedValue || "—",
-          source: [
-            match.source === "published-index"
-              ? `全局发布值索引${match.matchType === "prefix" ? "前缀" : "精确"}命中`
-              : match.source === "local-cache"
-                ? "查询缓存命中"
-                : "SelectDB 定向验证",
-            match.frequency ? `频次 ${match.frequency}` : "",
-            match.rankingReason || "",
-          ].filter(Boolean).join(" · "),
-          entityId: match.propertyId,
-        })),
+        facts: matches
+          .filter((match) => match.selectionStatus === "selected")
+          .map((match) => ({
+            label:
+              [match.object, match.property].filter(Boolean).join(" · ") ||
+              "属性值",
+            value: match.matchedValue || "—",
+            source: [
+              match.source === "published-index"
+                ? `全局发布值索引${match.matchType === "prefix" ? "前缀" : "精确"}命中`
+                : match.source === "local-cache"
+                  ? "查询缓存命中"
+                  : "SelectDB 定向验证",
+              match.frequency ? `频次 ${match.frequency}` : "",
+              match.rankingReason || "",
+            ]
+              .filter(Boolean)
+              .join(" · "),
+            entityId: match.propertyId,
+          })),
+        code: {
+          language: "json",
+          content: JSON.stringify(
+            {
+              kind: "candidate_diagnostics",
+              ontology: this.ontologyDiagnostics,
+              valueCandidates: matches,
+            },
+            null,
+            2,
+          ),
+        },
       });
       return;
     }

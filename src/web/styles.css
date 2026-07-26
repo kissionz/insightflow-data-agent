@@ -2006,13 +2006,13 @@ tbody tr:hover {
 }
 
 .property-edit-grid {
-  min-width: 1870px;
+  min-width: 1980px;
 }
 
 .property-edit-row {
   display: grid;
   grid-template-columns:
-    150px 130px 122px 205px 125px 410px 210px 165px 92px 92px
+    150px 130px 122px 92px 205px 125px 410px 210px 165px 92px 92px
     72px;
   gap: 8px;
   align-items: center;

@@ -19,6 +19,7 @@ export const testOntology: OntologySnapshot = {
       defaultTimePropertyId: undefined,
       exampleQuestions: [],
       synonyms: ["交易", "销售订单"],
+      bindingPriority: 50,
       properties: [
         property("p_order_id", "order_id", "订单ID", "BIGINT", "ID"),
         property("p_order_amount", "pay_amount", "实付金额", "DECIMAL", "NUMBER"),
@@ -44,6 +45,7 @@ export const testOntology: OntologySnapshot = {
       grain: "一行代表一个客户",
       exampleQuestions: [],
       synonyms: ["会员"],
+      bindingPriority: 50,
       properties: [
         property("p_customer_id", "customer_id", "客户ID", "BIGINT", "ID"),
         property(
@@ -67,6 +69,7 @@ export const testOntology: OntologySnapshot = {
       grain: "一行代表一个门店",
       exampleQuestions: [],
       synonyms: ["店铺"],
+      bindingPriority: 50,
       properties: [
         property("p_store_id", "store_id", "门店ID", "BIGINT", "ID"),
       ],
@@ -168,5 +171,6 @@ function property(
     detailOrder: 1,
     defaultDisplay: true,
     exportable: true,
+    bindingPriority: 50,
   };
 }

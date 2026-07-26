@@ -202,7 +202,7 @@ describe("DataAgentHarness", () => {
       ontology.version,
       order.id,
       "p_channel",
-      [{ displayValue: "ONLINE", frequency: 80 }],
+      [{ displayValue: "线上渠道", frequency: 80 }],
     );
     const conversation = createConversation();
     repository.saveConversation(conversation);
@@ -239,11 +239,12 @@ describe("DataAgentHarness", () => {
     });
 
     expect(model.seenTools).toContain("ExecuteAnalysisPlan");
+    expect(model.seenTools).toContain("SubmitQuestionFrame");
     expect(model.seenTools).not.toContain("SelectDBQuery");
     expect(queries).toHaveLength(1);
     expect(queries[0].sql).toContain("SUM(t0.`pay_amount`)");
     expect(queries[0].sql).toContain("t0.`channel_code` = ?");
-    expect(queries[0].parameters?.[0]).toBe("ONLINE");
+    expect(queries[0].parameters?.[0]).toBe("线上渠道");
     expect(output.responseKind).toBe("analysis");
     expect(output.result?.rows).toEqual([{ 成交金额: 128000 }]);
     await harness.close();
@@ -340,6 +341,8 @@ describe("DataAgentHarness", () => {
     );
     const ontology = structuredClone(testOntology);
     ontology.version = 2;
+    ontology.objects[0]!.bindingPriority = 20;
+    ontology.objects[2]!.bindingPriority = 90;
     ontology.objects[0]!.properties.push({
       id: "p_channel_nature",
       name: "channel_nature",
@@ -355,6 +358,7 @@ describe("DataAgentHarness", () => {
       synonyms: ["渠道"],
       defaultDisplay: true,
       exportable: true,
+      bindingPriority: 100,
     });
     ontology.objects[2]!.properties.push({
       id: "p_org_unit",
@@ -371,6 +375,7 @@ describe("DataAgentHarness", () => {
       synonyms: ["组织"],
       defaultDisplay: true,
       exportable: true,
+      bindingPriority: 80,
     });
     repository.saveOntology(ontology);
     repository.upsertScannedTables([
@@ -413,6 +418,12 @@ describe("DataAgentHarness", () => {
       "p_org_unit",
       [{ displayValue: "线上渠道", frequency: 128 }],
     );
+    repository.replaceIndexedPropertyValues(
+      ontology.version,
+      "o_order",
+      "p_channel_nature",
+      [{ displayValue: "线上渠道", frequency: 999 }],
+    );
     const harness = new DataAgentHarness(
       root,
       repository,
@@ -434,7 +445,10 @@ describe("DataAgentHarness", () => {
 
     expect(outcome.ok).toBe(true);
     expect(outcome.content).toContain('"property":"组织单元"');
-    expect(outcome.content).not.toContain('"property":"渠道性质"');
+    expect(outcome.content).toContain('"property":"渠道性质"');
+    expect(outcome.content).toContain('"selectionStatus":"selected"');
+    expect(outcome.content).toContain('"selectionStatus":"rejected"');
+    expect(outcome.content).toContain('"valueBindingId":"value_binding_');
     expect(outcome.content).toContain("纠正了词形候选范围");
     await harness.close();
     repository.close();
@@ -487,9 +501,18 @@ class PlanningMontaneModel implements ModelClient {
     if (this.step === 1) {
       return {
         toolCalls: [{
-          id: "call_ontology",
-          name: "OntologySearch",
-          args: { query: "今年线上渠道销售额" },
+          id: "call_frame",
+          name: "SubmitQuestionFrame",
+          args: {
+            original_question: "今年线上渠道销售额",
+            metric_terms: ["销售额"],
+            time_terms: ["今年"],
+            object_terms: [],
+            business_value_terms: ["线上渠道"],
+            grouping_terms: [],
+            calculation_terms: ["求和"],
+            presentation: { kind: "SINGLE_VALUE" },
+          },
         }],
         stopReason: "tool_use",
       };
@@ -497,10 +520,20 @@ class PlanningMontaneModel implements ModelClient {
     if (this.step === 2) {
       return {
         toolCalls: [{
+          id: "call_ontology",
+          name: "OntologySearch",
+          args: { query: "今年线上渠道销售额" },
+        }],
+        stopReason: "tool_use",
+      };
+    }
+    if (this.step === 3) {
+      return {
+        toolCalls: [{
           id: "call_value",
           name: "PropertyValueSearch",
           args: {
-            value: "ONLINE",
+            value: "线上渠道",
             property_ids: ["p_channel"],
             object_ids: ["o_order"],
             match_mode: "exact",
@@ -509,7 +542,12 @@ class PlanningMontaneModel implements ModelClient {
         stopReason: "tool_use",
       };
     }
-    if (this.step === 3) {
+    if (this.step === 4) {
+      const serialized = JSON.stringify(options.messages);
+      const bindingId = serialized.match(
+        /"valueBindingId"\s*:\s*"([^"]+)"/,
+      )?.[1];
+      if (!bindingId) throw new Error("PropertyValueSearch 未返回绑定句柄");
       return {
         toolCalls: [{
           id: "call_plan",
@@ -519,10 +557,8 @@ class PlanningMontaneModel implements ModelClient {
             measure_ids: ["m_gmv"],
             dimension_property_ids: [],
             filters: [{
-              property_id: "p_channel",
+              value_binding_id: bindingId,
               operator: "EQ",
-              business_value: "线上",
-              value: "ONLINE",
             }],
             time_range: {
               expression: "今年",

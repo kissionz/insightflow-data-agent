@@ -144,6 +144,64 @@ describe("QueryIrCompiler", () => {
       ),
     ).toThrow("是属性，不是指标");
   });
+
+  it("compiles an indexed value on a related object as a correlated EXISTS", () => {
+    const ontology = structuredClone(testOntology);
+    ontology.objects[2]!.properties.push({
+      id: "p_store_name",
+      name: "store_name",
+      label: "组织名称",
+      description: "组织单元名称",
+      dataType: "VARCHAR",
+      sourceColumn: "store_name",
+      sensitive: false,
+      meaning: "NAME",
+      unique: false,
+      valueSearchable: true,
+      visibility: "ANALYTICAL",
+      synonyms: ["组织单元"],
+      defaultDisplay: true,
+      exportable: true,
+      bindingPriority: 80,
+    });
+    const compiler = new QueryIrCompiler();
+    const compiled = compiler.compile(
+      {
+        rootObjectId: "o_order",
+        measureIds: ["m_gmv"],
+        dimensionPropertyIds: [],
+        filters: [{
+          kind: "BOUND_VALUE",
+          valueBindingId: "value_binding_online",
+          objectId: "o_store",
+          propertyId: "p_store_name",
+          operator: "EQ",
+          value: "线上渠道",
+          businessValue: "线上渠道",
+          evidenceTier: "EXACT_VALUE",
+          objectPriority: 90,
+          propertyPriority: 80,
+        }],
+        resultKind: "aggregate",
+        title: "线上渠道销售额",
+      },
+      ontology,
+      [ordersTable(), storeTable()],
+    );
+
+    expect(compiled.sql).toContain("WHERE EXISTS (");
+    expect(compiled.sql).toContain(
+      "t0.`store_id` = vf0.`store_id`",
+    );
+    expect(compiled.sql).toContain("vf0.`store_name` = ?");
+    expect(compiled.sql).not.toContain("t0.`store_id` = ?");
+    expect(compiled.parameters).toEqual(["线上渠道"]);
+    expect(compiled.ir.filters[0]).toMatchObject({
+      kind: "BOUND_VALUE",
+      strategy: "EXISTS",
+      relationIds: ["r_order_store"],
+    });
+  });
 });
 
 function ordersTable(): PhysicalTable {
@@ -156,6 +214,20 @@ function ordersTable(): PhysicalTable {
     status: "MODELED",
     columns: [],
     fingerprint: "fact_orders:v3",
+    scannedAt: "2026-07-26T00:00:00.000Z",
+  };
+}
+
+function storeTable(): PhysicalTable {
+  return {
+    id: "t_stores",
+    catalog: "internal",
+    database: "retail",
+    name: "dim_stores",
+    type: "TABLE",
+    status: "MODELED",
+    columns: [],
+    fingerprint: "dim_stores:v3",
     scannedAt: "2026-07-26T00:00:00.000Z",
   };
 }

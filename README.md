@@ -40,6 +40,7 @@ Unicode 路径和密码；macOS 使用系统钥匙串。也可以通过 `SELECTD
 AgentLoop
   -> SessionManager / SessionStore
   -> ToolRegistry
+      -> SubmitQuestionFrame
       -> OntologySearch
       -> PropertyValueSearch
       -> ExecuteAnalysisPlan
@@ -58,8 +59,10 @@ InsightFlow 不单独配置或调用大模型。它通过 Montane SDK 读取与 
 运行环境；InsightFlow 不要求再配置一份 API Key。
 
 发布本体后，系统会在后台为允许值定位的非敏感属性构建按本体版本隔离的
-SQLite 属性值索引。问数时先在全部可检索属性中寻找精确值，Ontology 词形候选
-只参与排序，SelectDB 实时字段探测仅作为小范围兜底。「设置」页可检查每个对象
+SQLite 属性值索引。问数时先形成时间、指标、完整业务值等强类型语言框架，再在
+全部可检索属性中寻找精确值。唯一命中会生成本轮不可改写的值绑定句柄；关联对象
+筛选由 IR 编译为相关 `EXISTS`，不会把名称值错误写到事实表外键上。Ontology
+词形候选只进入候选诊断，SelectDB 实时字段探测仅作为小范围兜底。「设置」页可检查每个对象
 属性的索引状态、物理字段、值数量、覆盖频次和高频样例值。
 「设置」页可以维护带版本号的工作区业务指令和业务时区，核心安全协议不可修改。
 

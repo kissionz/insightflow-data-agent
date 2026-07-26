@@ -13,6 +13,9 @@ export interface SemanticMatch {
   label: string;
   score: number;
   matchedBy: string;
+  evidenceTier: "EXACT_LABEL" | "SYNONYM" | "NGRAM";
+  objectPriority: number;
+  propertyPriority: number;
 }
 
 export class SemanticIndex {
@@ -25,24 +28,34 @@ export class SemanticIndex {
     snapshot.relations.forEach((relation) => this.indexRelation(relation));
   }
 
-  search(query: string, limit = 8): SemanticMatch[] {
+  search(
+    query: string,
+    limit = 8,
+    allowedKinds?: SemanticMatch["kind"][],
+  ): SemanticMatch[] {
     const normalized = normalize(query);
     const tokens = new Set([normalized, ...tokenize(normalized), ...chineseNgrams(normalized)]);
     const scores = new Map<string, SemanticMatch>();
 
     for (const token of tokens) {
       for (const match of this.terms.get(token) ?? []) {
+        if (allowedKinds && !allowedKinds.includes(match.kind)) continue;
         const key = `${match.kind}:${match.id}`;
         const existing = scores.get(key);
         const exactBoost = token === normalized ? 0.4 : 0;
-        const next = { ...match, score: Math.min(1, match.score + exactBoost) };
-        if (!existing || next.score > existing.score) {
+        const exactTerm = normalize(match.matchedBy) === normalized;
+        const next = {
+          ...match,
+          evidenceTier: exactTerm ? match.evidenceTier : "NGRAM" as const,
+          score: Math.min(1, match.score + exactBoost),
+        };
+        if (!existing || compareSemanticMatches(next, existing) < 0) {
           scores.set(key, next);
         }
       }
     }
 
-    return [...scores.values()].sort((a, b) => b.score - a.score).slice(0, limit);
+    return [...scores.values()].sort(compareSemanticMatches).slice(0, limit);
   }
 
   findRelationPath(sourceObjectId: string, targetObjectId: string): OntologyRelation[] {
@@ -94,7 +107,7 @@ export class SemanticIndex {
       metric.name,
       metric.label,
       ...metric.synonyms,
-    ]);
+    ], metric.objectId);
   }
 
   private addTerms(
@@ -105,6 +118,20 @@ export class SemanticIndex {
     objectId?: string,
     propertyId?: string,
   ): void {
+    const object = objectId
+      ? this.snapshot.objects.find((candidate) => candidate.id === objectId)
+      : kind === "object"
+        ? this.snapshot.objects.find((candidate) => candidate.id === id)
+        : kind === "metric"
+          ? this.snapshot.objects.find(
+              (candidate) =>
+                candidate.id ===
+                this.snapshot.metrics.find((metric) => metric.id === id)?.objectId,
+            )
+          : undefined;
+    const property = propertyId
+      ? object?.properties.find((candidate) => candidate.id === propertyId)
+      : undefined;
     for (const [index, rawTerm] of terms.entries()) {
       const term = normalize(rawTerm);
       if (!term) continue;
@@ -116,6 +143,9 @@ export class SemanticIndex {
         label,
         score: index < 2 ? 0.96 : 0.84,
         matchedBy: rawTerm,
+        evidenceTier: index < 2 ? "EXACT_LABEL" : "SYNONYM",
+        objectPriority: object?.bindingPriority ?? 50,
+        propertyPriority: property?.bindingPriority ?? 50,
       };
       for (const token of new Set([term, ...tokenize(term), ...chineseNgrams(term)])) {
         const matches = this.terms.get(token) ?? [];
@@ -135,6 +165,20 @@ export class SemanticIndex {
     target.push({ objectId: relation.sourceObjectId, relationId: relation.id });
     this.adjacency.set(relation.targetObjectId, target);
   }
+}
+
+function compareSemanticMatches(
+  left: SemanticMatch,
+  right: SemanticMatch,
+): number {
+  const tier = { EXACT_LABEL: 3, SYNONYM: 2, NGRAM: 1 };
+  return (
+    tier[right.evidenceTier] - tier[left.evidenceTier] ||
+    right.objectPriority - left.objectPriority ||
+    right.propertyPriority - left.propertyPriority ||
+    right.score - left.score ||
+    left.id.localeCompare(right.id)
+  );
 }
 
 function normalize(value: string): string {

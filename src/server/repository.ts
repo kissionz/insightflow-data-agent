@@ -3,6 +3,9 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type {
   Conversation,
+  NumericPropertySpec,
+  OntologyObjectType,
+  OntologyProperty,
   OntologySnapshot,
   PhysicalTable,
   SafeDataSourceConfig,
@@ -11,6 +14,15 @@ import type {
 
 interface JsonRow {
   payload: string;
+}
+
+export interface CachedPropertyValue {
+  ontologyVersion: number;
+  objectId: string;
+  propertyId: string;
+  normalizedValue: string;
+  displayValue: string;
+  updatedAt: string;
 }
 
 export class Repository {
@@ -98,6 +110,63 @@ export class Repository {
          ON CONFLICT(version) DO UPDATE SET status = excluded.status, payload = excluded.payload`,
       )
       .run(snapshot.version, snapshot.status, new Date().toISOString(), JSON.stringify(snapshot));
+  }
+
+  findCachedPropertyValues(
+    ontologyVersion: number,
+    normalizedValue: string,
+    propertyIds: string[],
+  ): CachedPropertyValue[] {
+    if (!propertyIds.length) return [];
+    const placeholders = propertyIds.map(() => "?").join(", ");
+    return this.db
+      .prepare(
+        `SELECT ontology_version, object_id, property_id, normalized_value,
+                display_value, updated_at
+           FROM property_value_cache
+          WHERE ontology_version = ?
+            AND normalized_value = ?
+            AND property_id IN (${placeholders})
+          ORDER BY updated_at DESC`,
+      )
+      .all(ontologyVersion, normalizedValue, ...propertyIds)
+      .map((row) => {
+        const value = row as {
+          ontology_version: number;
+          object_id: string;
+          property_id: string;
+          normalized_value: string;
+          display_value: string;
+          updated_at: string;
+        };
+        return {
+          ontologyVersion: value.ontology_version,
+          objectId: value.object_id,
+          propertyId: value.property_id,
+          normalizedValue: value.normalized_value,
+          displayValue: value.display_value,
+          updatedAt: value.updated_at,
+        };
+      });
+  }
+
+  cachePropertyValue(value: CachedPropertyValue): void {
+    this.db
+      .prepare(
+        `INSERT INTO property_value_cache
+           (ontology_version, object_id, property_id, normalized_value, display_value, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(ontology_version, property_id, normalized_value)
+         DO UPDATE SET display_value = excluded.display_value, updated_at = excluded.updated_at`,
+      )
+      .run(
+        value.ontologyVersion,
+        value.objectId,
+        value.propertyId,
+        value.normalizedValue,
+        value.displayValue,
+        value.updatedAt,
+      );
   }
 
   deleteDraftOntology(): void {
@@ -204,6 +273,17 @@ export class Repository {
         created_at TEXT NOT NULL,
         payload TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS property_value_cache (
+        ontology_version INTEGER NOT NULL,
+        object_id TEXT NOT NULL,
+        property_id TEXT NOT NULL,
+        normalized_value TEXT NOT NULL,
+        display_value TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (ontology_version, property_id, normalized_value)
+      );
+      CREATE INDEX IF NOT EXISTS property_value_cache_lookup
+        ON property_value_cache (ontology_version, normalized_value);
     `);
   }
 
@@ -270,6 +350,7 @@ export class Repository {
 
 function emptyOntology(): OntologySnapshot {
   return {
+    schemaVersion: 2,
     version: 0,
     status: "PUBLISHED",
     publishedAt: new Date().toISOString(),
@@ -279,37 +360,128 @@ function emptyOntology(): OntologySnapshot {
   };
 }
 
-function normalizeOntology(snapshot: OntologySnapshot): OntologySnapshot {
+type LegacySemanticType =
+  | "IDENTIFIER"
+  | "DIMENSION"
+  | "ENUM"
+  | "TIME"
+  | "GEOGRAPHY"
+  | "AMOUNT"
+  | "QUANTITY"
+  | "BOOLEAN";
+type LegacyIdentityRole = "NONE" | "OBJECT_IDENTIFIER" | "BUSINESS_KEY";
+type LegacyProperty = Partial<OntologyProperty> & {
+  id: string;
+  name: string;
+  label: string;
+  dataType: string;
+  sourceColumn: string;
+  sensitive: boolean;
+  semanticType?: LegacySemanticType;
+  identityRole?: LegacyIdentityRole;
+};
+type LegacySnapshot = Omit<OntologySnapshot, "schemaVersion" | "objects"> & {
+  schemaVersion?: number;
+  objects: Array<
+    Omit<OntologySnapshot["objects"][number], "objectType" | "grainPropertyIds" | "properties"> & {
+      objectType?: OntologyObjectType;
+      grainPropertyIds?: string[];
+      primaryKey?: string[];
+      properties: LegacyProperty[];
+    }
+  >;
+};
+
+function normalizeOntology(input: OntologySnapshot): OntologySnapshot {
+  const snapshot = input as unknown as LegacySnapshot;
+  const outgoingRelationPropertyIds = new Set(
+    snapshot.relations
+      .map((relation) => relation.sourcePropertyId)
+      .filter((id): id is string => Boolean(id)),
+  );
+  const targetRelationPropertyIds = new Set(
+    snapshot.relations
+      .map((relation) => relation.targetPropertyId)
+      .filter((id): id is string => Boolean(id)),
+  );
   return {
     ...snapshot,
+    schemaVersion: 2,
     baseVersion:
       snapshot.baseVersion ??
       (snapshot.status === "DRAFT" ? Math.max(0, snapshot.version - 1) : undefined),
     objects: snapshot.objects.map((object) => {
-      const legacyIdentifiers = new Set(object.primaryKey ?? []);
-      const currentObject = { ...object };
-      delete currentObject.primaryKey;
-      return {
-        ...currentObject,
-        grain: object.grain ?? "",
-        exampleQuestions: object.exampleQuestions ?? [],
-        properties: object.properties.map((property, index) => ({
-          ...property,
+      const legacyIdentifierIds = object.properties
+        .filter(
+          (property) =>
+            property.identityRole === "OBJECT_IDENTIFIER" ||
+            object.primaryKey?.includes(property.id),
+        )
+        .map((property) => property.id);
+      const requiresIdentityReview = legacyIdentifierIds.length > 1;
+      const chosenLegacyIdentifier = chooseLegacyIdentifier(
+        object.name,
+        object.properties,
+        legacyIdentifierIds,
+      );
+      const objectType = object.objectType ?? inferObjectType(object.name);
+      const properties = object.properties.map((legacyProperty, index) => {
+        const property = { ...legacyProperty };
+        const meaning =
+          property.meaning ??
+          migratePropertyMeaning(
+            property,
+            property.id === chosenLegacyIdentifier,
+            outgoingRelationPropertyIds.has(property.id),
+            targetRelationPropertyIds.has(property.id),
+          );
+        const normalized: OntologyProperty = {
+          id: property.id,
+          name: property.name,
+          label: property.label,
           description: property.description ?? "",
-          semanticType:
-            property.semanticType ??
-            inferSemanticType(property.name, property.dataType),
-          identityRole:
-            property.identityRole ??
-            (legacyIdentifiers.has(property.id)
-              ? "OBJECT_IDENTIFIER"
-              : "NONE"),
+          dataType: property.dataType,
+          sourceColumn: property.sourceColumn,
+          sensitive: property.sensitive,
+          meaning,
+          unique:
+            meaning === "ID" ||
+            property.unique === true ||
+            property.identityRole === "BUSINESS_KEY",
+          valueSearchable:
+            !property.sensitive &&
+            (property.visibility ?? "ANALYTICAL") === "ANALYTICAL" &&
+            (property.valueSearchable ?? defaultValueSearchable(meaning)),
+          numericSpec:
+            meaning === "NUMBER"
+              ? property.numericSpec ?? inferNumericSpec(property.name, property.semanticType)
+              : undefined,
           visibility: property.visibility ?? "ANALYTICAL",
           synonyms: property.synonyms ?? [],
+          format: property.format,
           detailOrder: property.detailOrder ?? index + 1,
           defaultDisplay: property.defaultDisplay ?? true,
           exportable: property.exportable ?? true,
-        })),
+          nullDisplay: property.nullDisplay,
+        };
+        return normalized;
+      });
+      const idProperty = properties.find((property) => property.meaning === "ID");
+      const { primaryKey: _legacyPrimaryKey, properties: _legacyProperties, ...currentObject } =
+        object;
+      return {
+        ...currentObject,
+        objectType,
+        identityReviewRequired:
+          object.identityReviewRequired ??
+          (requiresIdentityReview ? true : undefined),
+        grain: object.grain ?? "",
+        grainPropertyIds:
+          object.grainPropertyIds?.filter((id) =>
+            properties.some((property) => property.id === id),
+          ) ?? (idProperty ? [idProperty.id] : []),
+        exampleQuestions: object.exampleQuestions ?? [],
+        properties,
       };
     }),
     relations: snapshot.relations.map((relation) => ({
@@ -325,15 +497,111 @@ function normalizeOntology(snapshot: OntologySnapshot): OntologySnapshot {
   };
 }
 
-function inferSemanticType(
-  name: string,
-  dataType: string,
-): OntologySnapshot["objects"][number]["properties"][number]["semanticType"] {
+function chooseLegacyIdentifier(
+  objectName: string,
+  properties: LegacyProperty[],
+  ids: string[],
+): string | undefined {
+  if (ids.length <= 1) return ids[0];
+  const normalizedObject = objectName.replace(/^(dim|fact|agg)_/, "").replace(/s$/, "");
+  return (
+    properties.find(
+      (property) =>
+        ids.includes(property.id) &&
+        (property.name === "id" || property.name === `${normalizedObject}_id`),
+    )?.id ?? ids[0]
+  );
+}
+
+function migratePropertyMeaning(
+  property: LegacyProperty,
+  isObjectId: boolean,
+  isRelationSource: boolean,
+  isRelationTarget: boolean,
+): OntologyProperty["meaning"] {
+  if (isObjectId || (isRelationTarget && property.identityRole === "OBJECT_IDENTIFIER")) {
+    return "ID";
+  }
+  if (isRelationSource) return "ENTITY_REFERENCE";
+  if (property.identityRole === "BUSINESS_KEY") return "CODE";
+  const normalized = property.name.toLowerCase();
+  switch (property.semanticType) {
+    case "ENUM":
+      return "CATEGORY";
+    case "TIME":
+      return "TIME";
+    case "GEOGRAPHY":
+      return "GEOGRAPHY";
+    case "AMOUNT":
+    case "QUANTITY":
+      return "NUMBER";
+    case "BOOLEAN":
+      return "BOOLEAN";
+    case "IDENTIFIER":
+      return "CODE";
+    default:
+      if (/(name|title|label|名称|姓名)/i.test(normalized)) return "NAME";
+      if (/(status|type|category|level|class|状态|类型|等级|分类)/i.test(normalized)) {
+        return "CATEGORY";
+      }
+      if (isNumericDataType(property.dataType)) return "NUMBER";
+      return "TEXT";
+  }
+}
+
+function inferObjectType(name: string): OntologyObjectType {
   const normalized = name.toLowerCase();
-  if (/(^id$|_id$|code$|number$)/.test(normalized)) return "IDENTIFIER";
-  if (/(date|time|_at$)/.test(normalized) || /(date|time)/i.test(dataType)) return "TIME";
-  if (/(amount|price|fee|cost|revenue)/.test(normalized)) return "AMOUNT";
-  if (/(count|quantity|qty|num)/.test(normalized)) return "QUANTITY";
-  if (/^(is_|has_)/.test(normalized) || /bool/i.test(dataType)) return "BOOLEAN";
-  return "DIMENSION";
+  if (/(snapshot|快照|balance)/.test(normalized)) return "SNAPSHOT";
+  if (/(^|_)(agg|summary|stat|report)(_|$)|汇总|统计/.test(normalized)) {
+    return "AGGREGATE";
+  }
+  if (/(^|_)(bridge|mapping|relation|link)(_|$)|关联/.test(normalized)) {
+    return "RELATIONSHIP";
+  }
+  if (/(^|_)(fact|event|order|payment|transaction|detail|log)(_|$)|订单|支付|交易|明细|事件/.test(normalized)) {
+    return "EVENT";
+  }
+  return "ENTITY";
+}
+
+function inferNumericSpec(
+  name: string,
+  legacyType?: LegacySemanticType,
+): NumericPropertySpec {
+  const normalized = name.toLowerCase();
+  if (
+    legacyType === "AMOUNT" ||
+    /(amount|price|fee|cost|revenue|income|gmv|金额|价格|费用|收入)/.test(normalized)
+  ) {
+    return {
+      kind: "CURRENCY",
+      currency: "CNY",
+      defaultAggregation: /(price|单价)/.test(normalized) ? "AVG" : "SUM",
+      aggregationBehavior: /(price|单价)/.test(normalized)
+        ? "NON_ADDITIVE"
+        : "ADDITIVE",
+    };
+  }
+  if (/(rate|ratio|percent|pct|score_rate|率|比例|占比)/.test(normalized)) {
+    return {
+      kind: "RATIO",
+      unit: "%",
+      defaultAggregation: "AVG",
+      aggregationBehavior: "NON_ADDITIVE",
+    };
+  }
+  return {
+    kind: "GENERAL",
+    defaultAggregation: legacyType === "QUANTITY" ? "SUM" : "NONE",
+    aggregationBehavior:
+      legacyType === "QUANTITY" ? "ADDITIVE" : "NON_ADDITIVE",
+  };
+}
+
+function defaultValueSearchable(meaning: OntologyProperty["meaning"]): boolean {
+  return ["CODE", "NAME", "CATEGORY", "BOOLEAN", "GEOGRAPHY"].includes(meaning);
+}
+
+function isNumericDataType(dataType: string): boolean {
+  return /int|decimal|numeric|float|double|real/i.test(dataType);
 }

@@ -1,6 +1,7 @@
 import type { OntologySnapshot } from "../src/shared/types.js";
 
 export const testOntology: OntologySnapshot = {
+  schemaVersion: 2,
   version: 1,
   status: "PUBLISHED",
   publishedAt: "2026-07-25T00:00:00.000Z",
@@ -12,21 +13,23 @@ export const testOntology: OntologySnapshot = {
       description: "订单业务对象",
       sourceTableId: "t_orders",
       status: "PUBLISHED",
+      objectType: "EVENT",
+      grainPropertyIds: ["p_order_id"],
       grain: "一行代表一个订单",
       defaultTimePropertyId: undefined,
       exampleQuestions: [],
       synonyms: ["交易", "销售订单"],
       properties: [
+        property("p_order_id", "order_id", "订单ID", "BIGINT", "ID"),
+        property("p_order_amount", "pay_amount", "实付金额", "DECIMAL", "NUMBER"),
+        property("p_store_id", "store_id", "门店", "BIGINT", "ENTITY_REFERENCE"),
         property(
-          "p_order_id",
-          "order_id",
-          "订单编号",
+          "p_customer_id",
+          "customer_id",
+          "客户",
           "BIGINT",
-          "OBJECT_IDENTIFIER",
+          "ENTITY_REFERENCE",
         ),
-        property("p_order_amount", "pay_amount", "实付金额", "DECIMAL"),
-        property("p_store_id", "store_id", "门店编号", "BIGINT"),
-        property("p_customer_id", "customer_id", "客户编号", "BIGINT"),
       ],
     },
     {
@@ -36,18 +39,20 @@ export const testOntology: OntologySnapshot = {
       description: "客户业务对象",
       sourceTableId: "t_customers",
       status: "PUBLISHED",
+      objectType: "ENTITY",
+      grainPropertyIds: ["p_customer_id"],
       grain: "一行代表一个客户",
       exampleQuestions: [],
       synonyms: ["会员"],
       properties: [
+        property("p_customer_id", "customer_id", "客户ID", "BIGINT", "ID"),
         property(
-          "p_customer_id",
-          "customer_id",
-          "客户编号",
-          "BIGINT",
-          "OBJECT_IDENTIFIER",
+          "p_customer_level",
+          "member_level",
+          "会员等级",
+          "VARCHAR",
+          "CATEGORY",
         ),
-        property("p_customer_level", "member_level", "会员等级", "VARCHAR"),
       ],
     },
     {
@@ -57,17 +62,13 @@ export const testOntology: OntologySnapshot = {
       description: "门店业务对象",
       sourceTableId: "t_stores",
       status: "PUBLISHED",
+      objectType: "ENTITY",
+      grainPropertyIds: ["p_store_id"],
       grain: "一行代表一个门店",
       exampleQuestions: [],
       synonyms: ["店铺"],
       properties: [
-        property(
-          "p_store_id",
-          "store_id",
-          "门店编号",
-          "BIGINT",
-          "OBJECT_IDENTIFIER",
-        ),
+        property("p_store_id", "store_id", "门店ID", "BIGINT", "ID"),
       ],
     },
   ],
@@ -128,7 +129,17 @@ function property(
   name: string,
   label: string,
   dataType: string,
-  identityRole: "NONE" | "OBJECT_IDENTIFIER" | "BUSINESS_KEY" = "NONE",
+  meaning:
+    | "ID"
+    | "CODE"
+    | "NAME"
+    | "ENTITY_REFERENCE"
+    | "CATEGORY"
+    | "TIME"
+    | "NUMBER"
+    | "BOOLEAN"
+    | "GEOGRAPHY"
+    | "TEXT" = "TEXT",
 ) {
   return {
     id,
@@ -138,8 +149,20 @@ function property(
     sourceColumn: name,
     sensitive: false,
     description: "",
-    semanticType: name.endsWith("_id") ? ("IDENTIFIER" as const) : ("DIMENSION" as const),
-    identityRole,
+    meaning,
+    unique: meaning === "ID",
+    valueSearchable: ["CODE", "NAME", "CATEGORY", "BOOLEAN", "GEOGRAPHY"].includes(
+      meaning,
+    ),
+    numericSpec:
+      meaning === "NUMBER"
+        ? {
+            kind: "CURRENCY" as const,
+            currency: "CNY",
+            defaultAggregation: "SUM" as const,
+            aggregationBehavior: "ADDITIVE" as const,
+          }
+        : undefined,
     visibility: "ANALYTICAL" as const,
     synonyms: [],
     detailOrder: 1,

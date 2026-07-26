@@ -124,20 +124,38 @@ export type OntologyEntityStatus =
 
 export type PropertyVisibility = "ANALYTICAL" | "DETAIL_ONLY" | "HIDDEN";
 
-export type PropertyIdentityRole =
-  | "NONE"
-  | "OBJECT_IDENTIFIER"
-  | "BUSINESS_KEY";
+export type OntologyObjectType =
+  | "ENTITY"
+  | "EVENT"
+  | "SNAPSHOT"
+  | "AGGREGATE"
+  | "RELATIONSHIP";
 
-export type PropertySemanticType =
-  | "IDENTIFIER"
-  | "DIMENSION"
-  | "ENUM"
+export type PropertyMeaning =
+  | "ID"
+  | "CODE"
+  | "NAME"
+  | "ENTITY_REFERENCE"
+  | "CATEGORY"
   | "TIME"
+  | "NUMBER"
+  | "BOOLEAN"
   | "GEOGRAPHY"
-  | "AMOUNT"
-  | "QUANTITY"
-  | "BOOLEAN";
+  | "TEXT";
+
+export type NumericKind = "GENERAL" | "CURRENCY" | "RATIO";
+export type NumericAggregationBehavior =
+  | "ADDITIVE"
+  | "SEMI_ADDITIVE"
+  | "NON_ADDITIVE";
+
+export interface NumericPropertySpec {
+  kind: NumericKind;
+  unit?: string;
+  currency?: string;
+  defaultAggregation: "SUM" | "AVG" | "MIN" | "MAX" | "NONE";
+  aggregationBehavior: NumericAggregationBehavior;
+}
 
 export interface OntologyProperty {
   id: string;
@@ -147,8 +165,10 @@ export interface OntologyProperty {
   dataType: string;
   sourceColumn: string;
   sensitive: boolean;
-  semanticType: PropertySemanticType;
-  identityRole: PropertyIdentityRole;
+  meaning: PropertyMeaning;
+  unique: boolean;
+  valueSearchable: boolean;
+  numericSpec?: NumericPropertySpec;
   visibility: PropertyVisibility;
   synonyms: string[];
   format?: string;
@@ -165,9 +185,10 @@ export interface OntologyObject {
   description: string;
   sourceTableId: string;
   status: OntologyEntityStatus;
+  objectType: OntologyObjectType;
+  grainPropertyIds: string[];
   grain: string;
-  /** @deprecated Legacy snapshots are migrated to property.identityRole at read time. */
-  primaryKey?: string[];
+  identityReviewRequired?: boolean;
   defaultTimePropertyId?: string;
   defaultFilter?: string;
   category?: string;
@@ -231,6 +252,7 @@ export interface Metric {
 }
 
 export interface OntologySnapshot {
+  schemaVersion: 2;
   version: number;
   baseVersion?: number;
   status: OntologyEntityStatus;

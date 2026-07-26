@@ -10,9 +10,16 @@ describe("SemanticIndex", () => {
     expect(matches.some((match) => match.id === "m_gmv")).toBe(true);
   });
 
-  it("matches an object through a property label", () => {
+  it("returns the exact property and owning object for a property label", () => {
     const matches = index.search("按会员等级分析");
-    expect(matches.some((match) => match.id === "o_customer")).toBe(true);
+    expect(
+      matches.some(
+        (match) =>
+          match.kind === "property" &&
+          match.id === "p_customer_level" &&
+          match.objectId === "o_customer",
+      ),
+    ).toBe(true);
   });
 
   it("finds a relation path between objects", () => {
@@ -35,7 +42,7 @@ describe("SemanticIndex", () => {
     const isolated = new SemanticIndex(ontology);
 
     expect(
-      isolated.search("内部展示码").some((match) => match.id === "o_order"),
+      isolated.search("内部展示码").some((match) => match.id === "p_order_amount"),
     ).toBe(false);
   });
 });

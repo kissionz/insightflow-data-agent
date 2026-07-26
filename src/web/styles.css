@@ -1497,7 +1497,7 @@ tbody tr:hover {
 
 .object-summary {
   display: grid;
-  grid-template-columns: 0.7fr 1.5fr 1fr;
+  grid-template-columns: 0.75fr 0.85fr 1.4fr 1.4fr;
   gap: 1px;
   overflow: hidden;
   border: 1px solid var(--border);
@@ -1917,7 +1917,7 @@ tbody tr:hover {
   padding: 9px;
 }
 
-.property-role-cell {
+.property-constraint-cell {
   display: flex;
   min-width: 0;
   flex-direction: column;
@@ -1925,20 +1925,36 @@ tbody tr:hover {
   gap: 4px;
 }
 
-.property-role-cell select {
+.property-constraint-cell select {
   width: 100%;
 }
 
-.relation-role-badge {
+.identity-chip {
   display: inline-flex;
   align-items: center;
   gap: 3px;
-  border-radius: 999px;
-  background: #eef7f2;
-  color: #147a49;
+  border-radius: 5px;
+  background: var(--blue-soft);
+  color: var(--blue-hover);
   padding: 2px 6px;
   font-size: 8px;
   font-weight: 600;
+}
+
+.compact-check {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: #475467;
+  font-size: 8px;
+}
+
+.compact-check input {
+  width: 13px;
+  height: 13px;
+  min-height: 13px;
+  padding: 0;
+  accent-color: var(--blue);
 }
 
 .property-edit-row.header {
@@ -1962,8 +1978,32 @@ tbody tr:hover {
 }
 
 .property-edit-row textarea {
-  grid-column: span 2;
   resize: vertical;
+}
+
+.property-row-details {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: minmax(180px, 1.4fr) minmax(150px, 1fr);
+  gap: 8px;
+  align-items: start;
+  border-top: 1px dashed var(--border);
+  padding-top: 9px;
+}
+
+.numeric-rule-grid {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: repeat(4, minmax(110px, 1fr));
+  gap: 8px;
+}
+
+.property-behavior-checks {
+  display: flex;
+  grid-column: 1 / -1;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px;
 }
 
 .physical-field {

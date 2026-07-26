@@ -14,6 +14,7 @@ import {
 } from "montane-code";
 import type {
   Conversation,
+  OntologyObject,
   ResultArtifact,
   Turn,
 } from "../shared/types.js";
@@ -30,13 +31,14 @@ const DATA_AGENT_SYSTEM_PROMPT = `
 1. 先判断用户是在打招呼、询问能力，还是提出数据分析请求。
 2. 打招呼或询问能力时直接简短回答，不调用数据工具，不生成图表或业务结论。
 3. 数据分析请求必须先调用 OntologySearch，将问题绑定到已发布业务对象、属性、指标和关系。
-4. 只能根据 OntologySearch 返回的语义生成查询，不得猜测表名、字段或关系。
-5. 然后调用 SelectDBQuery 执行一条只读 SQL；只允许 SELECT 或 WITH ... SELECT。
-6. 必须检查关系基数、扇出风险和分析粒度。
-7. 最终使用中文给出简洁、可验证的结论，只能引用工具返回的数据。
-8. 信息不足时向用户说明需要补充的条件，不得编造默认业务结果。
-9. 不得在最终答案中暴露数据源地址、用户名、密码或内部配置。
-10. 不得调用未提供的工具，也不得省略查询执行直接编造结果。
+4. 当问题包含可能是具体属性值的词语，且 OntologySearch 不能唯一确定字段时，必须调用 PropertyValueSearch 定位属性列；多个候选时必须让用户澄清。
+5. 只能根据工具返回的语义生成查询，不得猜测表名、字段、属性值归属或关系。
+6. 然后调用 SelectDBQuery 执行一条只读 SQL；只允许 SELECT 或 WITH ... SELECT。
+7. 必须根据对象类型、行级粒度、数字聚合规则、关系基数和扇出风险选择查询方法。
+8. 最终使用中文给出简洁、可验证的结论，只能引用工具返回的数据。
+9. 信息不足时向用户说明需要补充的条件，不得编造默认业务结果。
+10. 不得在最终答案中暴露数据源地址、用户名、密码或内部配置。
+11. 不得调用未提供的工具，也不得省略查询执行直接编造结果。
 `.trim();
 
 interface HarnessRunResult {
@@ -68,6 +70,8 @@ export class DataAgentHarness {
     private readonly executeLiveQuery: (
       sql: string,
       maxRows: number,
+      parameters?: unknown[],
+      timeoutMs?: number,
     ) => Promise<QueryResult>,
     private readonly resolveModelRuntime: () => Promise<ConfiguredModelRuntime> =
       () => resolveConfiguredModel({ workspaceRoot }),
@@ -88,6 +92,7 @@ export class DataAgentHarness {
     let captured: CapturedAnalysis | null = null;
     const tools = new ToolRegistry();
     tools.register(this.ontologySearchTool());
+    tools.register(this.propertyValueSearchTool());
     tools.register(
       this.selectDbQueryTool((analysis) => {
         captured = analysis;
@@ -96,6 +101,7 @@ export class DataAgentHarness {
 
     const policy = defaultPolicy();
     policy.allowedTools.add("OntologySearch");
+    policy.allowedTools.add("PropertyValueSearch");
     policy.allowedTools.add("SelectDBQuery");
     const permissions = new PermissionGate(policy, this.workspaceRoot);
     const session = new SessionStore(
@@ -247,8 +253,8 @@ export class DataAgentHarness {
         const index = new SemanticIndex(ontology);
         const matches = index.search(query, 10);
         const objectIds = matches
-          .filter((match) => match.kind === "object")
-          .map((match) => match.id);
+          .filter((match) => match.kind === "object" || match.kind === "property")
+          .map((match) => match.objectId ?? match.id);
         const metricObjectIds = matches
           .filter((match) => match.kind === "metric")
           .map(
@@ -274,7 +280,9 @@ export class DataAgentHarness {
           objects: objects.map((object) => ({
             id: object.id,
             label: object.label,
+            objectType: object.objectType,
             table: tables.find((table) => table.id === object.sourceTableId)?.name,
+            grain: effectiveGrainLabels(object),
             properties: object.properties
               .filter((property) => property.visibility === "ANALYTICAL")
               .map((property) => ({
@@ -282,8 +290,10 @@ export class DataAgentHarness {
                 column: property.sourceColumn,
                 dataType: property.dataType,
                 sensitive: property.sensitive,
-                semanticType: property.semanticType,
-                identityRole: property.identityRole,
+                meaning: property.meaning,
+                unique: property.unique,
+                valueSearchable: property.valueSearchable,
+                numericSpec: property.numericSpec,
               })),
           })),
           metrics: metrics.map((metric) => ({
@@ -303,6 +313,177 @@ export class DataAgentHarness {
           content: JSON.stringify(payload),
           data: payload,
         };
+      },
+    };
+  }
+
+  private propertyValueSearchTool(): Tool {
+    return {
+      name: "PropertyValueSearch",
+      description:
+        "在用户允许的非敏感属性中定位具体业务值属于哪个对象和字段。优先使用 OntologySearch 返回的 property_ids 或 object_ids 缩小范围。",
+      effect: "readonly",
+      timeoutMs: 35_000,
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          value: {
+            type: "string",
+            description: "需要定位字段归属的原始业务值，例如华东、VIP、上海门店",
+          },
+          property_ids: {
+            type: "array",
+            items: { type: "string" },
+            description: "OntologySearch 返回的候选属性 ID",
+          },
+          object_ids: {
+            type: "array",
+            items: { type: "string" },
+            description: "OntologySearch 返回的候选对象 ID",
+          },
+          match_mode: {
+            type: "string",
+            enum: ["exact", "prefix"],
+          },
+        },
+        required: ["value"],
+      },
+      execute: async (args): Promise<ToolOutcome> => {
+        const value = String(args.value ?? "").trim();
+        if (!value) {
+          return { ok: false, content: "属性值不能为空" };
+        }
+        if (!this.repository.getDataSource().configured) {
+          return {
+            ok: false,
+            content: "SelectDB 尚未配置，无法定位真实属性值。",
+          };
+        }
+        const ontology = this.repository.getPublishedOntology();
+        const propertyIds = new Set(
+          Array.isArray(args.property_ids)
+            ? args.property_ids.map(String)
+            : [],
+        );
+        const objectIds = new Set(
+          Array.isArray(args.object_ids) ? args.object_ids.map(String) : [],
+        );
+        const tables = new Map(
+          this.repository.getTables().map((table) => [table.id, table]),
+        );
+        const candidates = ontology.objects
+          .filter((object) => !objectIds.size || objectIds.has(object.id))
+          .flatMap((object) =>
+            object.properties
+              .filter(
+                (property) =>
+                  property.visibility === "ANALYTICAL" &&
+                  property.valueSearchable &&
+                  !property.sensitive &&
+                  (!propertyIds.size || propertyIds.has(property.id)),
+              )
+              .map((property) => ({
+                object,
+                property,
+                table: tables.get(object.sourceTableId),
+              })),
+          )
+          .filter(
+            (
+              candidate,
+            ): candidate is typeof candidate & {
+              table: NonNullable<typeof candidate.table>;
+            } => Boolean(candidate.table),
+          )
+          .slice(0, 12);
+
+        const normalizedValue = normalizePropertyValue(value);
+        const cached = this.repository.findCachedPropertyValues(
+          ontology.version,
+          normalizedValue,
+          candidates.map((candidate) => candidate.property.id),
+        );
+        if (cached.length) {
+          const matches = cached.flatMap((entry) => {
+            const candidate = candidates.find(
+              (item) => item.property.id === entry.propertyId,
+            );
+            return candidate
+              ? [{
+                  objectId: candidate.object.id,
+                  object: candidate.object.label,
+                  propertyId: candidate.property.id,
+                  property: candidate.property.label,
+                  column: candidate.property.sourceColumn,
+                  matchedValue: entry.displayValue,
+                  source: "local-cache",
+                }]
+              : [];
+          });
+          return valueSearchOutcome(value, matches);
+        }
+
+        const matches: Array<{
+          objectId: string;
+          object: string;
+          propertyId: string;
+          property: string;
+          column: string;
+          matchedValue: string;
+          source: "selectdb";
+        }> = [];
+        for (let offset = 0; offset < candidates.length; offset += 4) {
+          const batch = candidates.slice(offset, offset + 4);
+          const results = await Promise.allSettled(
+            batch.map(async ({ object, property, table }) => {
+              const column = quoteIdentifier(property.sourceColumn);
+              const tableName = `${quoteIdentifier(table.database)}.${quoteIdentifier(table.name)}`;
+              const prefix = args.match_mode === "prefix";
+              const sql = `SELECT CAST(${column} AS STRING) AS matched_value FROM ${tableName} WHERE CAST(${column} AS STRING) ${prefix ? "LIKE CONCAT(?, '%')" : "= ?"} LIMIT 3`;
+              const result = await this.executeLiveQuery(
+                sql,
+                3,
+                [value],
+                8_000,
+              );
+              return result.rows.map((row) => ({
+                objectId: object.id,
+                object: object.label,
+                propertyId: property.id,
+                property: property.label,
+                column: property.sourceColumn,
+                matchedValue: String(row.matched_value ?? value),
+                source: "selectdb" as const,
+              }));
+            }),
+          );
+          for (const result of results) {
+            if (result.status === "fulfilled") matches.push(...result.value);
+          }
+          if (matches.length >= 8) break;
+        }
+
+        const deduplicated = [
+          ...new Map(
+            matches.map((match) => [
+              `${match.propertyId}:${normalizePropertyValue(match.matchedValue)}`,
+              match,
+            ]),
+          ).values(),
+        ].slice(0, 8);
+        const now = new Date().toISOString();
+        for (const match of deduplicated) {
+          this.repository.cachePropertyValue({
+            ontologyVersion: ontology.version,
+            objectId: match.objectId,
+            propertyId: match.propertyId,
+            normalizedValue: normalizePropertyValue(match.matchedValue),
+            displayValue: match.matchedValue,
+            updatedAt: now,
+          });
+        }
+        return valueSearchOutcome(value, deduplicated);
       },
     };
   }
@@ -376,6 +557,58 @@ export class DataAgentHarness {
       },
     };
   }
+}
+
+function effectiveGrainLabels(object: OntologyObject): string[] {
+  const idProperty = object.properties.find((property) => property.meaning === "ID");
+  const grainIds = idProperty ? [idProperty.id] : object.grainPropertyIds;
+  return grainIds
+    .map((id) => object.properties.find((property) => property.id === id)?.label)
+    .filter((label): label is string => Boolean(label));
+}
+
+function normalizePropertyValue(value: string): string {
+  return value.trim().toLocaleLowerCase("zh-CN").replace(/\s+/g, " ");
+}
+
+function quoteIdentifier(value: string): string {
+  return `\`${value.replaceAll("`", "``")}\``;
+}
+
+function valueSearchOutcome(
+  value: string,
+  matches: Array<{
+    objectId: string;
+    object: string;
+    propertyId: string;
+    property: string;
+    column: string;
+    matchedValue: string;
+    source: string;
+  }>,
+): ToolOutcome {
+  const ambiguous = new Set(matches.map((match) => match.propertyId)).size > 1;
+  const payload = {
+    value,
+    status:
+      matches.length === 0
+        ? "not_found"
+        : !ambiguous
+          ? "resolved"
+          : "ambiguous",
+    matches,
+    instruction:
+      ambiguous
+        ? "多个属性包含该值，必须向用户澄清，不得自行选择。"
+        : matches.length === 0
+          ? "没有找到可靠属性绑定，请向用户补充字段或业务对象。"
+          : "已定位属性，可使用返回的对象、列和属性值生成查询。",
+  };
+  return {
+    ok: true,
+    content: JSON.stringify(payload),
+    data: payload,
+  };
 }
 
 function isLikelyDataQuestion(question: string): boolean {

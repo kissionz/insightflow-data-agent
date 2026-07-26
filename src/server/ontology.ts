@@ -11,6 +11,18 @@ import type {
 import { createId } from "./id.js";
 
 const entityStatusSchema = z.enum(["DRAFT", "VERIFIED", "PUBLISHED", "DEPRECATED"]);
+const propertyMeaningSchema = z.enum([
+  "ID",
+  "CODE",
+  "NAME",
+  "ENTITY_REFERENCE",
+  "CATEGORY",
+  "TIME",
+  "NUMBER",
+  "BOOLEAN",
+  "GEOGRAPHY",
+  "TEXT",
+]);
 const propertySchema = z.object({
   id: z.string().min(1),
   name: z.string().trim().min(1).max(120),
@@ -19,17 +31,22 @@ const propertySchema = z.object({
   dataType: z.string().min(1).max(120),
   sourceColumn: z.string().min(1).max(200),
   sensitive: z.boolean(),
-  semanticType: z.enum([
-    "IDENTIFIER",
-    "DIMENSION",
-    "ENUM",
-    "TIME",
-    "GEOGRAPHY",
-    "AMOUNT",
-    "QUANTITY",
-    "BOOLEAN",
-  ]),
-  identityRole: z.enum(["NONE", "OBJECT_IDENTIFIER", "BUSINESS_KEY"]),
+  meaning: propertyMeaningSchema,
+  unique: z.boolean(),
+  valueSearchable: z.boolean(),
+  numericSpec: z
+    .object({
+      kind: z.enum(["GENERAL", "CURRENCY", "RATIO"]),
+      unit: z.string().max(50).optional(),
+      currency: z.string().max(12).optional(),
+      defaultAggregation: z.enum(["SUM", "AVG", "MIN", "MAX", "NONE"]),
+      aggregationBehavior: z.enum([
+        "ADDITIVE",
+        "SEMI_ADDITIVE",
+        "NON_ADDITIVE",
+      ]),
+    })
+    .optional(),
   visibility: z.enum(["ANALYTICAL", "DETAIL_ONLY", "HIDDEN"]),
   synonyms: z.array(z.string().trim().min(1).max(120)).max(50),
   format: z.string().max(120).optional(),
@@ -46,7 +63,16 @@ const objectSchema = z.object({
   description: z.string().max(4_000),
   sourceTableId: z.string().min(1),
   status: entityStatusSchema,
+  objectType: z.enum([
+    "ENTITY",
+    "EVENT",
+    "SNAPSHOT",
+    "AGGREGATE",
+    "RELATIONSHIP",
+  ]),
+  grainPropertyIds: z.array(z.string().min(1)).max(200),
   grain: z.string().max(1_000),
+  identityReviewRequired: z.boolean().optional(),
   defaultTimePropertyId: z.string().min(1).optional(),
   defaultFilter: z.string().max(4_000).optional(),
   category: z.string().max(120).optional(),
@@ -149,6 +175,10 @@ export function addTablesToDraft(
     objects: [
       ...next.objects,
       ...selected.map<OntologyObject>((table) => {
+        const objectType = inferObjectType(table.name, table.description);
+        const normalizedObjectName = table.name
+          .replace(/^(dim|fact|agg)_/, "")
+          .replace(/s$/, "");
         const properties: OntologyObject["properties"] = table.columns.map(
           (column, index) => ({
             id: createId("property"),
@@ -158,8 +188,14 @@ export function addTablesToDraft(
             dataType: column.dataType,
             sourceColumn: column.name,
             sensitive: column.sensitive,
-            semanticType: inferSemanticType(column.name, column.dataType),
-            identityRole: "NONE",
+            meaning: inferPropertyMeaning(column.name, column.dataType),
+            unique: false,
+            valueSearchable:
+              !column.sensitive &&
+              defaultValueSearchable(inferPropertyMeaning(column.name, column.dataType)),
+            numericSpec: inferPropertyMeaning(column.name, column.dataType) === "NUMBER"
+              ? inferNumericSpec(column.name)
+              : undefined,
             visibility: column.sensitive ? "HIDDEN" : "ANALYTICAL",
             synonyms: [],
             detailOrder: index + 1,
@@ -170,9 +206,16 @@ export function addTablesToDraft(
         const primaryCandidate = properties.find(
           (property) =>
             property.name === "id" ||
-            property.name === `${table.name.replace(/^(dim|fact)_/, "").replace(/s$/, "")}_id`,
+            property.name === `${normalizedObjectName}_id`,
         );
-        if (primaryCandidate) primaryCandidate.identityRole = "OBJECT_IDENTIFIER";
+        if (
+          primaryCandidate &&
+          (objectType === "ENTITY" || objectType === "EVENT")
+        ) {
+          primaryCandidate.meaning = "ID";
+          primaryCandidate.unique = true;
+          primaryCandidate.valueSearchable = false;
+        }
         return {
           id: createId("object"),
           name: table.name.replace(/^(dim|fact)_/, "").replace(/s$/, ""),
@@ -180,9 +223,13 @@ export function addTablesToDraft(
           description: `基于 ${table.database}.${table.name} 生成的本体草稿`,
           sourceTableId: table.id,
           status: "DRAFT",
-          grain: "",
+          objectType,
+          grainPropertyIds: primaryCandidate ? [primaryCandidate.id] : [],
+          grain: primaryCandidate
+            ? `一行代表一个${table.description?.replace(/表$/, "") || normalizedObjectName}`
+            : "",
           defaultTimePropertyId: properties.find(
-            (property) => property.semanticType === "TIME",
+            (property) => property.meaning === "TIME",
           )?.id,
           exampleQuestions: [],
           synonyms: [],
@@ -313,27 +360,101 @@ export function validateOntology(
       issues.push(error("SOURCE_TABLE_MISSING", "对象来源表已不存在", object.id));
     }
     const propertyIds = new Set(object.properties.map((property) => property.id));
-    if (!object.grain.trim()) {
-      issues.push(error("GRAIN_REQUIRED", "请填写对象粒度", object.id));
-    }
-    if (
-      !object.properties.some(
-        (property) => property.identityRole === "OBJECT_IDENTIFIER",
-      )
-    ) {
+    const idProperties = object.properties.filter(
+      (property) => property.meaning === "ID",
+    );
+    if (object.identityReviewRequired) {
       issues.push(
         error(
-          "OBJECT_IDENTIFIER_REQUIRED",
-          "请至少将一个属性标记为对象标识",
+          "IDENTITY_REVIEW_REQUIRED",
+          `${object.label} 从旧版本迁移出多个对象标识，请重新确认唯一 ID`,
+          object.id,
+        ),
+      );
+    }
+    if (object.objectType === "ENTITY" && idProperties.length !== 1) {
+      issues.push(
+        error(
+          idProperties.length ? "OBJECT_ID_MULTIPLE" : "OBJECT_ID_REQUIRED",
+          idProperties.length
+            ? `${object.label} 是业务实体，只能配置一个 ID`
+            : `${object.label} 是业务实体，必须配置一个 ID`,
+          object.id,
+        ),
+      );
+    }
+    if (object.objectType === "EVENT" && idProperties.length > 1) {
+      issues.push(
+        error(
+          "OBJECT_ID_MULTIPLE",
+          `${object.label} 最多只能配置一个 ID`,
           object.id,
         ),
       );
     }
     if (
-      object.defaultTimePropertyId &&
-      !propertyIds.has(object.defaultTimePropertyId)
+      ["SNAPSHOT", "AGGREGATE", "RELATIONSHIP"].includes(object.objectType) &&
+      idProperties.length
     ) {
-      issues.push(error("TIME_PROPERTY_INVALID", "默认时间字段不存在", object.id));
+      issues.push(
+        error(
+          "OBJECT_ID_NOT_ALLOWED",
+          `${object.label} 的对象类型不使用 ID，请通过行级粒度定义一行数据`,
+          object.id,
+        ),
+      );
+    }
+    const effectiveGrainIds = idProperties.length === 1
+      ? [idProperties[0].id]
+      : object.grainPropertyIds;
+    if (!effectiveGrainIds.length) {
+      issues.push(
+        error(
+          "GRAIN_REQUIRED",
+          `${object.label} 没有唯一 ID，请选择“一行数据由哪些字段共同确定”`,
+          object.id,
+        ),
+      );
+    }
+    for (const grainPropertyId of effectiveGrainIds) {
+      const grainProperty = object.properties.find(
+        (property) => property.id === grainPropertyId,
+      );
+      if (!grainProperty) {
+        issues.push(
+          error(
+            "GRAIN_PROPERTY_INVALID",
+            `${object.label} 的行级粒度引用了不存在的属性`,
+            object.id,
+            grainPropertyId,
+          ),
+        );
+      } else if (grainProperty.visibility !== "ANALYTICAL") {
+        issues.push(
+          error(
+            "GRAIN_PROPERTY_NOT_ANALYTICAL",
+            `粒度字段 ${grainProperty.label} 必须设为分析可用`,
+            object.id,
+            grainProperty.id,
+          ),
+        );
+      }
+    }
+    if (
+      object.defaultTimePropertyId &&
+      !object.properties.some(
+        (property) =>
+          property.id === object.defaultTimePropertyId &&
+          property.meaning === "TIME",
+      )
+    ) {
+      issues.push(
+        error(
+          "TIME_PROPERTY_INVALID",
+          "默认时间字段不存在或字段含义不是时间",
+          object.id,
+        ),
+      );
     }
     if (containsUnsafeExpression(object.defaultFilter)) {
       issues.push(error("FILTER_UNSAFE", "默认过滤条件包含不允许的 SQL", object.id));
@@ -346,6 +467,86 @@ export function validateOntology(
         );
       }
       propertyNames.add(property.name.toLowerCase());
+      if (
+        (property.meaning === "ID" ||
+          property.meaning === "ENTITY_REFERENCE") &&
+        property.visibility !== "ANALYTICAL"
+      ) {
+        issues.push(
+          error(
+            "STRUCTURAL_PROPERTY_NOT_ANALYTICAL",
+            `${property.label} 用于对象身份或关系，必须设为分析可用`,
+            object.id,
+            property.id,
+          ),
+        );
+      }
+      if (
+        property.meaning === "ENTITY_REFERENCE" &&
+        !snapshot.relations.some(
+          (relation) =>
+            relation.sourceObjectId === object.id &&
+            relation.sourcePropertyId === property.id,
+        )
+      ) {
+        issues.push(
+          error(
+            "ENTITY_REFERENCE_RELATION_REQUIRED",
+            `${property.label} 是关联实体，请配置它指向的目标对象`,
+            object.id,
+            property.id,
+          ),
+        );
+      }
+      if (property.meaning === "ID" && !property.unique) {
+        issues.push(
+          error(
+            "OBJECT_ID_NOT_UNIQUE",
+            `${property.label} 是当前对象 ID，必须标记为唯一`,
+            object.id,
+            property.id,
+          ),
+        );
+      }
+      if (property.meaning === "NUMBER" && !property.numericSpec) {
+        issues.push(
+          error(
+            "NUMBER_RULE_REQUIRED",
+            `数字属性 ${property.label} 缺少聚合规则`,
+            object.id,
+            property.id,
+          ),
+        );
+      }
+      if (
+        property.valueSearchable &&
+        (property.sensitive ||
+          property.visibility !== "ANALYTICAL" ||
+          !isValueSearchableMeaning(property.meaning))
+      ) {
+        issues.push(
+          error(
+            "VALUE_SEARCH_NOT_ALLOWED",
+            `${property.label} 当前不可启用属性值定位`,
+            object.id,
+            property.id,
+          ),
+        );
+      }
+    }
+    if (object.objectType === "RELATIONSHIP") {
+      const referenceCount = object.properties.filter(
+        (property) => property.meaning === "ENTITY_REFERENCE",
+      ).length;
+      if (referenceCount < 2) {
+        issues.push(
+          error(
+            "RELATIONSHIP_ENDPOINTS_REQUIRED",
+            `${object.label} 是关联记录，至少需要两个关联实体字段`,
+            object.id,
+          ),
+        );
+      }
     }
   }
 
@@ -393,6 +594,40 @@ export function validateOntology(
         ),
       );
     }
+    const metricProperty = object.properties.find(
+      (property) => property.id === metric.sourcePropertyId,
+    );
+    if (
+      metric.definitionMode === "VISUAL" &&
+      metric.aggregation !== "COUNT" &&
+      metricProperty &&
+      metricProperty.meaning !== "NUMBER"
+    ) {
+      issues.push(
+        error(
+          "METRIC_SOURCE_NOT_NUMBER",
+          `指标 ${metric.label} 的计算字段 ${metricProperty.label} 不是数字`,
+          object.id,
+          metric.id,
+        ),
+      );
+    }
+    if (
+      metric.definitionMode === "VISUAL" &&
+      metricProperty?.meaning === "NUMBER" &&
+      metric.aggregation === "SUM" &&
+      (metricProperty.numericSpec?.kind === "RATIO" ||
+        metricProperty.numericSpec?.aggregationBehavior === "NON_ADDITIVE")
+    ) {
+      issues.push(
+        error(
+          "NUMBER_SUM_NOT_ALLOWED",
+          `${metricProperty.label} 不允许直接求和，请调整数字聚合规则或指标公式`,
+          object.id,
+          metric.id,
+        ),
+      );
+    }
   }
 
   for (const relation of snapshot.relations) {
@@ -416,6 +651,30 @@ export function validateOntology(
     const targetProperty = target.properties.find(
       (property) => property.id === relation.targetPropertyId,
     );
+    if (
+      sourceProperty &&
+      !["HIERARCHY", "IDENTITY"].includes(relation.type) &&
+      sourceProperty.meaning !== "ENTITY_REFERENCE"
+    ) {
+      issues.push(
+        error(
+          "RELATION_SOURCE_NOT_REFERENCE",
+          `关系 ${relation.name} 的源字段 ${sourceProperty.label} 必须设为关联实体`,
+          source.id,
+          relation.id,
+        ),
+      );
+    }
+    if (targetProperty && targetProperty.meaning !== "ID") {
+      issues.push(
+        error(
+          "RELATION_TARGET_NOT_ID",
+          `关系 ${relation.name} 必须关联到目标对象的 ID`,
+          target.id,
+          relation.id,
+        ),
+      );
+    }
     if (
       (sourceProperty && sourceProperty.visibility !== "ANALYTICAL") ||
       (targetProperty && targetProperty.visibility !== "ANALYTICAL")
@@ -504,17 +763,83 @@ export function metricExpression(
   return aggregate;
 }
 
-function inferSemanticType(
+function inferPropertyMeaning(
   name: string,
   dataType: string,
-): OntologyObject["properties"][number]["semanticType"] {
+): OntologyObject["properties"][number]["meaning"] {
   const normalized = name.toLowerCase();
-  if (/(^id$|_id$|code$|number$)/.test(normalized)) return "IDENTIFIER";
+  if (/(^id$|_id$|code$|number$|_no$)/.test(normalized)) return "CODE";
+  if (/(name|title|label|名称|姓名)/.test(normalized)) return "NAME";
+  if (/(status|type|category|level|class|状态|类型|等级|分类)/.test(normalized)) {
+    return "CATEGORY";
+  }
   if (/(date|time|_at$)/.test(normalized) || /(date|time)/i.test(dataType)) return "TIME";
-  if (/(amount|price|fee|cost|revenue)/.test(normalized)) return "AMOUNT";
-  if (/(count|quantity|qty|num)/.test(normalized)) return "QUANTITY";
   if (/^(is_|has_)/.test(normalized) || /bool/i.test(dataType)) return "BOOLEAN";
-  return "DIMENSION";
+  if (isNumericDataType(dataType)) return "NUMBER";
+  if (/(province|city|district|region|country|longitude|latitude|省|市|区|区域)/.test(normalized)) {
+    return "GEOGRAPHY";
+  }
+  return "TEXT";
+}
+
+function inferObjectType(name: string, description?: string): OntologyObject["objectType"] {
+  const normalized = `${name} ${description ?? ""}`.toLowerCase();
+  if (/(snapshot|快照|balance)/.test(normalized)) return "SNAPSHOT";
+  if (/(^|_)(agg|summary|stat|report)(_|$)|汇总|统计/.test(normalized)) {
+    return "AGGREGATE";
+  }
+  if (/(^|_)(bridge|mapping|relation|link)(_|$)|关联/.test(normalized)) {
+    return "RELATIONSHIP";
+  }
+  if (/(^|_)(fact|event|order|payment|transaction|detail|log)(_|$)|订单|支付|交易|明细|事件/.test(normalized)) {
+    return "EVENT";
+  }
+  return "ENTITY";
+}
+
+function inferNumericSpec(name: string): NonNullable<
+  OntologyObject["properties"][number]["numericSpec"]
+> {
+  const normalized = name.toLowerCase();
+  if (/(amount|price|fee|cost|revenue|income|gmv|金额|价格|费用|收入)/.test(normalized)) {
+    const nonAdditive = /(price|单价)/.test(normalized);
+    return {
+      kind: "CURRENCY",
+      currency: "CNY",
+      defaultAggregation: nonAdditive ? "AVG" : "SUM",
+      aggregationBehavior: nonAdditive ? "NON_ADDITIVE" : "ADDITIVE",
+    };
+  }
+  if (/(rate|ratio|percent|pct|率|比例|占比)/.test(normalized)) {
+    return {
+      kind: "RATIO",
+      unit: "%",
+      defaultAggregation: "AVG",
+      aggregationBehavior: "NON_ADDITIVE",
+    };
+  }
+  const additive = /(count|quantity|qty|num|数量|件数|次数)/.test(normalized);
+  return {
+    kind: "GENERAL",
+    defaultAggregation: additive ? "SUM" : "NONE",
+    aggregationBehavior: additive ? "ADDITIVE" : "NON_ADDITIVE",
+  };
+}
+
+function defaultValueSearchable(
+  meaning: OntologyObject["properties"][number]["meaning"],
+): boolean {
+  return isValueSearchableMeaning(meaning);
+}
+
+function isValueSearchableMeaning(
+  meaning: OntologyObject["properties"][number]["meaning"],
+): boolean {
+  return ["CODE", "NAME", "CATEGORY", "BOOLEAN", "GEOGRAPHY"].includes(meaning);
+}
+
+function isNumericDataType(dataType: string): boolean {
+  return /int|decimal|numeric|float|double|real/i.test(dataType);
 }
 
 function containsUnsafeExpression(value?: string): boolean {

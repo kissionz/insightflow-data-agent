@@ -37,7 +37,9 @@ describe("ontology lifecycle", () => {
   it("blocks publishing an incomplete object", () => {
     const draft = createDraftFromPublished(testOntology);
     draft.objects[0].grain = "";
-    draft.objects[0].properties[0].identityRole = "NONE";
+    draft.objects[0].grainPropertyIds = [];
+    draft.objects[0].properties[0].meaning = "CODE";
+    draft.objects[0].properties[0].unique = false;
 
     const result = validateOntology(
       draft,
@@ -56,10 +58,61 @@ describe("ontology lifecycle", () => {
 
     expect(result.valid).toBe(false);
     expect(result.issues.some((issue) => issue.code === "GRAIN_REQUIRED")).toBe(true);
+  });
+
+  it("allows aggregate objects without an ID when structured grain is configured", () => {
+    const draft = createDraftFromPublished(testOntology);
+    const aggregate = draft.objects[0];
+    aggregate.objectType = "AGGREGATE";
+    aggregate.properties[0].meaning = "CODE";
+    aggregate.properties[0].unique = false;
+    aggregate.grainPropertyIds = ["p_store_id"];
+
+    const result = validateOntology(
+      draft,
+      draft.objects.map((object) => ({
+        id: object.sourceTableId,
+        catalog: "internal",
+        database: "retail",
+        name: object.name,
+        type: "TABLE",
+        status: "MODELED",
+        columns: [],
+        fingerprint: "v1",
+        scannedAt: new Date().toISOString(),
+      })),
+    );
+
     expect(
-      result.issues.some(
-        (issue) => issue.code === "OBJECT_IDENTIFIER_REQUIRED",
-      ),
+      result.issues.some((issue) => issue.code === "OBJECT_ID_REQUIRED"),
+    ).toBe(false);
+    expect(
+      result.issues.some((issue) => issue.code === "GRAIN_REQUIRED"),
+    ).toBe(false);
+  });
+
+  it("rejects more than one ID for the same object", () => {
+    const draft = createDraftFromPublished(testOntology);
+    draft.objects[1].properties[1].meaning = "ID";
+    draft.objects[1].properties[1].unique = true;
+
+    const result = validateOntology(
+      draft,
+      draft.objects.map((object) => ({
+        id: object.sourceTableId,
+        catalog: "internal",
+        database: "retail",
+        name: object.name,
+        type: "TABLE",
+        status: "MODELED",
+        columns: [],
+        fingerprint: "v1",
+        scannedAt: new Date().toISOString(),
+      })),
+    );
+
+    expect(
+      result.issues.some((issue) => issue.code === "OBJECT_ID_MULTIPLE"),
     ).toBe(true);
   });
 

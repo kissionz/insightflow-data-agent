@@ -1151,6 +1151,10 @@ function OntologyObjectInspector({
     <div className="object-detail">
       <div className="object-summary">
         <div>
+          <span>对象类型</span>
+          <strong>{objectTypeLabel(object.objectType)}</strong>
+        </div>
+        <div>
           <span>对象编码</span>
           <strong>{object.name}</strong>
         </div>
@@ -1159,8 +1163,8 @@ function OntologyObjectInspector({
           <strong>{source ? `${source.database}.${source.name}` : "来源表不可用"}</strong>
         </div>
         <div>
-          <span>同义词</span>
-          <strong>{object.synonyms.length ? object.synonyms.join("、") : "未配置"}</strong>
+          <span>行级粒度</span>
+          <strong>{effectiveGrainLabel(object)}</strong>
         </div>
       </div>
       <p className="object-description">{object.description || "暂无业务描述"}</p>
@@ -1174,8 +1178,8 @@ function OntologyObjectInspector({
             <tr>
               <th>业务名称</th>
               <th>物理字段</th>
-              <th>语义类型</th>
-              <th>业务角色</th>
+              <th>字段含义</th>
+              <th>查询约束</th>
               <th>可见性</th>
             </tr>
           </thead>
@@ -1185,25 +1189,17 @@ function OntologyObjectInspector({
                 <td><strong>{property.label}</strong><small>{property.name}</small></td>
                 <td>{property.sourceColumn}</td>
                 <td>
-                  <strong>{propertySemanticTypeLabel(property.semanticType)}</strong>
+                  <strong>{propertyMeaningLabel(property.meaning)}</strong>
                   <small>{property.dataType}</small>
                 </td>
                 <td>
                   <div className="property-role-summary">
-                    {property.identityRole !== "NONE" && (
-                      <span>{propertyIdentityRoleLabel(property.identityRole)}</span>
+                    <span>{propertyConstraintLabel(property, object)}</span>
+                    {property.meaning === "ENTITY_REFERENCE" && (
+                      <span className="relation">
+                        {relationTargetLabel(property.id, object.id, relations, ontology)}
+                      </span>
                     )}
-                    {relations.some(
-                      (relation) =>
-                        relation.sourcePropertyId === property.id ||
-                        relation.targetPropertyId === property.id,
-                    ) && <span className="relation">关联键</span>}
-                    {property.identityRole === "NONE" &&
-                      !relations.some(
-                        (relation) =>
-                          relation.sourcePropertyId === property.id ||
-                          relation.targetPropertyId === property.id,
-                      ) && <small>普通属性</small>}
                   </div>
                 </td>
                 <td>{propertyVisibilityLabel(property.visibility)}</td>
@@ -1308,6 +1304,153 @@ function OntologyObjectEditor({
       ),
     });
   }
+  function changePropertyMeaning(
+    propertyId: string,
+    meaning: OntologyObject["properties"][number]["meaning"],
+  ) {
+    const currentProperty = draftObject.properties.find(
+      (property) => property.id === propertyId,
+    );
+    if (!currentProperty) return;
+    const outgoingRelations = draftRelations.filter(
+      (relation) =>
+        relation.sourceObjectId === draftObject.id &&
+        relation.sourcePropertyId === propertyId,
+    );
+    if (
+      currentProperty.meaning === "ENTITY_REFERENCE" &&
+      meaning !== "ENTITY_REFERENCE" &&
+      outgoingRelations.length &&
+      !window.confirm("修改字段含义会同时删除该字段建立的对象关系，是否继续？")
+    ) {
+      return;
+    }
+    let properties = draftObject.properties.map((property) => ({ ...property }));
+    if (meaning === "ID") {
+      const existingId = properties.find(
+        (property) => property.meaning === "ID" && property.id !== propertyId,
+      );
+      if (
+        existingId &&
+        !window.confirm(
+          `当前 ID 是“${existingId.label}”。是否替换为“${currentProperty.label}”？原字段将改为编号。`,
+        )
+      ) {
+        return;
+      }
+      properties = properties.map((property) =>
+        property.id === existingId?.id
+          ? {
+              ...property,
+              meaning: "CODE" as const,
+              unique: true,
+              valueSearchable: !property.sensitive,
+            }
+          : property,
+      );
+    }
+    properties = properties.map((property) => {
+      if (property.id !== propertyId) return property;
+      return {
+        ...property,
+        meaning,
+        unique: meaning === "ID" ? true : meaning === "CODE" ? property.unique : false,
+        valueSearchable:
+          !property.sensitive && defaultValueSearchableForMeaning(meaning),
+        numericSpec:
+          meaning === "NUMBER"
+            ? property.numericSpec ?? defaultNumericSpec()
+            : undefined,
+        visibility:
+          meaning === "ID" || meaning === "ENTITY_REFERENCE"
+            ? ("ANALYTICAL" as const)
+            : property.visibility,
+      };
+    });
+    setDraftObject((current) => ({
+      ...current,
+      identityReviewRequired:
+        meaning === "ID" ? false : current.identityReviewRequired,
+      properties,
+      grainPropertyIds:
+        meaning === "ID"
+          ? [propertyId]
+          : current.grainPropertyIds.filter((id) => id !== propertyId),
+    }));
+    if (
+      currentProperty.meaning === "ENTITY_REFERENCE" &&
+      meaning !== "ENTITY_REFERENCE"
+    ) {
+      setDraftRelations((items) =>
+        items.filter(
+          (relation) =>
+            relation.sourceObjectId !== draftObject.id ||
+            relation.sourcePropertyId !== propertyId,
+        ),
+      );
+    }
+    setDirty(true);
+  }
+  function setEntityReferenceTarget(propertyId: string, targetObjectId: string) {
+    if (!targetObjectId) return;
+    const property = draftObject.properties.find(
+      (candidate) => candidate.id === propertyId,
+    );
+    const target = ontology.objects.find(
+      (candidate) => candidate.id === targetObjectId,
+    );
+    const targetId = target?.properties.find(
+      (candidate) => candidate.meaning === "ID",
+    );
+    if (!property || !target || !targetId) {
+      onError("目标对象必须先配置唯一 ID");
+      return;
+    }
+    changePropertyMeaning(propertyId, "ENTITY_REFERENCE");
+    const currentRelation = draftRelations.find(
+      (relation) =>
+        relation.sourceObjectId === draftObject.id &&
+        relation.sourcePropertyId === propertyId,
+    );
+    const nextRelation: OntologyRelation = {
+      id: currentRelation?.id ?? createClientId("relation"),
+      name: `${draftObject.label}关联${target.label}`,
+      sourceObjectId: draftObject.id,
+      targetObjectId: target.id,
+      sourcePropertyId: property.id,
+      targetPropertyId: targetId.id,
+      type: currentRelation?.type ?? "REFERENCE",
+      cardinality: currentRelation?.cardinality ?? "MANY_TO_ONE",
+      joinExpression: relationJoinExpression(
+        draftObject,
+        target,
+        property.id,
+        targetId.id,
+        source,
+        tables.find((table) => table.id === target.sourceTableId),
+      ),
+      direction: currentRelation?.direction ?? "BIDIRECTIONAL",
+      required: currentRelation?.required ?? false,
+      enabled: true,
+      fanoutRisk: currentRelation?.fanoutRisk ?? "NONE",
+      status: "DRAFT",
+    };
+    setDraftRelations((items) =>
+      currentRelation
+        ? items.map((relation) =>
+            relation.id === currentRelation.id ? nextRelation : relation,
+          )
+        : [...items, nextRelation],
+    );
+    setDirty(true);
+  }
+  function toggleGrainProperty(propertyId: string, checked: boolean) {
+    changeObject({
+      grainPropertyIds: checked
+        ? [...new Set([...draftObject.grainPropertyIds, propertyId])]
+        : draftObject.grainPropertyIds.filter((id) => id !== propertyId),
+    });
+  }
   function changeMetric(metricId: string, patch: Partial<Metric>) {
     setDraftMetrics((items) =>
       items.map((metric) =>
@@ -1325,6 +1468,12 @@ function OntologyObjectEditor({
     setDirty(true);
   }
   function addMetric() {
+    const sourceProperty = draftObject.properties.find(
+      (property) =>
+        property.visibility === "ANALYTICAL" && property.meaning === "NUMBER",
+    );
+    const defaultAggregation =
+      sourceProperty?.numericSpec?.defaultAggregation ?? "NONE";
     const metric: Metric = {
       id: createClientId("metric"),
       objectId: object.id,
@@ -1332,11 +1481,14 @@ function OntologyObjectEditor({
       label: "新指标",
       description: "",
       definitionMode: "VISUAL",
-      sourcePropertyId: draftObject.properties.find(
-        (property) => property.visibility === "ANALYTICAL",
-      )?.id,
+      sourcePropertyId: sourceProperty?.id,
       expression: "",
-      aggregation: "SUM",
+      aggregation:
+        defaultAggregation === "NONE"
+          ? sourceProperty
+            ? "AVG"
+            : "COUNT"
+          : defaultAggregation,
       format: "number",
       synonyms: [],
       status: "DRAFT",
@@ -1352,36 +1504,40 @@ function OntologyObjectEditor({
       return;
     }
     const sourceProperty =
-      object.properties.find(
+      draftObject.properties.find(
         (property) =>
           property.visibility === "ANALYTICAL" &&
-          property.semanticType === "IDENTIFIER",
+          property.meaning === "ENTITY_REFERENCE",
       ) ??
-      object.properties.find((property) => property.visibility === "ANALYTICAL");
+      draftObject.properties.find(
+        (property) =>
+          property.visibility === "ANALYTICAL" && property.meaning === "CODE",
+      ) ??
+      draftObject.properties.find(
+        (property) =>
+          property.visibility === "ANALYTICAL" && property.meaning !== "ID",
+      );
     const targetProperty =
       target.properties.find(
         (property) =>
           property.visibility === "ANALYTICAL" &&
-          (property.sourceColumn === sourceProperty?.sourceColumn ||
-            property.name === sourceProperty?.name),
-      ) ??
-      target.properties.find(
-        (property) =>
-          property.visibility === "ANALYTICAL" &&
-          property.semanticType === "IDENTIFIER",
-      ) ??
-      target.properties.find((property) => property.visibility === "ANALYTICAL");
+          property.meaning === "ID",
+      );
+    if (!sourceProperty || !targetProperty) {
+      onError("请先为源对象选择关联字段，并为目标对象配置唯一 ID");
+      return;
+    }
     const relation: OntologyRelation = {
       id: createClientId("relation"),
       name: `${object.label}关联${target.label}`,
-      sourceObjectId: object.id,
+      sourceObjectId: draftObject.id,
       targetObjectId: target.id,
       sourcePropertyId: sourceProperty?.id,
       targetPropertyId: targetProperty?.id,
       type: "REFERENCE",
       cardinality: "MANY_TO_ONE",
       joinExpression: relationJoinExpression(
-        object,
+        draftObject,
         target,
         sourceProperty?.id,
         targetProperty?.id,
@@ -1394,6 +1550,7 @@ function OntologyObjectEditor({
       fanoutRisk: "NONE",
       status: "DRAFT",
     };
+    changePropertyMeaning(sourceProperty.id, "ENTITY_REFERENCE");
     setDraftRelations((items) => [...items, relation]);
     setSelectedRelationId(relation.id);
     setDirty(true);
@@ -1408,11 +1565,20 @@ function OntologyObjectEditor({
             ? visualMetricExpression(metric, draftObject)
             : metric.expression,
       }));
+      const objectToSave = {
+        ...draftObject,
+        identityReviewRequired:
+          draftObject.properties.filter((property) => property.meaning === "ID")
+            .length === 1
+            ? false
+            : draftObject.identityReviewRequired,
+      };
       const result = await api.saveOntologyObject(
-        draftObject,
+        objectToSave,
         normalizedMetrics,
         draftRelations,
       );
+      setDraftObject(objectToSave);
       setDraftMetrics(normalizedMetrics);
       setDirty(false);
       onSaved(result.ontology, result.validation);
@@ -1480,6 +1646,28 @@ function OntologyObjectEditor({
                 disabled
               />
             </EditorField>
+            <EditorField label="对象类型">
+              <select
+                value={draftObject.objectType}
+                onChange={(event) =>
+                  changeObject({
+                    objectType: event.target.value as OntologyObject["objectType"],
+                    grainPropertyIds:
+                      event.target.value === "ENTITY"
+                        ? draftObject.properties
+                            .filter((property) => property.meaning === "ID")
+                            .map((property) => property.id)
+                        : draftObject.grainPropertyIds,
+                  })
+                }
+              >
+                {OBJECT_TYPES.map((type) => (
+                  <option key={type} value={type}>
+                    {objectTypeLabel(type)}
+                  </option>
+                ))}
+              </select>
+            </EditorField>
             <EditorField label="业务分类">
               <input
                 value={draftObject.category ?? ""}
@@ -1487,10 +1675,16 @@ function OntologyObjectEditor({
                 onChange={(event) => changeObject({ category: event.target.value })}
               />
             </EditorField>
-            <EditorField label="对象粒度" wide>
+            <EditorField label="当前行级粒度" wide>
+              <input
+                value={effectiveGrainLabel(draftObject)}
+                disabled
+              />
+            </EditorField>
+            <EditorField label="粒度补充说明" wide>
               <input
                 value={draftObject.grain}
-                placeholder="例如：一行代表一个订单"
+                placeholder="可选，例如：每日闭店后的库存状态"
                 onChange={(event) => changeObject({ grain: event.target.value })}
               />
             </EditorField>
@@ -1518,17 +1712,20 @@ function OntologyObjectEditor({
         <div className="editor-section property-editor">
           <div className="editor-help">
             <Info size={16} />
-            语义类型描述字段含义，身份角色定义对象标识；关联键由关系配置自动生成。
+            字段含义只保留会影响检索、SQL 或校验的业务语义。ID 表示当前对象，关联实体表示它指向的其他对象。
           </div>
           <div className="property-edit-table">
             <div className="property-edit-row header">
-              <span>业务名称</span><span>物理字段</span><span>语义类型</span><span>业务角色</span><span>可见性</span>
+              <span>业务名称</span><span>物理字段</span><span>字段含义</span><span>查询约束</span><span>可用范围</span>
             </div>
             {draftObject.properties.map((property) => {
-              const relationUses = draftRelations.filter(
+              const sourceRelation = draftRelations.find(
                 (relation) =>
-                  relation.sourcePropertyId === property.id ||
-                  relation.targetPropertyId === property.id,
+                  relation.sourceObjectId === draftObject.id &&
+                  relation.sourcePropertyId === property.id,
+              );
+              const hasObjectId = draftObject.properties.some(
+                (candidate) => candidate.meaning === "ID",
               );
               return (
                 <div className="property-edit-row" key={property.id}>
@@ -1543,46 +1740,88 @@ function OntologyObjectEditor({
                     <small>{property.dataType}</small>
                   </div>
                   <select
-                    value={property.semanticType}
+                    aria-label={`${property.label}字段含义`}
+                    value={property.meaning}
                     onChange={(event) =>
-                      changeProperty(property.id, {
-                        semanticType: event.target
-                          .value as OntologyObject["properties"][number]["semanticType"],
-                      })
+                      changePropertyMeaning(
+                        property.id,
+                        event.target
+                          .value as OntologyObject["properties"][number]["meaning"],
+                      )
                     }
                   >
-                    {PROPERTY_TYPES.map((type) => (
-                      <option key={type} value={type}>
-                        {propertySemanticTypeLabel(type)}
+                    {PROPERTY_MEANINGS.map((meaning) => (
+                      <option key={meaning} value={meaning}>
+                        {propertyMeaningLabel(meaning)}
                       </option>
                     ))}
                   </select>
-                  <div className="property-role-cell">
-                    <select
-                      value={property.identityRole}
-                      onChange={(event) =>
-                        changeProperty(property.id, {
-                          identityRole: event.target
-                            .value as OntologyObject["properties"][number]["identityRole"],
-                        })
-                      }
-                    >
-                      <option value="NONE">普通属性</option>
-                      <option value="OBJECT_IDENTIFIER">对象标识</option>
-                      <option value="BUSINESS_KEY">业务唯一键</option>
-                    </select>
-                    {relationUses.map((relation) => (
-                      <span
-                        className="relation-role-badge"
-                        key={relation.id}
-                        title={relation.name}
+                  <div className="property-constraint-cell">
+                    {property.meaning === "ID" && (
+                      <span className="identity-chip">当前对象唯一 ID</span>
+                    )}
+                    {property.meaning === "CODE" && (
+                      <label className="compact-check">
+                        <input
+                          type="checkbox"
+                          checked={property.unique}
+                          onChange={(event) =>
+                            changeProperty(property.id, {
+                              unique: event.target.checked,
+                            })
+                          }
+                        />
+                        编号唯一
+                      </label>
+                    )}
+                    {property.meaning === "ENTITY_REFERENCE" && (
+                      <select
+                        aria-label={`${property.label}关联目标`}
+                        value={sourceRelation?.targetObjectId ?? ""}
+                        onChange={(event) =>
+                          setEntityReferenceTarget(property.id, event.target.value)
+                        }
                       >
-                        <LinkIcon size={11} /> 关联键
-                      </span>
-                    ))}
+                        <option value="">选择目标对象</option>
+                        {ontology.objects
+                          .filter(
+                            (candidate) =>
+                              candidate.id !== draftObject.id &&
+                              candidate.properties.some(
+                                (targetProperty) => targetProperty.meaning === "ID",
+                              ),
+                          )
+                          .map((candidate) => (
+                            <option key={candidate.id} value={candidate.id}>
+                              {candidate.label}
+                            </option>
+                          ))}
+                      </select>
+                    )}
+                    {(property.meaning === "ID" || !hasObjectId) && (
+                      <label className="compact-check">
+                        <input
+                          type="checkbox"
+                          checked={
+                            property.meaning === "ID" ||
+                            draftObject.grainPropertyIds.includes(property.id)
+                          }
+                          disabled={property.meaning === "ID"}
+                          onChange={(event) =>
+                            toggleGrainProperty(property.id, event.target.checked)
+                          }
+                        />
+                        {property.meaning === "ID" ? "自动确定一行" : "共同确定一行"}
+                      </label>
+                    )}
                   </div>
                   <select
                     value={property.visibility}
+                    aria-label={`${property.label}可用范围`}
+                    disabled={
+                      property.meaning === "ID" ||
+                      property.meaning === "ENTITY_REFERENCE"
+                    }
                     onChange={(event) =>
                       changeProperty(property.id, {
                         visibility: event.target
@@ -1592,52 +1831,162 @@ function OntologyObjectEditor({
                   >
                     <option value="ANALYTICAL">分析属性</option>
                     <option value="DETAIL_ONLY">仅明细展示</option>
-                    <option value="HIDDEN">完全隐藏</option>
+                      <option value="HIDDEN">完全隐藏</option>
                   </select>
-                  <textarea
-                    rows={2}
-                    value={property.description}
-                    placeholder="属性口径说明"
-                    onChange={(event) =>
-                      changeProperty(property.id, { description: event.target.value })
-                    }
-                  />
-                  <input
-                    value={property.synonyms.join("、")}
-                    placeholder="同义词"
-                    disabled={property.visibility !== "ANALYTICAL"}
-                    onChange={(event) =>
-                      changeProperty(property.id, {
-                        synonyms: splitTerms(event.target.value),
-                      })
-                    }
-                  />
-                  <label className="inline-check">
+                  <div className="property-row-details">
+                    <textarea
+                      rows={2}
+                      value={property.description}
+                      placeholder="属性口径说明"
+                      onChange={(event) =>
+                        changeProperty(property.id, { description: event.target.value })
+                      }
+                    />
                     <input
-                      type="checkbox"
-                      checked={property.defaultDisplay}
-                      disabled={property.visibility !== "DETAIL_ONLY"}
+                      value={property.synonyms.join("、")}
+                      placeholder="同义词"
+                      disabled={property.visibility !== "ANALYTICAL"}
                       onChange={(event) =>
                         changeProperty(property.id, {
-                          defaultDisplay: event.target.checked,
+                          synonyms: splitTerms(event.target.value),
                         })
                       }
                     />
-                    明细默认展示
-                  </label>
-                  <label className="inline-check">
-                    <input
-                      type="checkbox"
-                      checked={property.exportable}
-                      disabled={property.visibility === "HIDDEN"}
-                      onChange={(event) =>
-                        changeProperty(property.id, {
-                          exportable: event.target.checked,
-                        })
-                      }
-                    />
-                    允许导出
-                  </label>
+                    {property.meaning === "NUMBER" && property.numericSpec && (
+                      <div className="numeric-rule-grid">
+                        <select
+                          aria-label={`${property.label}数字类型`}
+                          value={property.numericSpec.kind}
+                          onChange={(event) =>
+                            changeProperty(property.id, {
+                              numericSpec: {
+                                ...property.numericSpec!,
+                                kind: event.target.value as NonNullable<
+                                  typeof property.numericSpec
+                                >["kind"],
+                                aggregationBehavior:
+                                  event.target.value === "RATIO"
+                                    ? "NON_ADDITIVE"
+                                    : property.numericSpec!.aggregationBehavior,
+                              },
+                            })
+                          }
+                        >
+                          <option value="GENERAL">一般数字</option>
+                          <option value="CURRENCY">货币</option>
+                          <option value="RATIO">比率</option>
+                        </select>
+                        <select
+                          aria-label={`${property.label}聚合性质`}
+                          value={property.numericSpec.aggregationBehavior}
+                          onChange={(event) =>
+                            changeProperty(property.id, {
+                              numericSpec: {
+                                ...property.numericSpec!,
+                                aggregationBehavior: event.target
+                                  .value as NonNullable<
+                                  typeof property.numericSpec
+                                >["aggregationBehavior"],
+                              },
+                            })
+                          }
+                        >
+                          <option value="ADDITIVE">可加</option>
+                          <option value="SEMI_ADDITIVE">半可加</option>
+                          <option value="NON_ADDITIVE">不可加</option>
+                        </select>
+                        <select
+                          aria-label={`${property.label}默认聚合`}
+                          value={property.numericSpec.defaultAggregation}
+                          onChange={(event) =>
+                            changeProperty(property.id, {
+                              numericSpec: {
+                                ...property.numericSpec!,
+                                defaultAggregation: event.target
+                                  .value as NonNullable<
+                                  typeof property.numericSpec
+                                >["defaultAggregation"],
+                              },
+                            })
+                          }
+                        >
+                          <option value="NONE">不默认聚合</option>
+                          <option value="SUM">求和</option>
+                          <option value="AVG">平均</option>
+                          <option value="MIN">最小值</option>
+                          <option value="MAX">最大值</option>
+                        </select>
+                        <input
+                          value={
+                            property.numericSpec.kind === "CURRENCY"
+                              ? property.numericSpec.currency ?? ""
+                              : property.numericSpec.unit ?? ""
+                          }
+                          placeholder={
+                            property.numericSpec.kind === "CURRENCY"
+                              ? "币种，例如 CNY"
+                              : "单位，例如 分、kg"
+                          }
+                          onChange={(event) =>
+                            changeProperty(property.id, {
+                              numericSpec: {
+                                ...property.numericSpec!,
+                                ...(property.numericSpec!.kind === "CURRENCY"
+                                  ? { currency: event.target.value }
+                                  : { unit: event.target.value }),
+                              },
+                            })
+                          }
+                        />
+                      </div>
+                    )}
+                    <div className="property-behavior-checks">
+                      {isValueSearchableMeaning(property.meaning) && (
+                        <label className="inline-check">
+                          <input
+                            type="checkbox"
+                            checked={property.valueSearchable}
+                            disabled={
+                              property.sensitive ||
+                              property.visibility !== "ANALYTICAL"
+                            }
+                            onChange={(event) =>
+                              changeProperty(property.id, {
+                                valueSearchable: event.target.checked,
+                              })
+                            }
+                          />
+                          允许定位属性值
+                        </label>
+                      )}
+                      <label className="inline-check">
+                        <input
+                          type="checkbox"
+                          checked={property.defaultDisplay}
+                          disabled={property.visibility !== "DETAIL_ONLY"}
+                          onChange={(event) =>
+                            changeProperty(property.id, {
+                              defaultDisplay: event.target.checked,
+                            })
+                          }
+                        />
+                        明细默认展示
+                      </label>
+                      <label className="inline-check">
+                        <input
+                          type="checkbox"
+                          checked={property.exportable}
+                          disabled={property.visibility === "HIDDEN"}
+                          onChange={(event) =>
+                            changeProperty(property.id, {
+                              exportable: event.target.checked,
+                            })
+                          }
+                        />
+                        允许导出
+                      </label>
+                    </div>
+                  </div>
                 </div>
               );
             })}
@@ -1841,7 +2190,18 @@ function OntologyObjectEditor({
               relation={selectedRelation}
               ontology={ontology}
               tables={tables}
-              onChange={(patch) => changeRelation(selectedRelation.id, patch)}
+              onChange={(patch) => {
+                changeRelation(selectedRelation.id, patch);
+                if (
+                  patch.sourcePropertyId &&
+                  selectedRelation.sourceObjectId === draftObject.id
+                ) {
+                  changePropertyMeaning(
+                    patch.sourcePropertyId,
+                    "ENTITY_REFERENCE",
+                  );
+                }
+              }}
               onDelete={() => {
                 setDraftRelations((items) =>
                   items.filter((relation) => relation.id !== selectedRelation.id),
@@ -1870,7 +2230,7 @@ function OntologyObjectEditor({
               >
                 <option value="">不设置</option>
                 {draftObject.properties
-                  .filter((property) => property.semanticType === "TIME")
+                  .filter((property) => property.meaning === "TIME")
                   .map((property) => (
                     <option key={property.id} value={property.id}>
                       {property.label}
@@ -2078,12 +2438,8 @@ function RelationEditor({
               );
               const nextProperty =
                 analyticalProperties(nextTarget).find(
-                  (property) =>
-                    property.sourceColumn ===
-                    source?.properties.find(
-                      (candidate) => candidate.id === relation.sourcePropertyId,
-                    )?.sourceColumn,
-                ) ?? analyticalProperties(nextTarget)[0];
+                  (property) => property.meaning === "ID",
+                );
               onChange({
                 targetObjectId: event.target.value,
                 targetPropertyId: nextProperty?.id,
@@ -2116,9 +2472,11 @@ function RelationEditor({
               })
             }
           >
-            {analyticalProperties(target).map((property) => (
+            {analyticalProperties(target)
+              .filter((property) => property.meaning === "ID")
+              .map((property) => (
               <option key={property.id} value={property.id}>{property.label}</option>
-            ))}
+              ))}
           </select>
         </EditorField>
         <EditorField label="基数">
@@ -2491,15 +2849,25 @@ function StatusBadge({ status }: { status: Turn["status"] }) {
   return <span className={`turn-status ${status}`}>{label}</span>;
 }
 
-const PROPERTY_TYPES: OntologyObject["properties"][number]["semanticType"][] = [
-  "IDENTIFIER",
-  "DIMENSION",
-  "ENUM",
+const OBJECT_TYPES: OntologyObject["objectType"][] = [
+  "ENTITY",
+  "EVENT",
+  "SNAPSHOT",
+  "AGGREGATE",
+  "RELATIONSHIP",
+];
+
+const PROPERTY_MEANINGS: OntologyObject["properties"][number]["meaning"][] = [
+  "ID",
+  "CODE",
+  "NAME",
+  "ENTITY_REFERENCE",
+  "CATEGORY",
   "TIME",
-  "GEOGRAPHY",
-  "AMOUNT",
-  "QUANTITY",
+  "NUMBER",
   "BOOLEAN",
+  "GEOGRAPHY",
+  "TEXT",
 ];
 
 const RELATION_TYPES: OntologyRelation["type"][] = [
@@ -2581,29 +2949,119 @@ function propertyVisibilityLabel(
   }[visibility];
 }
 
-function propertySemanticTypeLabel(
-  type: OntologyObject["properties"][number]["semanticType"],
-): string {
+function objectTypeLabel(type: OntologyObject["objectType"]): string {
   return {
-    IDENTIFIER: "标识符",
-    DIMENSION: "普通维度",
-    ENUM: "枚举",
-    TIME: "时间",
-    GEOGRAPHY: "地理位置",
-    AMOUNT: "金额",
-    QUANTITY: "数量",
-    BOOLEAN: "布尔值",
+    ENTITY: "业务实体",
+    EVENT: "业务事件",
+    SNAPSHOT: "状态快照",
+    AGGREGATE: "汇总结果",
+    RELATIONSHIP: "关联记录",
   }[type];
 }
 
-function propertyIdentityRoleLabel(
-  role: OntologyObject["properties"][number]["identityRole"],
+function propertyMeaningLabel(
+  type: OntologyObject["properties"][number]["meaning"],
 ): string {
   return {
-    NONE: "普通属性",
-    OBJECT_IDENTIFIER: "对象标识",
-    BUSINESS_KEY: "业务唯一键",
-  }[role];
+    ID: "ID",
+    CODE: "编号",
+    NAME: "名称",
+    ENTITY_REFERENCE: "关联实体",
+    CATEGORY: "分类",
+    TIME: "时间",
+    NUMBER: "数字",
+    BOOLEAN: "布尔值",
+    GEOGRAPHY: "地理位置",
+    TEXT: "文本",
+  }[type];
+}
+
+function defaultNumericSpec(): NonNullable<
+  OntologyObject["properties"][number]["numericSpec"]
+> {
+  return {
+    kind: "GENERAL",
+    defaultAggregation: "NONE",
+    aggregationBehavior: "NON_ADDITIVE",
+  };
+}
+
+function isValueSearchableMeaning(
+  meaning: OntologyObject["properties"][number]["meaning"],
+): boolean {
+  return ["CODE", "NAME", "CATEGORY", "BOOLEAN", "GEOGRAPHY"].includes(meaning);
+}
+
+function defaultValueSearchableForMeaning(
+  meaning: OntologyObject["properties"][number]["meaning"],
+): boolean {
+  return isValueSearchableMeaning(meaning);
+}
+
+function effectiveGrainLabel(object: OntologyObject): string {
+  const idProperty = object.properties.find((property) => property.meaning === "ID");
+  const ids = idProperty ? [idProperty.id] : object.grainPropertyIds;
+  const labels = ids
+    .map((id) => object.properties.find((property) => property.id === id)?.label)
+    .filter(Boolean);
+  if (!labels.length) return "尚未配置";
+  return labels.length === 1
+    ? `一行由“${labels[0]}”唯一确定`
+    : `一行由“${labels.join(" × ")}”共同确定`;
+}
+
+function propertyConstraintLabel(
+  property: OntologyObject["properties"][number],
+  object: OntologyObject,
+): string {
+  if (property.meaning === "ID") return "唯一 ID";
+  if (object.grainPropertyIds.includes(property.id)) return "构成行级粒度";
+  if (property.meaning === "NUMBER" && property.numericSpec) {
+    return `${numericKindLabel(property.numericSpec.kind)} · ${aggregationBehaviorLabel(
+      property.numericSpec.aggregationBehavior,
+    )}`;
+  }
+  if (property.unique) return "唯一";
+  if (property.valueSearchable) return "可定位属性值";
+  return "无额外约束";
+}
+
+function numericKindLabel(
+  kind: NonNullable<OntologyObject["properties"][number]["numericSpec"]>["kind"],
+): string {
+  return {
+    GENERAL: "一般数字",
+    CURRENCY: "货币",
+    RATIO: "比率",
+  }[kind];
+}
+
+function aggregationBehaviorLabel(
+  behavior: NonNullable<
+    OntologyObject["properties"][number]["numericSpec"]
+  >["aggregationBehavior"],
+): string {
+  return {
+    ADDITIVE: "可加",
+    SEMI_ADDITIVE: "半可加",
+    NON_ADDITIVE: "不可加",
+  }[behavior];
+}
+
+function relationTargetLabel(
+  propertyId: string,
+  objectId: string,
+  relations: OntologyRelation[],
+  ontology: OntologySnapshot,
+): string {
+  const relation = relations.find(
+    (candidate) =>
+      candidate.sourceObjectId === objectId &&
+      candidate.sourcePropertyId === propertyId,
+  );
+  return relation
+    ? `关联 ${ontology.objects.find((object) => object.id === relation.targetObjectId)?.label ?? "未知对象"}`
+    : "待选择目标对象";
 }
 
 function relationTypeLabel(type: OntologyRelation["type"]): string {

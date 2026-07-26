@@ -15,6 +15,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { Conversation, Turn } from "../src/shared/types.js";
 import { DataAgentHarness } from "../src/server/harness.js";
 import { Repository } from "../src/server/repository.js";
+import { testOntology } from "./fixtures.js";
 
 const roots: string[] = [];
 
@@ -102,6 +103,88 @@ describe("DataAgentHarness", () => {
     expect(output.responseKind).toBe("configuration_required");
     expect(output.result).toBeUndefined();
     expect(output.answer).toContain("请先配置 SelectDB");
+    repository.close();
+  });
+
+  it("locates a governed property value and reuses its local cache", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-harness-"));
+    roots.push(root);
+    const repository = new Repository(
+      path.join(root, ".montane/data-agent/ontology.sqlite"),
+    );
+    repository.saveOntology(testOntology);
+    repository.upsertScannedTables([
+      {
+        id: "t_customers",
+        catalog: "internal",
+        database: "retail",
+        name: "dim_customers",
+        type: "TABLE",
+        status: "MODELED",
+        columns: [
+          {
+            name: "customer_id",
+            dataType: "BIGINT",
+            nullable: false,
+            sensitive: false,
+          },
+          {
+            name: "member_level",
+            dataType: "VARCHAR",
+            nullable: false,
+            sensitive: false,
+          },
+        ],
+        fingerprint: "dim_customers:v2",
+        scannedAt: "2026-07-26T00:00:00.000Z",
+      },
+    ]);
+    repository.saveDataSource({
+      configured: true,
+      host: "selectdb.test",
+      port: 9030,
+      username: "reader",
+      database: "retail",
+      catalog: "internal",
+      tls: false,
+      passwordStored: true,
+    });
+    const calls: Array<{ sql: string; parameters?: unknown[] }> = [];
+    const harness = new DataAgentHarness(
+      root,
+      repository,
+      async (sql, _maxRows, parameters) => {
+        calls.push({ sql, parameters });
+        return {
+          columns: ["matched_value"],
+          rows: [{ matched_value: "VIP" }],
+          durationMs: 3,
+          truncated: false,
+        };
+      },
+      () => runtimeFor(new ScriptedMontaneModel()),
+    );
+    const tool = (
+      harness as unknown as { propertyValueSearchTool(): Tool }
+    ).propertyValueSearchTool();
+
+    const first = await tool.execute({
+      value: "VIP",
+      property_ids: ["p_customer_level"],
+    });
+    const second = await tool.execute({
+      value: "VIP",
+      property_ids: ["p_customer_level"],
+    });
+
+    expect(first.ok).toBe(true);
+    expect(first.content).toContain('"status":"resolved"');
+    expect(first.content).toContain('"property":"会员等级"');
+    expect(calls).toHaveLength(1);
+    expect(calls[0].sql).toContain("`member_level`");
+    expect(calls[0].parameters).toEqual(["VIP"]);
+    expect(second.content).toContain('"source":"local-cache"');
+    await harness.close();
     repository.close();
   });
 });

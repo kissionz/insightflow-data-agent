@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import type { PhysicalTable } from "../src/shared/types.js";
+import type { OntologySnapshot, PhysicalTable } from "../src/shared/types.js";
 import { Repository } from "../src/server/repository.js";
 import { testOntology } from "./fixtures.js";
 
@@ -27,6 +27,34 @@ describe("Repository schema reconciliation", () => {
       relations: [],
       metrics: [],
     });
+    repository.close();
+  });
+
+  it("caches governed property values by ontology version and property", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-repo-"));
+    roots.push(root);
+    const repository = new Repository(path.join(root, "ontology.sqlite"));
+    repository.cachePropertyValue({
+      ontologyVersion: 3,
+      objectId: "o_store",
+      propertyId: "p_region",
+      normalizedValue: "华东",
+      displayValue: "华东",
+      updatedAt: "2026-07-26T00:00:00.000Z",
+    });
+
+    expect(
+      repository.findCachedPropertyValues(3, "华东", ["p_region"]),
+    ).toEqual([
+      expect.objectContaining({
+        objectId: "o_store",
+        propertyId: "p_region",
+        displayValue: "华东",
+      }),
+    ]);
+    expect(repository.findCachedPropertyValues(2, "华东", ["p_region"])).toEqual(
+      [],
+    );
     repository.close();
   });
 
@@ -95,25 +123,36 @@ describe("Repository schema reconciliation", () => {
     repository.close();
   });
 
-  it("migrates legacy object primary keys to property identity roles", () => {
+  it("migrates legacy object primary keys to the single ID field meaning", () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-repo-"));
     roots.push(root);
     const repository = new Repository(path.join(root, "ontology.sqlite"));
     const legacy = structuredClone(testOntology);
+    delete (legacy as Partial<typeof legacy>).schemaVersion;
     legacy.version = 2;
-    legacy.objects[0].primaryKey = ["p_order_id"];
-    delete (
-      legacy.objects[0].properties[0] as Partial<
-        (typeof legacy.objects)[number]["properties"][number]
-      >
-    ).identityRole;
-    repository.saveOntology(legacy);
+    const legacyObject = legacy.objects[0] as unknown as {
+      primaryKey: string[];
+      objectType?: string;
+      grainPropertyIds?: string[];
+      properties: Array<Record<string, unknown>>;
+    };
+    legacyObject.primaryKey = ["p_order_id"];
+    delete legacyObject.objectType;
+    delete legacyObject.grainPropertyIds;
+    for (const property of legacyObject.properties) {
+      property.semanticType = property.id === "p_order_amount" ? "AMOUNT" : "IDENTIFIER";
+      property.identityRole = "NONE";
+      delete property.meaning;
+      delete property.unique;
+      delete property.valueSearchable;
+      delete property.numericSpec;
+    }
+    repository.saveOntology(legacy as OntologySnapshot);
 
     const migrated = repository.getPublishedOntology();
-    expect(migrated.objects[0].primaryKey).toBeUndefined();
-    expect(migrated.objects[0].properties[0].identityRole).toBe(
-      "OBJECT_IDENTIFIER",
-    );
+    expect(migrated.schemaVersion).toBe(2);
+    expect(migrated.objects[0].properties[0].meaning).toBe("ID");
+    expect(migrated.objects[0].properties[1].meaning).toBe("NUMBER");
     repository.close();
   });
 });

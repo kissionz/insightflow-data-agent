@@ -6,8 +6,10 @@ import type {
 } from "../shared/types.js";
 
 export interface SemanticMatch {
-  kind: "object" | "metric";
+  kind: "object" | "property" | "metric";
   id: string;
+  objectId?: string;
+  propertyId?: string;
   label: string;
   score: number;
   matchedBy: string;
@@ -30,11 +32,12 @@ export class SemanticIndex {
 
     for (const token of tokens) {
       for (const match of this.terms.get(token) ?? []) {
-        const existing = scores.get(match.id);
+        const key = `${match.kind}:${match.id}`;
+        const existing = scores.get(key);
         const exactBoost = token === normalized ? 0.4 : 0;
         const next = { ...match, score: Math.min(1, match.score + exactBoost) };
         if (!existing || next.score > existing.score) {
-          scores.set(match.id, next);
+          scores.set(key, next);
         }
       }
     }
@@ -71,14 +74,19 @@ export class SemanticIndex {
       object.name,
       object.label,
       ...object.synonyms,
-      ...object.properties
-        .filter((property) => property.visibility === "ANALYTICAL")
-        .flatMap((property) => [
-          property.name,
-          property.label,
-          ...property.synonyms,
-        ]),
     ]);
+    object.properties
+      .filter((property) => property.visibility === "ANALYTICAL")
+      .forEach((property) =>
+        this.addTerms(
+          "property",
+          property.id,
+          property.label,
+          [property.name, property.label, ...property.synonyms],
+          object.id,
+          property.id,
+        ),
+      );
   }
 
   private indexMetric(metric: Metric): void {
@@ -94,6 +102,8 @@ export class SemanticIndex {
     id: string,
     label: string,
     terms: string[],
+    objectId?: string,
+    propertyId?: string,
   ): void {
     for (const [index, rawTerm] of terms.entries()) {
       const term = normalize(rawTerm);
@@ -101,6 +111,8 @@ export class SemanticIndex {
       const match: SemanticMatch = {
         kind,
         id,
+        objectId,
+        propertyId,
         label,
         score: index < 2 ? 0.96 : 0.84,
         matchedBy: rawTerm,

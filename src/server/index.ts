@@ -36,12 +36,12 @@ const selectDb = new SelectDbClient();
 const harness = new DataAgentHarness(
   config.workspaceRoot,
   repository,
-  async (sql, maxRows) => {
+  async (sql, maxRows, parameters = [], timeoutMs = 180_000) => {
     const source = repository.getDataSource();
     const password = await keychain.getPassword();
     if (!source.configured || !password) throw new Error("SelectDB 凭证不可用");
     await selectDb.configure(source, password);
-    return selectDb.query(sql, 180_000, maxRows);
+    return selectDb.query(sql, timeoutMs, maxRows, parameters);
   },
 );
 const agent = new DataAgent(repository, events, harness);

@@ -107,18 +107,26 @@ export class SelectDbClient {
     }));
   }
 
-  async query(sql: string, timeoutMs = 180_000, maxRows = 10_000): Promise<QueryResult> {
+  async query(
+    sql: string,
+    timeoutMs = 180_000,
+    maxRows = 10_000,
+    parameters: unknown[] = [],
+  ): Promise<QueryResult> {
     if (!this.pool) {
       throw new Error("SelectDB 尚未连接");
     }
 
     const guarded = guardReadOnlySql(sql, maxRows);
     const startedAt = performance.now();
-    const [rows, fields] = await this.pool.query({
-      sql: guarded.sql,
-      timeout: timeoutMs,
-      rowsAsArray: false,
-    });
+    const [rows, fields] = await this.pool.query(
+      {
+        sql: guarded.sql,
+        timeout: timeoutMs,
+        rowsAsArray: false,
+      },
+      parameters,
+    );
     const records = rows as RowDataPacket[];
 
     return {

@@ -1,4 +1,9 @@
-import mysql, { type Pool, type RowDataPacket } from "mysql2/promise";
+import { createHash } from "node:crypto";
+import mysql, {
+  type Pool,
+  type PoolOptions,
+  type RowDataPacket,
+} from "mysql2/promise";
 import type { DataSourceInput, PhysicalTable, SafeDataSourceConfig } from "../shared/types.js";
 import { createId } from "./id.js";
 import { guardReadOnlySql } from "./sql-guard.js";
@@ -10,12 +15,42 @@ export interface QueryResult {
   truncated: boolean;
 }
 
+type PoolFactory = (options: PoolOptions) => Pool;
+
 export class SelectDbClient {
   private pool: Pool | null = null;
+  private poolFingerprint: string | null = null;
+  private configuring: Promise<void> | null = null;
+
+  constructor(
+    private readonly createPool: PoolFactory = (options) =>
+      mysql.createPool(options),
+  ) {}
 
   async configure(config: SafeDataSourceConfig, password: string): Promise<void> {
-    await this.close();
-    this.pool = mysql.createPool({
+    const fingerprint = connectionFingerprint(config, password);
+    if (this.pool && this.poolFingerprint === fingerprint) return;
+
+    if (this.configuring) {
+      await this.configuring;
+      if (this.pool && this.poolFingerprint === fingerprint) return;
+    }
+
+    const configuring = this.replacePool(config, password, fingerprint);
+    this.configuring = configuring;
+    try {
+      await configuring;
+    } finally {
+      if (this.configuring === configuring) this.configuring = null;
+    }
+  }
+
+  private async replacePool(
+    config: SafeDataSourceConfig,
+    password: string,
+    fingerprint: string,
+  ): Promise<void> {
+    const nextPool = this.createPool({
       host: config.host,
       port: config.port,
       user: config.username,
@@ -28,6 +63,10 @@ export class SelectDbClient {
       timezone: "Z",
       ssl: config.tls ? {} : undefined,
     });
+    const previousPool = this.pool;
+    this.pool = nextPool;
+    this.poolFingerprint = fingerprint;
+    if (previousPool) await previousPool.end();
   }
 
   async test(config: DataSourceInput): Promise<{ version: string }> {
@@ -138,11 +177,30 @@ export class SelectDbClient {
   }
 
   async close(): Promise<void> {
-    if (this.pool) {
-      await this.pool.end();
-      this.pool = null;
-    }
+    if (this.configuring) await this.configuring;
+    const pool = this.pool;
+    this.pool = null;
+    this.poolFingerprint = null;
+    if (pool) await pool.end();
   }
+}
+
+function connectionFingerprint(
+  config: SafeDataSourceConfig,
+  password: string,
+): string {
+  return createHash("sha256")
+    .update(
+      JSON.stringify([
+        config.host,
+        config.port,
+        config.username,
+        password,
+        config.database,
+        config.tls,
+      ]),
+    )
+    .digest("hex");
 }
 
 function isSensitiveColumn(name: string): boolean {

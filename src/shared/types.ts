@@ -60,6 +60,8 @@ export type QueryFilterOperator =
   | "IS_NULL"
   | "NOT_NULL";
 
+export type TimeGrain = "DAY" | "WEEK" | "MONTH" | "QUARTER" | "YEAR";
+
 export interface QuestionLanguageFrame {
   originalQuestion: string;
   metricTerms: string[];
@@ -96,15 +98,72 @@ export interface BoundValueAnalysisFilter {
   propertyPriority: number;
 }
 
+export type AnalysisFilter =
+  | DirectAnalysisFilter
+  | BoundValueAnalysisFilter;
+
+export type AnalysisFilterExpression =
+  | {
+      type: "CONDITION";
+      filter: AnalysisFilter;
+    }
+  | {
+      type: "GROUP";
+      operator: "AND" | "OR";
+      children: AnalysisFilterExpression[];
+    }
+  | {
+      type: "NOT";
+      child: AnalysisFilterExpression;
+    };
+
+export interface DerivedMeasureCalculation {
+  id: string;
+  label: string;
+  operator: "ADD" | "SUBTRACT" | "MULTIPLY" | "DIVIDE" | "RATIO";
+  leftMeasureId: string;
+  rightMeasureId: string;
+  scale?: number;
+}
+
+export interface TimeComparisonCalculation {
+  id: string;
+  label: string;
+  measureId: string;
+  comparison: "PREVIOUS_PERIOD" | "YEAR_OVER_YEAR";
+  output: "PREVIOUS_VALUE" | "DIFFERENCE" | "GROWTH_RATE";
+}
+
+export interface WindowCalculation {
+  id: string;
+  label: string;
+  measureId: string;
+  operator: "RANK" | "DENSE_RANK" | "RUNNING_SUM" | "MOVING_AVG";
+  partitionByPropertyIds: string[];
+  orderBy: {
+    entityId: string;
+    direction: "ASC" | "DESC";
+  };
+  windowSize?: number;
+}
+
 export interface AnalysisIntent {
   rootObjectId?: string;
   measureIds: string[];
   dimensionPropertyIds: string[];
-  filters: Array<DirectAnalysisFilter | BoundValueAnalysisFilter>;
+  filters: AnalysisFilter[];
+  filterExpression?: AnalysisFilterExpression;
   timeRange?: {
     expression: string;
     propertyId?: string;
   };
+  timeGrain?: {
+    unit: TimeGrain;
+    propertyId?: string;
+  };
+  derivedMeasures?: DerivedMeasureCalculation[];
+  timeComparisons?: TimeComparisonCalculation[];
+  windowCalculations?: WindowCalculation[];
   sort?: Array<{
     entityId: string;
     direction: "ASC" | "DESC";
@@ -115,7 +174,7 @@ export interface AnalysisIntent {
 }
 
 export interface QueryIR {
-  version: 1;
+  version: 2;
   ontologyVersion: number;
   rootObjectId: string;
   measureIds: string[];
@@ -127,12 +186,20 @@ export interface QueryIR {
         relationIds: string[];
       })
   >;
+  filterExpression?: AnalysisFilterExpression;
   timeRange?: {
     propertyId: string;
     expression: string;
     start: string;
     endExclusive: string;
   };
+  timeGrain?: {
+    unit: TimeGrain;
+    propertyId: string;
+  };
+  derivedMeasures: DerivedMeasureCalculation[];
+  timeComparisons: TimeComparisonCalculation[];
+  windowCalculations: WindowCalculation[];
   relationIds: string[];
   grain: string;
   resultKind: "aggregate" | "detail";

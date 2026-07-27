@@ -523,6 +523,21 @@ export function validateOntology(
         );
       }
       if (
+        property.meaning === "NUMBER" &&
+        property.numericSpec?.defaultAggregation === "SUM" &&
+        (property.numericSpec.kind === "RATIO" ||
+          property.numericSpec.aggregationBehavior === "NON_ADDITIVE")
+      ) {
+        issues.push(
+          error(
+            "NUMBER_DEFAULT_SUM_NOT_ALLOWED",
+            `${property.label} 是比例或不可加数字，默认聚合不能设为 SUM`,
+            object.id,
+            property.id,
+          ),
+        );
+      }
+      if (
         property.valueSearchable &&
         (property.sensitive ||
           property.visibility !== "ANALYTICAL" ||

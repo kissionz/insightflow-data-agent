@@ -630,6 +630,17 @@ Montane 提示词分为不可修改的核心执行协议和可配置的工作区
   按治理口径执行；`measureKind=PROPERTY` 的数字属性 ID 按默认聚合规则生成
   受控度量；普通属性 ID 仍会被拒绝。若数字属性唯一对应一个正式治理指标，
   规则引擎优先映射到正式指标并显示纠正来源。
+- Query IR v2 将时间粒度与普通维度分离，支持 `DAY/WEEK/MONTH/QUARTER/YEAR`，
+  月度问题必须编译为 `DATE_TRUNC(..., 'month')`，不能直接按原始日期分组。
+- 派生计算仅支持强类型 `ADD/SUBTRACT/MULTIPLY/DIVIDE/RATIO`，除零通过
+  `NULLIF` 保护；同比和环比由 `YEAR_OVER_YEAR/PREVIOUS_PERIOD` 指定，
+  规则引擎自动扩展底层取数时间并裁剪最终展示区间。
+- 窗口计算支持 `RANK/DENSE_RANK/RUNNING_SUM/MOVING_AVG`，分区字段必须已
+  出现在结果维度中，移动窗口限制为 2 至 365。
+- 筛选支持最多四层 `AND/OR/NOT` 逻辑树；所有叶子仍执行属性权限、值绑定和
+  参数化校验。
+- 聚合安全规则禁止多个事实对象直接混算，阻止会放大事实行的一对多/多对多路径，
+  禁止比例或不可加数字求和，并禁止半可加指标跨时间直接求和。
 - SQL 和查询参数必须写入对应轮次追踪。
 
 Montane 会话启用事件压缩，模型侧 Ontology 工具结果只返回当前问题所需的对象、

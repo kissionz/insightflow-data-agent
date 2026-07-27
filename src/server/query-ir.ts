@@ -1,5 +1,8 @@
 import type {
+  AnalysisFilter,
+  AnalysisFilterExpression,
   AnalysisIntent,
+  DerivedMeasureCalculation,
   Metric,
   OntologyObject,
   OntologyProperty,
@@ -8,6 +11,9 @@ import type {
   PhysicalTable,
   QueryFilterOperator,
   QueryIR,
+  TimeComparisonCalculation,
+  TimeGrain,
+  WindowCalculation,
 } from "../shared/types.js";
 import { SemanticIndex } from "./semantic-index.js";
 
@@ -46,7 +52,10 @@ export class QueryIrCompiler {
     const dimensions = intent.dimensionPropertyIds.map((id) =>
       requireProperty(propertyOwners, id, "分析维度"),
     );
-    const filters = intent.filters.map((filter) => {
+    const sourceFilters = intent.filterExpression
+      ? flattenFilterExpression(intent.filterExpression)
+      : intent.filters;
+    const filters = sourceFilters.map((filter) => {
       const binding = requireProperty(propertyOwners, filter.propertyId, "筛选条件");
       if (filter.kind === "BOUND_VALUE" && binding.object.id !== filter.objectId) {
         throw new Error(`属性值绑定 ${filter.valueBindingId} 的对象与属性不一致`);
@@ -64,7 +73,15 @@ export class QueryIrCompiler {
     const rootTable = tableById.get(root.sourceTableId);
     if (!rootTable) throw new Error(`业务对象 ${root.label} 的来源表不可用`);
 
-    const timeBinding = intent.timeRange
+    const needsTimeBinding = Boolean(
+      intent.timeRange ||
+      intent.timeGrain ||
+      intent.timeComparisons?.length ||
+      intent.windowCalculations?.some(
+        (calculation) => calculation.orderBy.entityId === "__time__",
+      ),
+    );
+    const timeBinding = needsTimeBinding
       ? resolveTimeBinding(intent, root, measures, propertyOwners)
       : undefined;
     const requiredObjectIds = new Set([
@@ -116,6 +133,15 @@ export class QueryIrCompiler {
         return [object.id, table] as const;
       }),
     );
+    validateAggregationSafety(
+      root,
+      measures,
+      dimensions,
+      intent.timeGrain?.unit,
+      outerRelationIds,
+      ontology,
+    );
+
     const selectParts: string[] = [];
     const groupParts: string[] = [];
     for (const binding of dimensions) {
@@ -126,11 +152,40 @@ export class QueryIrCompiler {
       selectParts.push(`${expression} AS ${quoteIdentifier(binding.property.label)}`);
       groupParts.push(expression);
     }
+    if (intent.timeGrain && timeBinding) {
+      const expression = compileTimeBucket(
+        qualifiedColumn(aliases.get(timeBinding.object.id)!, timeBinding.property),
+        intent.timeGrain.unit,
+      );
+      selectParts.push(`${expression} AS ${quoteIdentifier(timeGrainLabel(intent.timeGrain.unit))}`);
+      groupParts.push(expression);
+    }
     for (const metric of measures) {
       const object = objectById.get(metric.objectId);
       if (!object) throw new Error(`指标 ${metric.label} 的所属对象不存在`);
       selectParts.push(
         `${compileMetric(metric, object, aliases, tablesByObject)} AS ${quoteIdentifier(metric.label)}`,
+      );
+    }
+    const measureByReference = buildMeasureReferenceMap(
+      intent.measureIds,
+      measureBindings,
+    );
+    validateCalculations(
+      intent,
+      measureByReference,
+      dimensions,
+      timeBinding,
+    );
+    for (const calculation of intent.derivedMeasures ?? []) {
+      selectParts.push(
+        `${compileDerivedMeasure(
+          calculation,
+          measureByReference,
+          objectById,
+          aliases,
+          tablesByObject,
+        )} AS ${quoteIdentifier(calculation.label)}`,
       );
     }
     if (!selectParts.length) {
@@ -164,10 +219,11 @@ export class QueryIrCompiler {
       }
     }
     const filterRelationIds = new Map<string, string[]>();
+    const compiledFilterParts: string[] = [];
     for (const filter of filters) {
       const existingAlias = aliases.get(filter.binding.object.id);
       if (filter.kind !== "BOUND_VALUE" || existingAlias) {
-        whereParts.push(
+        compiledFilterParts.push(
           compileFilter(
             qualifiedColumn(existingAlias ?? aliases.get(root.id)!, filter.binding.property),
             filter.operator,
@@ -187,7 +243,7 @@ export class QueryIrCompiler {
         );
       }
       validateRelationPath(path);
-      whereParts.push(
+      compiledFilterParts.push(
         compileRelatedValueExists(
           root,
           aliases.get(root.id)!,
@@ -203,6 +259,22 @@ export class QueryIrCompiler {
       );
       filterRelationIds.set(filter.valueBindingId, path.map((relation) => relation.id));
     }
+    if (intent.filterExpression) {
+      let filterIndex = 0;
+      whereParts.push(
+        compileFilterExpression(intent.filterExpression, () => {
+          const part = compiledFilterParts[filterIndex];
+          filterIndex += 1;
+          if (!part) throw new Error("逻辑筛选树与筛选条件数量不一致");
+          return part;
+        }),
+      );
+      if (filterIndex !== compiledFilterParts.length) {
+        throw new Error("逻辑筛选树未覆盖全部筛选条件");
+      }
+    } else {
+      whereParts.push(...compiledFilterParts);
+    }
 
     let resolvedTime: QueryIR["timeRange"];
     if (intent.timeRange && timeBinding) {
@@ -211,12 +283,19 @@ export class QueryIrCompiler {
         this.now(),
         timezone,
       );
+      const comparisonStart = intent.timeComparisons?.length
+        ? expandTimeRangeStart(
+            range.start,
+            intent.timeGrain?.unit,
+            intent.timeComparisons,
+          )
+        : range.start;
       const column = qualifiedColumn(
         aliases.get(timeBinding.object.id)!,
         timeBinding.property,
       );
       whereParts.push(`${column} >= ?`);
-      parameters.push(range.start);
+      parameters.push(comparisonStart);
       whereParts.push(`${column} < ?`);
       parameters.push(range.endExclusive);
       resolvedTime = {
@@ -232,27 +311,63 @@ export class QueryIrCompiler {
     );
     const sort = intent.sort ?? [];
     const orderParts = sort.map((item) => {
-      const metric = metricById.get(item.entityId);
+      const metric = metricById.get(item.entityId) ?? measureByReference.get(item.entityId);
       if (metric) return `${quoteIdentifier(metric.label)} ${item.direction}`;
+      const calculation = [
+        ...(intent.derivedMeasures ?? []),
+        ...(intent.timeComparisons ?? []),
+        ...(intent.windowCalculations ?? []),
+      ].find((candidate) => candidate.id === item.entityId);
+      if (calculation) return `${quoteIdentifier(calculation.label)} ${item.direction}`;
+      if (item.entityId === "__time__" && intent.timeGrain) {
+        return `${quoteIdentifier(timeGrainLabel(intent.timeGrain.unit))} ${item.direction}`;
+      }
       const binding = requireProperty(propertyOwners, item.entityId, "排序字段");
       return `${qualifiedColumn(aliases.get(binding.object.id)!, binding.property)} ${item.direction}`;
     });
-    const sql = [
-      `SELECT ${selectParts.join(", ")}`,
-      `FROM ${from}`,
-      ...joins,
-      whereParts.length ? `WHERE ${whereParts.join("\n  AND ")}` : "",
-      groupParts.length ? `GROUP BY ${groupParts.join(", ")}` : "",
-      orderParts.length ? `ORDER BY ${orderParts.join(", ")}` : "",
-      `LIMIT ${limit}`,
-    ]
-      .filter(Boolean)
-      .join("\n");
+    if (!orderParts.length && intent.timeGrain) {
+      orderParts.push(`${quoteIdentifier(timeGrainLabel(intent.timeGrain.unit))} ASC`);
+    }
+    const advancedCalculations = Boolean(
+      intent.timeComparisons?.length || intent.windowCalculations?.length,
+    );
+    const sql = advancedCalculations
+      ? compileLayeredAnalysis({
+          intent,
+          dimensions,
+          measures,
+          measureByReference,
+          objectById,
+          aliases,
+          tablesByObject,
+          from,
+          joins,
+          whereParts,
+          parameters,
+          timeBinding,
+          resolvedTime,
+          orderParts,
+          limit,
+        })
+      : [
+          `SELECT ${selectParts.join(", ")}`,
+          `FROM ${from}`,
+          ...joins,
+          whereParts.length ? `WHERE ${whereParts.join("\n  AND ")}` : "",
+          groupParts.length ? `GROUP BY ${groupParts.join(", ")}` : "",
+          orderParts.length ? `ORDER BY ${orderParts.join(", ")}` : "",
+          `LIMIT ${limit}`,
+        ]
+          .filter(Boolean)
+          .join("\n");
     const grain =
       intent.resultKind === "detail"
         ? effectiveGrainLabel(root)
-        : dimensions.length
-          ? dimensions.map((binding) => binding.property.label).join("、")
+        : dimensions.length || intent.timeGrain
+          ? [
+              ...dimensions.map((binding) => binding.property.label),
+              ...(intent.timeGrain ? [timeGrainLabel(intent.timeGrain.unit)] : []),
+            ].join("、")
           : "整体汇总";
     const relationIds = [
       ...new Set([
@@ -261,7 +376,7 @@ export class QueryIrCompiler {
       ]),
     ];
     const ir: QueryIR = {
-      version: 1,
+      version: 2,
       ontologyVersion: ontology.version,
       rootObjectId: root.id,
       measureIds: measures.map((metric) => metric.id),
@@ -275,7 +390,18 @@ export class QueryIrCompiler {
             }
           : filter,
       ),
+      filterExpression: intent.filterExpression,
       timeRange: resolvedTime,
+      timeGrain:
+        intent.timeGrain && timeBinding
+          ? {
+              unit: intent.timeGrain.unit,
+              propertyId: timeBinding.property.id,
+            }
+          : undefined,
+      derivedMeasures: intent.derivedMeasures ?? [],
+      timeComparisons: intent.timeComparisons ?? [],
+      windowCalculations: intent.windowCalculations ?? [],
       relationIds,
       grain,
       resultKind: intent.resultKind,
@@ -300,6 +426,32 @@ export class QueryIrCompiler {
         value: property.label,
         source: "属性ID精确绑定",
         entityId: property.id,
+      })),
+      ...(intent.timeGrain && timeBinding
+        ? [{
+            label: "时间粒度",
+            value: timeGrainLabel(intent.timeGrain.unit),
+            source: `时间属性 ${timeBinding.property.label}`,
+            entityId: timeBinding.property.id,
+          }]
+        : []),
+      ...(intent.derivedMeasures ?? []).map((calculation) => ({
+        label: "派生计算",
+        value: calculation.label,
+        source: `IR ${calculation.operator}`,
+        entityId: calculation.id,
+      })),
+      ...(intent.timeComparisons ?? []).map((calculation) => ({
+        label: "时间比较",
+        value: calculation.label,
+        source: `IR ${calculation.comparison}/${calculation.output}`,
+        entityId: calculation.id,
+      })),
+      ...(intent.windowCalculations ?? []).map((calculation) => ({
+        label: "窗口计算",
+        value: calculation.label,
+        source: `IR ${calculation.operator}`,
+        entityId: calculation.id,
       })),
       ...filters.map(({ binding, businessValue, value, ...filter }) => ({
         label: "筛选条件",
@@ -326,9 +478,575 @@ export class QueryIrCompiler {
       sql,
       parameters,
       bindings,
-      planSummary: `${root.label} · ${grain} · ${measures.length} 个指标 · ${filters.length + (resolvedTime ? 1 : 0)} 个条件`,
+      planSummary: `${root.label} · ${grain} · ${measures.length} 个基础指标 · ${
+        (intent.derivedMeasures?.length ?? 0) +
+        (intent.timeComparisons?.length ?? 0) +
+        (intent.windowCalculations?.length ?? 0)
+      } 个计算 · ${filters.length + (resolvedTime ? 1 : 0)} 个条件`,
     };
   }
+}
+
+function flattenFilterExpression(
+  expression: AnalysisFilterExpression,
+): AnalysisFilter[] {
+  if (expression.type === "CONDITION") return [expression.filter];
+  if (expression.type === "NOT") return flattenFilterExpression(expression.child);
+  return expression.children.flatMap(flattenFilterExpression);
+}
+
+function compileFilterExpression(
+  expression: AnalysisFilterExpression,
+  nextCondition: () => string,
+): string {
+  if (expression.type === "CONDITION") return `(${nextCondition()})`;
+  if (expression.type === "NOT") {
+    return `(NOT ${compileFilterExpression(expression.child, nextCondition)})`;
+  }
+  if (expression.children.length < 2) {
+    throw new Error(`${expression.operator} 条件组至少需要两个子条件`);
+  }
+  return `(${expression.children
+    .map((child) => compileFilterExpression(child, nextCondition))
+    .join(` ${expression.operator} `)})`;
+}
+
+function buildMeasureReferenceMap(
+  requestedIds: string[],
+  bindings: Array<{ metric: Metric }>,
+): Map<string, Metric> {
+  const result = new Map<string, Metric>();
+  bindings.forEach((binding, index) => {
+    result.set(binding.metric.id, binding.metric);
+    const requested = requestedIds[index];
+    if (requested) result.set(requested, binding.metric);
+  });
+  return result;
+}
+
+function validateCalculations(
+  intent: AnalysisIntent,
+  measures: Map<string, Metric>,
+  dimensions: Array<{ object: OntologyObject; property: OntologyProperty }>,
+  timeBinding?: { object: OntologyObject; property: OntologyProperty },
+): void {
+  const calculations = [
+    ...(intent.derivedMeasures ?? []),
+    ...(intent.timeComparisons ?? []),
+    ...(intent.windowCalculations ?? []),
+  ];
+  const ids = new Set<string>();
+  for (const calculation of calculations) {
+    if (!calculation.id.trim() || !calculation.label.trim()) {
+      throw new Error("计算项的 ID 和名称不能为空");
+    }
+    if (ids.has(calculation.id) || measures.has(calculation.id)) {
+      throw new Error(`计算项 ID 重复：${calculation.id}`);
+    }
+    ids.add(calculation.id);
+  }
+  for (const calculation of intent.derivedMeasures ?? []) {
+    requireMeasureReference(measures, calculation.leftMeasureId, calculation.label);
+    requireMeasureReference(measures, calculation.rightMeasureId, calculation.label);
+    if (
+      calculation.scale != null &&
+      (!Number.isFinite(calculation.scale) ||
+        calculation.scale <= 0 ||
+        calculation.scale > 1_000_000)
+    ) {
+      throw new Error(`派生计算 ${calculation.label} 的缩放系数无效`);
+    }
+  }
+  if (intent.timeComparisons?.length) {
+    if (!intent.timeGrain || !timeBinding) {
+      throw new Error("同比或环比计算必须指定时间粒度");
+    }
+    for (const calculation of intent.timeComparisons) {
+      requireMeasureReference(measures, calculation.measureId, calculation.label);
+    }
+  }
+  const dimensionIds = new Set(dimensions.map((binding) => binding.property.id));
+  for (const calculation of intent.windowCalculations ?? []) {
+    requireMeasureReference(measures, calculation.measureId, calculation.label);
+    for (const propertyId of calculation.partitionByPropertyIds) {
+      if (
+        propertyId !== "__time__" &&
+        !dimensionIds.has(propertyId)
+      ) {
+        throw new Error(
+          `窗口计算 ${calculation.label} 的分区属性必须同时出现在维度中：${propertyId}`,
+        );
+      }
+      if (propertyId === "__time__" && (!intent.timeGrain || !timeBinding)) {
+        throw new Error(`窗口计算 ${calculation.label} 按时间分区时必须指定时间粒度`);
+      }
+    }
+    const orderId = calculation.orderBy.entityId;
+    if (
+      orderId !== "__time__" &&
+      !dimensionIds.has(orderId) &&
+      !measures.has(orderId)
+    ) {
+      throw new Error(`窗口计算 ${calculation.label} 引用了不可用的排序字段`);
+    }
+    if (orderId === "__time__" && (!intent.timeGrain || !timeBinding)) {
+      throw new Error(`窗口计算 ${calculation.label} 按时间排序时必须指定时间粒度`);
+    }
+    if (calculation.operator === "MOVING_AVG") {
+      const size = calculation.windowSize ?? 3;
+      if (!Number.isInteger(size) || size < 2 || size > 365) {
+        throw new Error(`移动平均 ${calculation.label} 的窗口必须在 2 到 365 之间`);
+      }
+    }
+  }
+  if (
+    intent.resultKind === "detail" &&
+    (intent.timeGrain ||
+      intent.derivedMeasures?.length ||
+      intent.timeComparisons?.length ||
+      intent.windowCalculations?.length)
+  ) {
+    throw new Error("时间粒度和计算算法只能用于聚合查询");
+  }
+}
+
+function requireMeasureReference(
+  measures: Map<string, Metric>,
+  id: string,
+  calculationLabel: string,
+): Metric {
+  const metric = measures.get(id);
+  if (!metric) {
+    throw new Error(`计算项 ${calculationLabel} 引用了未提交的基础指标：${id}`);
+  }
+  return metric;
+}
+
+function compileDerivedMeasure(
+  calculation: DerivedMeasureCalculation,
+  measures: Map<string, Metric>,
+  objects: Map<string, OntologyObject>,
+  aliases: Map<string, string>,
+  tables: Map<string, PhysicalTable>,
+): string {
+  const left = requireMeasureReference(
+    measures,
+    calculation.leftMeasureId,
+    calculation.label,
+  );
+  const right = requireMeasureReference(
+    measures,
+    calculation.rightMeasureId,
+    calculation.label,
+  );
+  const leftObject = objects.get(left.objectId);
+  const rightObject = objects.get(right.objectId);
+  if (!leftObject || !rightObject) {
+    throw new Error(`派生计算 ${calculation.label} 的指标对象不存在`);
+  }
+  return compileArithmeticExpression(
+    calculation.operator,
+    compileMetric(left, leftObject, aliases, tables),
+    compileMetric(right, rightObject, aliases, tables),
+    calculation.scale,
+  );
+}
+
+function compileArithmeticExpression(
+  operator: DerivedMeasureCalculation["operator"],
+  left: string,
+  right: string,
+  scale = 1,
+): string {
+  if (operator === "ADD") return `(${left} + ${right})`;
+  if (operator === "SUBTRACT") return `(${left} - ${right})`;
+  if (operator === "MULTIPLY") return `(${left} * ${right})`;
+  if (operator === "DIVIDE" || operator === "RATIO") {
+    return `((${left}) / NULLIF((${right}), 0) * ${formatNumericLiteral(scale)})`;
+  }
+  throw new Error(`不支持的派生计算：${operator}`);
+}
+
+function formatNumericLiteral(value: number): string {
+  if (!Number.isFinite(value)) throw new Error("计算系数必须是有限数字");
+  return String(value);
+}
+
+function validateAggregationSafety(
+  root: OntologyObject,
+  measures: Metric[],
+  _dimensions: Array<{ object: OntologyObject; property: OntologyProperty }>,
+  timeGrain: TimeGrain | undefined,
+  relationIds: string[],
+  ontology: OntologySnapshot,
+): void {
+  const measureObjects = new Set(measures.map((metric) => metric.objectId));
+  if (measureObjects.size > 1) {
+    throw new Error("当前 IR 不允许直接混合多个事实对象的指标，请先配置同粒度派生对象");
+  }
+  for (const metric of measures) {
+    const object = ontology.objects.find((candidate) => candidate.id === metric.objectId);
+    const property = object?.properties.find(
+      (candidate) => candidate.id === metric.sourcePropertyId,
+    );
+    const numeric = property?.numericSpec;
+    if (!numeric) continue;
+    if (
+      metric.aggregation === "SUM" &&
+      (numeric.kind === "RATIO" ||
+        numeric.aggregationBehavior === "NON_ADDITIVE")
+    ) {
+      throw new Error(`指标 ${metric.label} 的来源属性 ${property!.label} 不允许求和`);
+    }
+    if (
+      metric.aggregation === "SUM" &&
+      numeric.aggregationBehavior === "SEMI_ADDITIVE" &&
+      timeGrain
+    ) {
+      throw new Error(
+        `指标 ${metric.label} 是半可加指标，不能直接按${timeGrainLabel(timeGrain)}跨时间求和`,
+      );
+    }
+  }
+  const joined = new Set([root.id]);
+  for (const relationId of relationIds) {
+    const relation = ontology.relations.find((candidate) => candidate.id === relationId);
+    if (!relation) continue;
+    const fromSource =
+      joined.has(relation.sourceObjectId) && !joined.has(relation.targetObjectId);
+    const fromTarget =
+      joined.has(relation.targetObjectId) && !joined.has(relation.sourceObjectId);
+    const expands =
+      relation.cardinality === "MANY_TO_MANY" ||
+      (fromSource && relation.cardinality === "ONE_TO_MANY") ||
+      (fromTarget && relation.cardinality === "MANY_TO_ONE");
+    if (expands) {
+      throw new Error(
+        `关系 ${relation.name} 会放大 ${root.label} 的行数，IR 已阻止可能的重复聚合`,
+      );
+    }
+    joined.add(
+      fromSource ? relation.targetObjectId : relation.sourceObjectId,
+    );
+  }
+}
+
+function compileTimeBucket(column: string, grain: TimeGrain): string {
+  return `DATE_TRUNC(${column}, '${grain.toLowerCase()}')`;
+}
+
+function timeGrainLabel(grain: TimeGrain): string {
+  return {
+    DAY: "日期",
+    WEEK: "周",
+    MONTH: "月份",
+    QUARTER: "季度",
+    YEAR: "年份",
+  }[grain];
+}
+
+interface LayeredAnalysisContext {
+  intent: AnalysisIntent;
+  dimensions: Array<{ object: OntologyObject; property: OntologyProperty }>;
+  measures: Metric[];
+  measureByReference: Map<string, Metric>;
+  objectById: Map<string, OntologyObject>;
+  aliases: Map<string, string>;
+  tablesByObject: Map<string, PhysicalTable>;
+  from: string;
+  joins: string[];
+  whereParts: string[];
+  parameters: unknown[];
+  timeBinding?: { object: OntologyObject; property: OntologyProperty };
+  resolvedTime?: QueryIR["timeRange"];
+  orderParts: string[];
+  limit: number;
+}
+
+function compileLayeredAnalysis(context: LayeredAnalysisContext): string {
+  const {
+    intent,
+    dimensions,
+    measures,
+    measureByReference,
+    objectById,
+    aliases,
+    tablesByObject,
+    from,
+    joins,
+    whereParts,
+    parameters,
+    timeBinding,
+    resolvedTime,
+    limit,
+  } = context;
+  const dimensionAliases = new Map<string, string>();
+  const measureAliases = new Map<string, string>();
+  const baseSelect: string[] = [];
+  const baseGroups: string[] = [];
+  dimensions.forEach((binding, index) => {
+    const alias = `__d${index}`;
+    dimensionAliases.set(binding.property.id, alias);
+    const expression = qualifiedColumn(
+      aliases.get(binding.object.id)!,
+      binding.property,
+    );
+    baseSelect.push(`${expression} AS ${quoteIdentifier(alias)}`);
+    baseGroups.push(expression);
+  });
+  if (intent.timeGrain && timeBinding) {
+    const expression = compileTimeBucket(
+      qualifiedColumn(aliases.get(timeBinding.object.id)!, timeBinding.property),
+      intent.timeGrain.unit,
+    );
+    baseSelect.push(`${expression} AS \`__time_bucket\``);
+    baseGroups.push(expression);
+  }
+  measures.forEach((metric, index) => {
+    const alias = `__m${index}`;
+    measureAliases.set(metric.id, alias);
+    const object = objectById.get(metric.objectId);
+    if (!object) throw new Error(`指标 ${metric.label} 的所属对象不存在`);
+    baseSelect.push(
+      `${compileMetric(metric, object, aliases, tablesByObject)} AS ${quoteIdentifier(alias)}`,
+    );
+  });
+
+  const comparisonJoins: string[] = [];
+  const comparisonExpressions = new Map<string, string>();
+  for (const [index, calculation] of (intent.timeComparisons ?? []).entries()) {
+    const previousAlias = `p${index}`;
+    const metric = requireMeasureReference(
+      measureByReference,
+      calculation.measureId,
+      calculation.label,
+    );
+    const metricAlias = measureAliases.get(metric.id)!;
+    const dimensionConditions = [...dimensionAliases.values()].map(
+      (alias) => `${previousAlias}.${quoteIdentifier(alias)} <=> c.${quoteIdentifier(alias)}`,
+    );
+    const interval = timeComparisonInterval(
+      calculation.comparison,
+      intent.timeGrain!.unit,
+    );
+    comparisonJoins.push(
+      [
+        `LEFT JOIN \`base\` AS ${previousAlias} ON`,
+        ...[
+          ...dimensionConditions,
+          `${previousAlias}.\`__time_bucket\` = DATE_SUB(c.\`__time_bucket\`, INTERVAL ${interval})`,
+        ].map((condition, conditionIndex) =>
+          `${conditionIndex ? "  AND " : "  "}${condition}`,
+        ),
+      ].join("\n"),
+    );
+    const current = `c.${quoteIdentifier(metricAlias)}`;
+    const previous = `${previousAlias}.${quoteIdentifier(metricAlias)}`;
+    comparisonExpressions.set(
+      calculation.id,
+      calculation.output === "PREVIOUS_VALUE"
+        ? previous
+        : calculation.output === "DIFFERENCE"
+          ? `(${current} - ${previous})`
+          : `((${current} - ${previous}) / NULLIF(${previous}, 0))`,
+    );
+  }
+
+  const finalSelect: string[] = [];
+  for (const binding of dimensions) {
+    finalSelect.push(
+      `c.${quoteIdentifier(dimensionAliases.get(binding.property.id)!)} AS ${quoteIdentifier(binding.property.label)}`,
+    );
+  }
+  if (intent.timeGrain) {
+    finalSelect.push(
+      `c.\`__time_bucket\` AS ${quoteIdentifier(timeGrainLabel(intent.timeGrain.unit))}`,
+    );
+  }
+  for (const metric of measures) {
+    finalSelect.push(
+      `c.${quoteIdentifier(measureAliases.get(metric.id)!)} AS ${quoteIdentifier(metric.label)}`,
+    );
+  }
+  for (const calculation of intent.derivedMeasures ?? []) {
+    const left = requireMeasureReference(
+      measureByReference,
+      calculation.leftMeasureId,
+      calculation.label,
+    );
+    const right = requireMeasureReference(
+      measureByReference,
+      calculation.rightMeasureId,
+      calculation.label,
+    );
+    finalSelect.push(
+      `${compileArithmeticExpression(
+        calculation.operator,
+        `c.${quoteIdentifier(measureAliases.get(left.id)!)}`,
+        `c.${quoteIdentifier(measureAliases.get(right.id)!)}`,
+        calculation.scale,
+      )} AS ${quoteIdentifier(calculation.label)}`,
+    );
+  }
+  for (const calculation of intent.timeComparisons ?? []) {
+    finalSelect.push(
+      `${comparisonExpressions.get(calculation.id)} AS ${quoteIdentifier(calculation.label)}`,
+    );
+  }
+  for (const calculation of intent.windowCalculations ?? []) {
+    finalSelect.push(
+      `${compileWindowExpression(
+        calculation,
+        measureByReference,
+        measureAliases,
+        dimensionAliases,
+        intent,
+      )} AS ${quoteIdentifier(calculation.label)}`,
+    );
+  }
+
+  const finalWhere: string[] = [];
+  if (resolvedTime && intent.timeComparisons?.length) {
+    finalWhere.push("c.`__time_bucket` >= ?");
+    parameters.push(resolvedTime.start);
+    finalWhere.push("c.`__time_bucket` < ?");
+    parameters.push(resolvedTime.endExclusive);
+  }
+  const finalOrder = compileLayeredOrder(
+    intent,
+    dimensions,
+    measureByReference,
+  );
+  return [
+    "WITH `base` AS (",
+    `  SELECT ${baseSelect.join(", ")}`,
+    `  FROM ${from}`,
+    ...joins.map((join) => `  ${join}`),
+    whereParts.length ? `  WHERE ${whereParts.join("\n    AND ")}` : "",
+    baseGroups.length ? `  GROUP BY ${baseGroups.join(", ")}` : "",
+    ")",
+    `SELECT ${finalSelect.join(", ")}`,
+    "FROM `base` AS c",
+    ...comparisonJoins,
+    finalWhere.length ? `WHERE ${finalWhere.join("\n  AND ")}` : "",
+    finalOrder.length ? `ORDER BY ${finalOrder.join(", ")}` : "",
+    `LIMIT ${limit}`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function compileWindowExpression(
+  calculation: WindowCalculation,
+  measures: Map<string, Metric>,
+  measureAliases: Map<string, string>,
+  dimensionAliases: Map<string, string>,
+  intent: AnalysisIntent,
+): string {
+  const metric = requireMeasureReference(
+    measures,
+    calculation.measureId,
+    calculation.label,
+  );
+  const value = `c.${quoteIdentifier(measureAliases.get(metric.id)!)}`;
+  const partitions = calculation.partitionByPropertyIds.map((propertyId) =>
+    propertyId === "__time__"
+      ? "c.`__time_bucket`"
+      : `c.${quoteIdentifier(dimensionAliases.get(propertyId)!)}`,
+  );
+  const orderEntity = calculation.orderBy.entityId;
+  const orderMetric = measures.get(orderEntity);
+  const orderExpression =
+    orderEntity === "__time__"
+      ? "c.`__time_bucket`"
+      : orderMetric
+        ? `c.${quoteIdentifier(measureAliases.get(orderMetric.id)!)}`
+        : `c.${quoteIdentifier(dimensionAliases.get(orderEntity)!)}`;
+  const overPrefix = [
+    partitions.length ? `PARTITION BY ${partitions.join(", ")}` : "",
+    `ORDER BY ${orderExpression} ${calculation.orderBy.direction}`,
+  ]
+    .filter(Boolean)
+    .join(" ");
+  if (calculation.operator === "RANK") return `RANK() OVER (${overPrefix})`;
+  if (calculation.operator === "DENSE_RANK") {
+    return `DENSE_RANK() OVER (${overPrefix})`;
+  }
+  if (calculation.operator === "RUNNING_SUM") {
+    return `SUM(${value}) OVER (${overPrefix} ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)`;
+  }
+  const size = calculation.windowSize ?? 3;
+  return `AVG(${value}) OVER (${overPrefix} ROWS BETWEEN ${size - 1} PRECEDING AND CURRENT ROW)`;
+}
+
+function compileLayeredOrder(
+  intent: AnalysisIntent,
+  dimensions: Array<{ property: OntologyProperty }>,
+  measures: Map<string, Metric>,
+): string[] {
+  const calculations = [
+    ...(intent.derivedMeasures ?? []),
+    ...(intent.timeComparisons ?? []),
+    ...(intent.windowCalculations ?? []),
+  ];
+  const parts = (intent.sort ?? []).map((sort) => {
+    const metric = measures.get(sort.entityId);
+    if (metric) return `${quoteIdentifier(metric.label)} ${sort.direction}`;
+    const calculation = calculations.find((candidate) => candidate.id === sort.entityId);
+    if (calculation) return `${quoteIdentifier(calculation.label)} ${sort.direction}`;
+    if (sort.entityId === "__time__" && intent.timeGrain) {
+      return `${quoteIdentifier(timeGrainLabel(intent.timeGrain.unit))} ${sort.direction}`;
+    }
+    const dimension = dimensions.find(
+      (binding) => binding.property.id === sort.entityId,
+    );
+    if (!dimension) throw new Error(`排序字段未包含在结果粒度中：${sort.entityId}`);
+    return `${quoteIdentifier(dimension.property.label)} ${sort.direction}`;
+  });
+  if (!parts.length && intent.timeGrain) {
+    parts.push(`${quoteIdentifier(timeGrainLabel(intent.timeGrain.unit))} ASC`);
+  }
+  return parts;
+}
+
+function timeComparisonInterval(
+  comparison: TimeComparisonCalculation["comparison"],
+  grain: TimeGrain,
+): string {
+  if (comparison === "YEAR_OVER_YEAR") return "1 YEAR";
+  return {
+    DAY: "1 DAY",
+    WEEK: "1 WEEK",
+    MONTH: "1 MONTH",
+    QUARTER: "3 MONTH",
+    YEAR: "1 YEAR",
+  }[grain];
+}
+
+function expandTimeRangeStart(
+  start: string,
+  grain: TimeGrain | undefined,
+  comparisons: TimeComparisonCalculation[],
+): string {
+  if (!grain) throw new Error("时间比较必须指定时间粒度");
+  const date = new Date(`${start.slice(0, 10)}T00:00:00.000Z`);
+  const needsYear = comparisons.some(
+    (calculation) => calculation.comparison === "YEAR_OVER_YEAR",
+  );
+  if (needsYear) {
+    date.setUTCFullYear(date.getUTCFullYear() - 1);
+  } else if (grain === "YEAR") {
+    date.setUTCFullYear(date.getUTCFullYear() - 1);
+  } else if (grain === "QUARTER") {
+    date.setUTCMonth(date.getUTCMonth() - 3);
+  } else if (grain === "MONTH") {
+    date.setUTCMonth(date.getUTCMonth() - 1);
+  } else if (grain === "WEEK") {
+    date.setUTCDate(date.getUTCDate() - 7);
+  } else {
+    date.setUTCDate(date.getUTCDate() - 1);
+  }
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}-${String(date.getUTCDate()).padStart(2, "0")} 00:00:00`;
 }
 
 function resolveMeasureReference(
@@ -391,7 +1109,10 @@ function createImplicitPropertyMetric(
     binding.property.visibility !== "ANALYTICAL" ||
     binding.property.sensitive ||
     !aggregation ||
-    aggregation === "NONE"
+    aggregation === "NONE" ||
+    (aggregation === "SUM" &&
+      (numeric.kind === "RATIO" ||
+        numeric.aggregationBehavior === "NON_ADDITIVE"))
   ) {
     return undefined;
   }
@@ -449,7 +1170,7 @@ function resolveTimeBinding(
   measures: Metric[],
   owners: Array<{ object: OntologyObject; property: OntologyProperty }>,
 ): { object: OntologyObject; property: OntologyProperty } {
-  const explicitId = intent.timeRange?.propertyId;
+  const explicitId = intent.timeRange?.propertyId ?? intent.timeGrain?.propertyId;
   const metricTimeIds = [
     ...new Set(measures.map((metric) => metric.timePropertyId).filter(Boolean)),
   ] as string[];
@@ -708,6 +1429,34 @@ function resolveNaturalTimeRange(
       endExclusive: dateText(year, month, 1),
     };
   }
+  if (/^(本周|这周|本星期)$/.test(text)) {
+    const weekday = zonedWeekday(now, timezone);
+    return {
+      start: dateText(year, month, day - weekday),
+      endExclusive: dateText(year, month, day - weekday + 7),
+    };
+  }
+  if (/^(上周|上星期)$/.test(text)) {
+    const weekday = zonedWeekday(now, timezone);
+    return {
+      start: dateText(year, month, day - weekday - 7),
+      endExclusive: dateText(year, month, day - weekday),
+    };
+  }
+  if (/^(本季度|本季)$/.test(text)) {
+    const quarterMonth = Math.floor((month - 1) / 3) * 3 + 1;
+    return {
+      start: dateText(year, quarterMonth, 1),
+      endExclusive: dateText(year, quarterMonth + 3, 1),
+    };
+  }
+  if (/^(上季度|上季)$/.test(text)) {
+    const quarterMonth = Math.floor((month - 1) / 3) * 3 + 1;
+    return {
+      start: dateText(year, quarterMonth - 3, 1),
+      endExclusive: dateText(year, quarterMonth, 1),
+    };
+  }
   if (/^(今天|今日)$/.test(text)) {
     return {
       start: dateText(year, month, day),
@@ -725,7 +1474,39 @@ function resolveNaturalTimeRange(
     const parsed = Number(explicitYear[1]);
     return { start: dateText(parsed, 1, 1), endExclusive: dateText(parsed + 1, 1, 1) };
   }
-  throw new Error(`暂不支持时间表达式“${expression}”，请使用今年、去年、本月、上月或明确年份`);
+  const explicitMonth = text.match(/^(\d{4})年(\d{1,2})月$/);
+  if (explicitMonth) {
+    const parsedYear = Number(explicitMonth[1]);
+    const parsedMonth = Number(explicitMonth[2]);
+    if (parsedMonth < 1 || parsedMonth > 12) {
+      throw new Error(`时间表达式“${expression}”中的月份无效`);
+    }
+    return {
+      start: dateText(parsedYear, parsedMonth, 1),
+      endExclusive: dateText(parsedYear, parsedMonth + 1, 1),
+    };
+  }
+  const recentDays = text.match(/^(?:近|最近)(\d{1,3})天$/);
+  if (recentDays) {
+    const count = Number(recentDays[1]);
+    if (count < 1 || count > 366) throw new Error("最近天数必须在 1 到 366 之间");
+    return {
+      start: dateText(year, month, day - count + 1),
+      endExclusive: dateText(year, month, day + 1),
+    };
+  }
+  const recentMonths = text.match(/^(?:近|最近)(\d{1,2})个?月$/);
+  if (recentMonths) {
+    const count = Number(recentMonths[1]);
+    if (count < 1 || count > 60) throw new Error("最近月数必须在 1 到 60 之间");
+    return {
+      start: dateText(year, month - count + 1, 1),
+      endExclusive: dateText(year, month + 1, 1),
+    };
+  }
+  throw new Error(
+    `暂不支持时间表达式“${expression}”，请使用今天、昨天、本周、上周、本月、上月、本季度、上季度、今年、去年、近N天、近N个月或明确年月`,
+  );
 }
 
 function dateText(year: number, month: number, day: number): string {
@@ -746,6 +1527,17 @@ function zonedDateParts(
   const get = (type: "year" | "month" | "day") =>
     Number(parts.find((part) => part.type === type)?.value);
   return { year: get("year"), month: get("month"), day: get("day") };
+}
+
+function zonedWeekday(value: Date, timezone: string): number {
+  const weekday = new Intl.DateTimeFormat("en-US", {
+    timeZone: timezone,
+    weekday: "short",
+  }).format(value);
+  const sundayBased = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].indexOf(
+    weekday,
+  );
+  return sundayBased <= 0 ? 6 : sundayBased - 1;
 }
 
 function qualifiedColumn(alias: string, property: OntologyProperty): string {

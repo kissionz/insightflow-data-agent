@@ -256,6 +256,97 @@ describe("DataAgentHarness", () => {
     repository.close();
   });
 
+  it("deterministically restores monthly grain when Montane omits time_grain", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-harness-"));
+    roots.push(root);
+    const repository = new Repository(
+      path.join(root, ".montane/data-agent/ontology.sqlite"),
+    );
+    const ontology = structuredClone(testOntology);
+    ontology.objects[0]!.defaultTimePropertyId = "p_paid_at";
+    ontology.objects[0]!.properties.push({
+      id: "p_paid_at",
+      name: "paid_at",
+      label: "支付日期",
+      description: "支付日期",
+      dataType: "DATETIME",
+      sourceColumn: "paid_at",
+      sensitive: false,
+      meaning: "TIME",
+      unique: false,
+      valueSearchable: false,
+      visibility: "ANALYTICAL",
+      synonyms: ["日期"],
+      defaultDisplay: true,
+      exportable: true,
+      bindingPriority: 50,
+    });
+    ontology.metrics[0]!.timePropertyId = "p_paid_at";
+    repository.saveOntology(ontology);
+    repository.upsertScannedTables([{
+      id: "t_orders",
+      catalog: "internal",
+      database: "retail",
+      name: "fact_orders",
+      type: "TABLE",
+      status: "MODELED",
+      columns: [],
+      fingerprint: "fact_orders:monthly",
+      scannedAt: "2026-07-27T00:00:00.000Z",
+    }]);
+    repository.saveDataSource({
+      configured: true,
+      host: "selectdb.test",
+      port: 9030,
+      username: "reader",
+      database: "retail",
+      catalog: "internal",
+      tls: false,
+      passwordStored: true,
+    });
+    const conversation = createConversation();
+    repository.saveConversation(conversation);
+    const queries: string[] = [];
+    const harness = new DataAgentHarness(
+      root,
+      repository,
+      async (sql) => {
+        queries.push(sql);
+        return {
+          columns: ["月份", "成交金额"],
+          rows: [{ 月份: "2026-01-01", 成交金额: 100 }],
+          durationMs: 8,
+          truncated: false,
+        };
+      },
+      () => runtimeFor(new MonthlyPlanningMontaneModel()),
+    );
+
+    const output = await harness.run(
+      conversation,
+      {
+        id: "turn_monthly_grain",
+        conversationId: conversation.id,
+        question: "今年销售额按月看",
+        status: "planning",
+        createdAt: new Date().toISOString(),
+        ontologyVersion: ontology.version,
+        trace: [],
+      },
+      {
+        onTextDelta() {},
+        onTextEnd() {},
+        onToolStatus() {},
+      },
+    );
+
+    expect(output.responseKind).toBe("analysis");
+    expect(queries[0]).toContain("DATE_TRUNC(t0.`paid_at`, 'month')");
+    expect(queries[0]).not.toContain("GROUP BY t0.`paid_at`");
+    await harness.close();
+    repository.close();
+  });
+
   it("locates a governed property value and reuses its local cache", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-harness-"));
     roots.push(root);
@@ -630,6 +721,78 @@ class PlanningMontaneModel implements ModelClient {
       };
     }
     const finalText = "今年线上渠道销售额为 128,000 元。";
+    options.onTextDelta?.(finalText);
+    return { finalText, stopReason: "end_turn" };
+  }
+}
+
+class MonthlyPlanningMontaneModel implements ModelClient {
+  readonly capabilities = {
+    contextWindow: 32_000,
+    maxOutputTokens: 2_000,
+    supportsStreaming: true,
+    supportsToolUse: true,
+    supportsImages: false,
+  };
+  private step = 0;
+
+  async complete(options: {
+    messages: AgentMessage[];
+    tools: Array<Record<string, unknown>>;
+    onTextDelta?: (delta: string) => void;
+  }): Promise<AgentResponse> {
+    this.step += 1;
+    if (this.step === 1) {
+      return {
+        toolCalls: [{
+          id: "call_month_frame",
+          name: "SubmitQuestionFrame",
+          args: {
+            original_question: "今年销售额按月看",
+            metric_terms: ["销售额"],
+            time_terms: ["今年"],
+            object_terms: [],
+            business_value_terms: [],
+            grouping_terms: ["按月"],
+            calculation_terms: ["求和"],
+            presentation: { kind: "TREND" },
+          },
+        }],
+        stopReason: "tool_use",
+      };
+    }
+    if (this.step === 2) {
+      return {
+        toolCalls: [{
+          id: "call_month_ontology",
+          name: "OntologySearch",
+          args: { query: "今年销售额按月看" },
+        }],
+        stopReason: "tool_use",
+      };
+    }
+    if (this.step === 3) {
+      return {
+        toolCalls: [{
+          id: "call_month_plan",
+          name: "ExecuteAnalysisPlan",
+          args: {
+            root_object_id: "o_order",
+            measure_ids: ["m_gmv"],
+            dimension_property_ids: ["p_paid_at"],
+            filters: [],
+            time_range: {
+              expression: "今年",
+              property_id: "p_paid_at",
+            },
+            result_kind: "aggregate",
+            title: "今年月度销售额",
+          },
+        }],
+        stopReason: "tool_use",
+      };
+    }
+    const finalText = "已按月返回今年销售额。";
     options.onTextDelta?.(finalText);
     return { finalText, stopReason: "end_turn" };
   }

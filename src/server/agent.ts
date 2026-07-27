@@ -455,15 +455,25 @@ class HarnessTurnReporter implements AgentReporter {
       const filterCount = Array.isArray(call.args.filters)
         ? call.args.filters.length
         : 0;
+      const calculationCount = [
+        call.args.derived_calculations,
+        call.args.time_comparisons,
+        call.args.window_calculations,
+      ].filter(Array.isArray).flat().length;
       this.update(
         "understanding",
         "completed",
         {
-          summary: `${measureCount} 个指标、${dimensionCount} 个维度、${filterCount} 个筛选条件`,
+          summary: `${measureCount} 个指标、${dimensionCount} 个维度、${filterCount} 个筛选条件、${calculationCount} 个计算`,
           facts: [
             { label: "指标", value: String(measureCount), source: "Montane 结构化意图" },
             { label: "维度", value: String(dimensionCount), source: "Montane 结构化意图" },
             { label: "筛选", value: String(filterCount), source: "Montane 结构化意图" },
+            {
+              label: "计算",
+              value: String(calculationCount),
+              source: "Montane 强类型计算",
+            },
             {
               label: "时间",
               value: String(
@@ -471,6 +481,14 @@ class HarnessTurnReporter implements AgentReporter {
                   ?.expression ?? "未指定",
               ),
               source: "用户原始表达",
+            },
+            {
+              label: "时间粒度",
+              value: String(
+                (call.args.time_grain as Record<string, unknown> | undefined)
+                  ?.unit ?? "未指定",
+              ),
+              source: "Montane 结构化意图",
             },
           ],
         },
@@ -488,6 +506,9 @@ class HarnessTurnReporter implements AgentReporter {
               grain?: string;
               relationIds?: string[];
               limit?: number;
+              derivedMeasures?: unknown[];
+              timeComparisons?: unknown[];
+              windowCalculations?: unknown[];
             };
             bindings?: Array<{
               label?: string;
@@ -534,6 +555,15 @@ class HarnessTurnReporter implements AgentReporter {
             label: "结果上限",
             value: `${data?.ir?.limit ?? "—"} 行`,
             source: "查询策略",
+          },
+          {
+            label: "受控计算",
+            value: String(
+              (data?.ir?.derivedMeasures?.length ?? 0) +
+                (data?.ir?.timeComparisons?.length ?? 0) +
+                (data?.ir?.windowCalculations?.length ?? 0),
+            ),
+            source: "IR v2",
           },
         ],
         code: data?.ir

@@ -255,7 +255,282 @@ describe("QueryIrCompiler", () => {
       relationIds: ["r_order_store"],
     });
   });
+
+  it("groups a time series by month instead of the raw day value", () => {
+    const ontology = ontologyWithTime();
+    const compiler = new QueryIrCompiler(() => new Date("2026-07-26T00:00:00Z"));
+    const compiled = compiler.compile(
+      {
+        rootObjectId: "o_order",
+        measureIds: ["m_gmv"],
+        dimensionPropertyIds: [],
+        filters: [],
+        timeRange: { expression: "今年" },
+        timeGrain: { unit: "MONTH" },
+        resultKind: "aggregate",
+        title: "今年月度销售额",
+      },
+      ontology,
+      [ordersTable()],
+    );
+
+    expect(compiled.sql).toContain(
+      "DATE_TRUNC(t0.`paid_at`, 'month') AS `月份`",
+    );
+    expect(compiled.sql).toContain(
+      "GROUP BY DATE_TRUNC(t0.`paid_at`, 'month')",
+    );
+    expect(compiled.sql).toContain("ORDER BY `月份` ASC");
+    expect(compiled.ir).toMatchObject({
+      version: 2,
+      grain: "月份",
+      timeGrain: { unit: "MONTH", propertyId: "p_paid_at" },
+    });
+  });
+
+  it("compiles year-over-year growth with an expanded base range", () => {
+    const ontology = ontologyWithTime();
+    const compiler = new QueryIrCompiler(() => new Date("2026-07-26T00:00:00Z"));
+    const compiled = compiler.compile(
+      {
+        rootObjectId: "o_order",
+        measureIds: ["m_gmv"],
+        dimensionPropertyIds: [],
+        filters: [],
+        timeRange: { expression: "今年" },
+        timeGrain: { unit: "MONTH" },
+        timeComparisons: [{
+          id: "calc_yoy",
+          label: "销售额同比",
+          measureId: "m_gmv",
+          comparison: "YEAR_OVER_YEAR",
+          output: "GROWTH_RATE",
+        }],
+        resultKind: "aggregate",
+        title: "今年月度销售额同比",
+      },
+      ontology,
+      [ordersTable()],
+    );
+
+    expect(compiled.sql).toContain("WITH `base` AS (");
+    expect(compiled.sql).toContain(
+      "p0.`__time_bucket` = DATE_SUB(c.`__time_bucket`, INTERVAL 1 YEAR)",
+    );
+    expect(compiled.sql).toContain("AS `销售额同比`");
+    expect(compiled.parameters).toEqual([
+      "2025-01-01 00:00:00",
+      "2027-01-01 00:00:00",
+      "2026-01-01 00:00:00",
+      "2027-01-01 00:00:00",
+    ]);
+  });
+
+  it("compiles governed ratios and protects division by zero", () => {
+    const ontology = ontologyWithTime();
+    ontology.metrics.push({
+      ...ontology.metrics[0]!,
+      id: "m_refund",
+      name: "refund_amount",
+      label: "退款金额",
+      sourcePropertyId: "p_refund_amount",
+      expression: "SUM(fact_orders.refund_amount)",
+      synonyms: ["退款额"],
+    });
+    ontology.objects[0]!.properties.push({
+      ...ontology.objects[0]!.properties[1]!,
+      id: "p_refund_amount",
+      name: "refund_amount",
+      label: "退款金额",
+      sourceColumn: "refund_amount",
+    });
+    const compiler = new QueryIrCompiler();
+    const compiled = compiler.compile(
+      {
+        rootObjectId: "o_order",
+        measureIds: ["m_refund", "m_gmv"],
+        dimensionPropertyIds: [],
+        filters: [],
+        derivedMeasures: [{
+          id: "calc_refund_rate",
+          label: "退款率",
+          operator: "RATIO",
+          leftMeasureId: "m_refund",
+          rightMeasureId: "m_gmv",
+          scale: 100,
+        }],
+        resultKind: "aggregate",
+        title: "退款率",
+      },
+      ontology,
+      [ordersTable()],
+    );
+
+    expect(compiled.sql).toContain("NULLIF((SUM(t0.`pay_amount`)), 0) * 100");
+    expect(compiled.sql).toContain("AS `退款率`");
+  });
+
+  it("compiles nested OR and NOT filter logic with parameters", () => {
+    const ontology = ontologyWithTime();
+    ontology.objects[0]!.properties.push(
+      {
+        ...ontology.objects[0]!.properties[0]!,
+        id: "p_status",
+        name: "status",
+        label: "订单状态",
+        sourceColumn: "status",
+        meaning: "CATEGORY",
+        unique: false,
+      },
+      {
+        ...ontology.objects[0]!.properties[0]!,
+        id: "p_region",
+        name: "region",
+        label: "区域",
+        sourceColumn: "region",
+        meaning: "CATEGORY",
+        unique: false,
+      },
+    );
+    const compiler = new QueryIrCompiler();
+    const compiled = compiler.compile(
+      {
+        rootObjectId: "o_order",
+        measureIds: ["m_gmv"],
+        dimensionPropertyIds: [],
+        filters: [],
+        filterExpression: {
+          type: "GROUP",
+          operator: "OR",
+          children: [
+            {
+              type: "CONDITION",
+              filter: { propertyId: "p_status", operator: "EQ", value: "PAID" },
+            },
+            {
+              type: "NOT",
+              child: {
+                type: "CONDITION",
+                filter: { propertyId: "p_region", operator: "EQ", value: "华北" },
+              },
+            },
+          ],
+        },
+        resultKind: "aggregate",
+        title: "筛选测试",
+      },
+      ontology,
+      [ordersTable()],
+    );
+
+    expect(compiled.sql).toContain(
+      "((t0.`status` = ?) OR (NOT (t0.`region` = ?)))",
+    );
+    expect(compiled.parameters).toEqual(["PAID", "华北"]);
+  });
+
+  it("compiles ranking, running sum and moving average windows", () => {
+    const ontology = ontologyWithTime();
+    const compiler = new QueryIrCompiler();
+    const compiled = compiler.compile(
+      {
+        rootObjectId: "o_order",
+        measureIds: ["m_gmv"],
+        dimensionPropertyIds: ["p_store_id"],
+        filters: [],
+        timeGrain: { unit: "MONTH" },
+        windowCalculations: [
+          {
+            id: "calc_rank",
+            label: "门店排名",
+            measureId: "m_gmv",
+            operator: "RANK",
+            partitionByPropertyIds: ["__time__"],
+            orderBy: { entityId: "m_gmv", direction: "DESC" },
+          },
+          {
+            id: "calc_running",
+            label: "累计销售额",
+            measureId: "m_gmv",
+            operator: "RUNNING_SUM",
+            partitionByPropertyIds: ["p_store_id"],
+            orderBy: { entityId: "__time__", direction: "ASC" },
+          },
+          {
+            id: "calc_ma3",
+            label: "三期移动平均",
+            measureId: "m_gmv",
+            operator: "MOVING_AVG",
+            partitionByPropertyIds: ["p_store_id"],
+            orderBy: { entityId: "__time__", direction: "ASC" },
+            windowSize: 3,
+          },
+        ],
+        resultKind: "aggregate",
+        title: "门店销售趋势",
+      },
+      ontology,
+      [ordersTable()],
+    );
+
+    expect(compiled.sql).toContain(
+      "RANK() OVER (PARTITION BY c.`__time_bucket` ORDER BY c.`__m0` DESC)",
+    );
+    expect(compiled.sql).toContain(
+      "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW",
+    );
+    expect(compiled.sql).toContain(
+      "ROWS BETWEEN 2 PRECEDING AND CURRENT ROW",
+    );
+  });
+
+  it("rejects semi-additive sums across a time grain", () => {
+    const ontology = ontologyWithTime();
+    ontology.objects[0]!.properties[1]!.numericSpec!.aggregationBehavior =
+      "SEMI_ADDITIVE";
+    const compiler = new QueryIrCompiler();
+
+    expect(() =>
+      compiler.compile(
+        {
+          rootObjectId: "o_order",
+          measureIds: ["m_gmv"],
+          dimensionPropertyIds: [],
+          filters: [],
+          timeGrain: { unit: "MONTH" },
+          resultKind: "aggregate",
+          title: "余额趋势",
+        },
+        ontology,
+        [ordersTable()],
+      ),
+    ).toThrow("半可加指标");
+  });
 });
+
+function ontologyWithTime() {
+  const ontology = structuredClone(testOntology);
+  ontology.objects[0]!.defaultTimePropertyId = "p_paid_at";
+  ontology.objects[0]!.properties.push({
+    id: "p_paid_at",
+    name: "paid_at",
+    label: "支付时间",
+    description: "支付完成时间",
+    dataType: "DATETIME",
+    sourceColumn: "paid_at",
+    sensitive: false,
+    meaning: "TIME",
+    unique: false,
+    valueSearchable: false,
+    visibility: "ANALYTICAL",
+    synonyms: [],
+    defaultDisplay: true,
+    exportable: true,
+    bindingPriority: 50,
+  });
+  ontology.metrics[0]!.timePropertyId = "p_paid_at";
+  return ontology;
+}
 
 function ordersTable(): PhysicalTable {
   return {

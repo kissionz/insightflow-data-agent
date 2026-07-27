@@ -1940,6 +1940,11 @@ function OntologyObjectEditor({
                                 event.target.value === "RATIO"
                                   ? "NON_ADDITIVE"
                                   : property.numericSpec!.aggregationBehavior,
+                              defaultAggregation:
+                                event.target.value === "RATIO" &&
+                                property.numericSpec!.defaultAggregation === "SUM"
+                                  ? "AVG"
+                                  : property.numericSpec!.defaultAggregation,
                             },
                           })
                         }
@@ -1959,6 +1964,11 @@ function OntologyObjectEditor({
                                 .value as NonNullable<
                                 typeof property.numericSpec
                               >["aggregationBehavior"],
+                              defaultAggregation:
+                                event.target.value === "NON_ADDITIVE" &&
+                                property.numericSpec!.defaultAggregation === "SUM"
+                                  ? "AVG"
+                                  : property.numericSpec!.defaultAggregation,
                             },
                           })
                         }
@@ -1983,7 +1993,16 @@ function OntologyObjectEditor({
                         }
                       >
                         <option value="NONE">不默认聚合</option>
-                        <option value="SUM">求和</option>
+                        <option
+                          value="SUM"
+                          disabled={
+                            property.numericSpec.kind === "RATIO" ||
+                            property.numericSpec.aggregationBehavior ===
+                              "NON_ADDITIVE"
+                          }
+                        >
+                          求和
+                        </option>
                         <option value="AVG">平均</option>
                         <option value="MIN">最小值</option>
                         <option value="MAX">最大值</option>
@@ -3168,7 +3187,7 @@ function SettingsPage({
       </section>
       <section className="panel setting-card">
         <div className="setting-icon"><Clock size={20} /></div>
-        <div><h2>IR查询执行</h2><p>规则引擎编译参数化Doris SQL，最大超时180秒，聚合最多200行，明细最多50行。</p></div>
+        <div><h2>IR查询执行</h2><p>IR v2 支持时间粒度、同比环比、派生与窗口计算、逻辑筛选树和聚合安全校验；最大超时180秒，聚合最多200行，明细最多50行。</p></div>
         <span className="status-pill success">已启用</span>
       </section>
       <section className="panel setting-card">

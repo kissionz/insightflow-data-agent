@@ -169,6 +169,37 @@ describe("ontology lifecycle", () => {
       result.issues.some((issue) => issue.code === "RELATION_KEY_NOT_ANALYTICAL"),
     ).toBe(true);
   });
+
+  it("rejects SUM as the default for a non-additive numeric property", () => {
+    const draft = createDraftFromPublished(testOntology);
+    draft.objects[0].properties[1].numericSpec = {
+      kind: "RATIO",
+      unit: "%",
+      defaultAggregation: "SUM",
+      aggregationBehavior: "NON_ADDITIVE",
+    };
+
+    const result = validateOntology(
+      draft,
+      draft.objects.map((object) => ({
+        id: object.sourceTableId,
+        catalog: "internal",
+        database: "retail",
+        name: object.name,
+        type: "TABLE",
+        status: "MODELED",
+        columns: [],
+        fingerprint: "v1",
+        scannedAt: new Date().toISOString(),
+      })),
+    );
+
+    expect(
+      result.issues.some(
+        (issue) => issue.code === "NUMBER_DEFAULT_SUM_NOT_ALLOWED",
+      ),
+    ).toBe(true);
+  });
 });
 
 describe("visual metric expressions", () => {

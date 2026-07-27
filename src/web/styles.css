@@ -1372,10 +1372,17 @@ tbody tr:hover {
 }
 
 .ontology-management-content {
+  --ontology-panel-height: calc(100dvh - 250px);
   width: 100%;
   max-width: none;
   margin: 0;
   padding: 20px 20px 44px;
+}
+
+.ontology-management-content .section-kicker,
+.ontology-management-content .status-pill,
+.ontology-management-content .count-badge {
+  font-size: 11px;
 }
 
 .stats-row {
@@ -1414,7 +1421,7 @@ tbody tr:hover {
 
 .stat-card small {
   color: var(--muted);
-  font-size: 9px;
+  font-size: 11px;
 }
 
 .stat-card strong {
@@ -1441,6 +1448,7 @@ tbody tr:hover {
 
 .panel-heading {
   display: flex;
+  flex: 0 0 auto;
   align-items: center;
   justify-content: space-between;
   border-bottom: 1px solid var(--border);
@@ -1449,7 +1457,7 @@ tbody tr:hover {
 
 .panel-heading h2 {
   margin: 3px 0 0;
-  font-size: 13px;
+  font-size: 15px;
 }
 
 .ontology-object-row {
@@ -1498,13 +1506,13 @@ tbody tr:hover {
 }
 
 .ontology-object strong {
-  font-size: 11px;
+  font-size: 13px;
 }
 
 .ontology-object small {
   overflow: hidden;
   color: var(--muted);
-  font-size: 9px;
+  font-size: 11px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -1537,18 +1545,22 @@ tbody tr:hover {
 
 .object-delete-confirm span {
   color: #7a2e33;
-  font-size: 8px;
+  font-size: 11px;
   line-height: 1.35;
 }
 
 .object-delete-confirm .subtle-button {
   min-height: 24px;
   padding: 4px 6px;
-  font-size: 8px;
+  font-size: 11px;
 }
 
 .object-inspector {
-  min-height: 500px;
+  display: flex;
+  height: max(320px, var(--ontology-panel-height));
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
 }
 
 .ontology-empty,
@@ -1567,19 +1579,24 @@ tbody tr:hover {
 .inspector-empty strong {
   margin-top: 10px;
   color: #344054;
-  font-size: 11px;
+  font-size: 13px;
 }
 
 .ontology-empty p,
 .inspector-empty p {
   max-width: 34ch;
   margin: 5px 0 0;
-  font-size: 9px;
+  font-size: 12px;
   line-height: 1.55;
 }
 
 .object-detail {
+  min-height: 0;
+  flex: 1;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
   padding: 16px;
+  scrollbar-gutter: stable;
 }
 
 .object-summary {
@@ -1603,12 +1620,12 @@ tbody tr:hover {
 
 .object-summary span {
   color: var(--muted);
-  font-size: 8px;
+  font-size: 11px;
 }
 
 .object-summary strong {
   overflow: hidden;
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 600;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1617,7 +1634,7 @@ tbody tr:hover {
 .object-description {
   margin: 12px 0 18px;
   color: #475467;
-  font-size: 10px;
+  font-size: 12px;
   line-height: 1.6;
 }
 
@@ -1630,18 +1647,28 @@ tbody tr:hover {
 
 .detail-section-heading h3 {
   margin: 0;
-  font-size: 11px;
+  font-size: 13px;
 }
 
 .detail-section-heading span {
   color: var(--muted);
-  font-size: 9px;
+  font-size: 11px;
 }
 
 .property-table-wrap {
+  max-height: min(320px, calc(var(--ontology-panel-height) - 190px));
   overflow: auto;
   border: 1px solid var(--border);
   border-radius: 7px;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.property-table th {
+  position: sticky;
+  z-index: 1;
+  top: 0;
+  font-size: 11px;
 }
 
 .property-table th,
@@ -1657,19 +1684,19 @@ tbody tr:hover {
 
 .property-table td strong {
   color: #344054;
-  font-size: 9px;
+  font-size: 12px;
 }
 
 .property-table td small {
   color: var(--muted);
-  font-size: 8px;
+  font-size: 11px;
 }
 
 .property-table code {
   border-radius: 4px;
   background: #f2f4f7;
   color: #475467;
-  font-size: 8px;
+  font-size: 11px;
   padding: 2px 4px;
 }
 
@@ -1684,7 +1711,7 @@ tbody tr:hover {
   background: var(--blue-soft);
   color: var(--blue-hover);
   padding: 2px 6px;
-  font-size: 8px;
+  font-size: 11px;
   font-weight: 600;
 }
 
@@ -1695,7 +1722,7 @@ tbody tr:hover {
 
 .property-role-summary small {
   color: var(--muted);
-  font-size: 8px;
+  font-size: 11px;
 }
 
 .inspector-columns {
@@ -1742,13 +1769,13 @@ tbody tr:hover {
 
 .semantic-list strong {
   color: #344054;
-  font-size: 9px;
+  font-size: 12px;
 }
 
 .semantic-list small {
   overflow: hidden;
   color: var(--muted);
-  font-size: 8px;
+  font-size: 11px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -1756,7 +1783,7 @@ tbody tr:hover {
 .semantic-list > p {
   margin: 0;
   color: var(--muted);
-  font-size: 9px;
+  font-size: 11px;
   padding: 13px;
 }
 
@@ -1768,7 +1795,7 @@ tbody tr:hover {
 .panel-note {
   margin: 12px 14px;
   color: var(--muted);
-  font-size: 9px;
+  font-size: 11px;
   line-height: 1.6;
 }
 
@@ -1800,12 +1827,12 @@ tbody tr:hover {
 }
 
 .draft-table-list strong {
-  font-size: 10px;
+  font-size: 12px;
 }
 
 .draft-table-list small {
   color: var(--muted);
-  font-size: 8px;
+  font-size: 11px;
 }
 
 .draft-panel > button {
@@ -1843,23 +1870,29 @@ tbody tr:hover {
 }
 
 .validation-summary strong {
-  font-size: 10px;
+  font-size: 12px;
 }
 
 .validation-summary span,
 .validation-summary small {
   color: var(--muted);
-  font-size: 8px;
+  font-size: 11px;
   line-height: 1.45;
 }
 
 .ontology-editor {
+  display: flex;
   min-width: 0;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+  overflow: hidden;
 }
 
 .editor-toolbar {
   display: flex;
   min-height: 52px;
+  flex: 0 0 auto;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
@@ -1882,7 +1915,7 @@ tbody tr:hover {
   background: transparent;
   color: var(--muted);
   padding: 0 9px;
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 600;
 }
 
@@ -1903,7 +1936,7 @@ tbody tr:hover {
   border-radius: 5px;
   background: #f2f4f7;
   color: #667085;
-  font-size: 8px;
+  font-size: 10px;
 }
 
 .save-state {
@@ -1915,7 +1948,7 @@ tbody tr:hover {
 
 .save-state > span {
   color: var(--muted);
-  font-size: 8px;
+  font-size: 11px;
 }
 
 .save-state > span.dirty {
@@ -1925,11 +1958,15 @@ tbody tr:hover {
 .save-state .primary-button {
   min-height: 32px;
   padding: 0 11px;
-  font-size: 10px;
+  font-size: 12px;
 }
 
 .editor-section {
+  min-height: 0;
+  flex: 1;
+  overflow-y: auto;
   padding: 16px;
+  overscroll-behavior-y: contain;
 }
 
 .ontology-form-grid {
@@ -1945,7 +1982,11 @@ tbody tr:hover {
   background: white;
   outline: 0;
   padding: 8px 10px;
-  font-size: 10px;
+  font-size: 12px;
+}
+
+.ontology-form-grid label > span {
+  font-size: 12px;
 }
 
 .ontology-form-grid input,
@@ -1985,17 +2026,24 @@ tbody tr:hover {
   background: var(--blue-soft);
   color: #475467;
   padding: 9px 11px;
-  font-size: 9px;
+  font-size: 11px;
   line-height: 1.5;
 }
 
+.property-editor {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
 .property-edit-table {
-  overflow-x: auto;
-  overflow-y: hidden;
+  min-height: 0;
+  flex: 1;
+  overflow: auto;
   border: 1px solid var(--border);
   border-radius: 8px;
   outline: 0;
-  overscroll-behavior-inline: contain;
+  overscroll-behavior: contain;
   scrollbar-color: #b9c5d5 #f4f7fa;
   scrollbar-gutter: stable;
 }
@@ -2044,7 +2092,7 @@ tbody tr:hover {
   background: var(--blue-soft);
   color: var(--blue-hover);
   padding: 2px 6px;
-  font-size: 8px;
+  font-size: 11px;
   font-weight: 600;
 }
 
@@ -2053,7 +2101,7 @@ tbody tr:hover {
   align-items: center;
   gap: 5px;
   color: #475467;
-  font-size: 8px;
+  font-size: 11px;
 }
 
 .compact-check input {
@@ -2065,10 +2113,13 @@ tbody tr:hover {
 }
 
 .property-edit-row.header {
+  position: sticky;
+  z-index: 2;
+  top: 0;
   border-top: 0;
   background: #f8fafc;
   color: var(--muted);
-  font-size: 8px;
+  font-size: 11px;
   font-weight: 700;
   white-space: nowrap;
 }
@@ -2082,7 +2133,7 @@ tbody tr:hover {
   background: white;
   outline: 0;
   padding: 7px 8px;
-  font-size: 9px;
+  font-size: 12px;
 }
 
 .numeric-rule-grid {
@@ -2099,7 +2150,7 @@ tbody tr:hover {
 
 .property-not-applicable {
   color: var(--muted-2);
-  font-size: 8px;
+  font-size: 11px;
 }
 
 .physical-field {
@@ -2113,7 +2164,7 @@ tbody tr:hover {
 .physical-field code {
   overflow: hidden;
   color: #344054;
-  font-size: 9px;
+  font-size: 12px;
   text-overflow: ellipsis;
 }
 
@@ -2123,7 +2174,7 @@ tbody tr:hover {
   background: #f2f4f7;
   color: var(--muted);
   padding: 2px 4px;
-  font-size: 8px;
+  font-size: 10px;
 }
 
 .inline-check {
@@ -2132,7 +2183,7 @@ tbody tr:hover {
   align-items: center;
   gap: 6px !important;
   color: #475467;
-  font-size: 9px;
+  font-size: 11px;
   white-space: nowrap;
 }
 
@@ -2146,7 +2197,7 @@ tbody tr:hover {
 
 .split-editor {
   display: grid;
-  min-height: 430px;
+  min-height: 0;
   grid-template-columns: 190px minmax(0, 1fr);
   gap: 14px;
   padding: 0;
@@ -2165,7 +2216,7 @@ tbody tr:hover {
 }
 
 .entity-list > div > strong {
-  font-size: 10px;
+  font-size: 12px;
 }
 
 .entity-list > button:not(.subtle-button) {
@@ -2185,14 +2236,14 @@ tbody tr:hover {
 }
 
 .entity-list > button strong {
-  font-size: 9px;
+  font-size: 12px;
 }
 
 .entity-list > button small,
 .entity-list > p {
   overflow: hidden;
   color: var(--muted);
-  font-size: 8px;
+  font-size: 11px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -2210,7 +2261,7 @@ tbody tr:hover {
 }
 
 .entity-form-heading > strong {
-  font-size: 11px;
+  font-size: 13px;
 }
 
 .entity-empty {
@@ -2218,7 +2269,7 @@ tbody tr:hover {
   min-height: 260px;
   place-items: center;
   color: var(--muted);
-  font-size: 10px;
+  font-size: 12px;
 }
 
 .expression-preview {
@@ -2229,7 +2280,7 @@ tbody tr:hover {
   background: #f8fafc;
   color: #344054;
   padding: 10px;
-  font-size: 9px;
+  font-size: 11px;
   white-space: pre-wrap;
 }
 
@@ -2238,7 +2289,7 @@ tbody tr:hover {
   align-items: center;
   gap: 8px;
   color: var(--success);
-  font-size: 10px;
+  font-size: 12px;
   padding: 16px 7px;
 }
 

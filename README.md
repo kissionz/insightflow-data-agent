@@ -42,6 +42,7 @@ AgentLoop
   -> ToolRegistry
       -> SubmitQuestionFrame
       -> OntologySearch
+      -> DiscoverAnalysisSpace
       -> PropertyValueSearch
       -> ExecuteAnalysisPlan
           -> Query IR
@@ -57,6 +58,13 @@ InsightFlow 不单独配置或调用大模型。它通过 Montane SDK 读取与 
 结构化分析意图；SQL 由确定性 IR 规则引擎编译，Montane 不持有 SQL 执行工具。只要 Montane CLI 本身能够
 正常回答问题，SDK 会自动复用默认用户配置以及全局安装或 `npm link` 的 CLI
 运行环境；InsightFlow 不要求再配置一份 API Key。
+
+未明确单一指标的开放问题会继续使用同一个 Montane AgentLoop。例如“今年销售
+表现怎么样”会被标记为开放分析，`DiscoverAnalysisSpace` 按本体对象优先级选出
+一个事实对象，并返回其已发布指标、受控数字属性、时间字段和诊断维度。Montane 先用一条 IR
+同时查询多个核心指标，再根据真实 observation 决定是否执行下一条诊断 IR。
+当前每轮最多四条成功查询，重复计划和跨事实对象计划会被确定性拒绝；每一步的
+目标、选择依据、IR、SQL 和结果样例都会追加到证据链，不会被后续查询覆盖。
 
 数字属性不需要逐个重复创建指标。只要本体为 `NUMBER` 属性设置了非 `NONE`
 默认聚合，它就会作为属性型度量返回给 Montane，并由 IR 按 `SUM/AVG/MIN/MAX`

@@ -747,6 +747,182 @@ button.brand-mark {
   white-space: pre;
 }
 
+.analysis-run-trace {
+  margin: 10px 0 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: white;
+}
+
+.analysis-run-heading {
+  display: flex;
+  min-height: 42px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid var(--border);
+  padding: 8px 10px;
+}
+
+.analysis-run-heading > div {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.analysis-run-heading strong {
+  color: #344054;
+  font-size: 10px;
+}
+
+.analysis-run-heading span,
+.analysis-space-summary,
+.analysis-run-empty {
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.analysis-run-state {
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: var(--blue-soft);
+  color: var(--blue) !important;
+  padding: 3px 7px;
+  font-weight: 600;
+}
+
+.analysis-run-state.completed {
+  background: color-mix(in oklab, var(--success), white 91%);
+  color: #087642 !important;
+}
+
+.analysis-run-state.failed {
+  background: color-mix(in oklab, var(--danger), white 91%);
+  color: var(--danger) !important;
+}
+
+.analysis-space-summary {
+  margin: 0 !important;
+  border-bottom: 1px solid var(--border);
+  padding: 7px 10px;
+  line-height: 1.5 !important;
+}
+
+.analysis-step-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.analysis-step-list li {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  gap: 8px;
+  border-bottom: 1px solid var(--border);
+  padding: 9px 10px;
+}
+
+.analysis-step-list li:last-child {
+  border-bottom: 0;
+}
+
+.analysis-step-index {
+  display: grid;
+  width: 18px;
+  height: 18px;
+  place-items: center;
+  border: 1px solid var(--border-strong);
+  border-radius: 50%;
+  background: #f8fafc;
+  color: var(--muted);
+  font-size: 8px;
+}
+
+.analysis-step-list li.completed .analysis-step-index {
+  border-color: color-mix(in oklab, var(--success), white 58%);
+  background: color-mix(in oklab, var(--success), white 92%);
+  color: var(--success);
+}
+
+.analysis-step-list li.failed .analysis-step-index {
+  border-color: color-mix(in oklab, var(--danger), white 62%);
+  background: color-mix(in oklab, var(--danger), white 92%);
+  color: var(--danger);
+}
+
+.analysis-step-title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.analysis-step-title strong {
+  color: #344054;
+  font-size: 10px;
+}
+
+.analysis-step-title span {
+  border-radius: 4px;
+  background: #f2f4f7;
+  color: #475467;
+  font-size: 8px;
+  padding: 2px 5px;
+}
+
+.analysis-step-list p {
+  margin-top: 3px;
+  color: #475467;
+}
+
+.analysis-step-list .analysis-step-rationale {
+  color: var(--muted);
+}
+
+.analysis-step-list small {
+  display: block;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 8px;
+}
+
+.analysis-step-evidence {
+  margin-top: 7px;
+}
+
+.analysis-step-evidence summary {
+  width: fit-content;
+  cursor: pointer;
+  color: var(--blue);
+  font-size: 9px;
+  font-weight: 600;
+}
+
+.analysis-step-evidence > span {
+  display: block;
+  margin: 8px 0 4px;
+  color: var(--muted);
+  font-size: 8px;
+  font-weight: 600;
+}
+
+.analysis-step-evidence pre {
+  max-height: 220px;
+  overflow: auto;
+  margin: 0;
+  border-radius: 6px;
+  background: #101828;
+  color: #e4e7ec;
+  padding: 9px 10px;
+  font-size: 8px;
+  line-height: 1.5;
+}
+
+.analysis-run-empty {
+  margin: 0 !important;
+  padding: 10px;
+}
+
 .trace-step.pending .trace-copy {
   opacity: 0.52;
 }

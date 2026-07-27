@@ -31,6 +31,7 @@ import {
   X,
 } from "@phosphor-icons/react";
 import type {
+  AnalysisRun,
   BootstrapPayload,
   Conversation,
   DataSourceInput,
@@ -449,7 +450,9 @@ function TurnCard({ turn }: { turn: Turn }) {
         <StatusBadge status={turn.status} />
         {traceOpen ? <CaretDown size={16} /> : <CaretRight size={16} />}
       </button>
-      {traceOpen && <TraceTimeline trace={turn.trace} />}
+      {traceOpen && (
+        <TraceTimeline trace={turn.trace} analysisRun={turn.analysisRun} />
+      )}
       {turn.result ? (
         <ResultCard turn={turn} />
       ) : turn.answer && terminal ? (
@@ -461,7 +464,13 @@ function TurnCard({ turn }: { turn: Turn }) {
   );
 }
 
-function TraceTimeline({ trace }: { trace: TraceStep[] }) {
+function TraceTimeline({
+  trace,
+  analysisRun,
+}: {
+  trace: TraceStep[];
+  analysisRun?: AnalysisRun;
+}) {
   return (
     <div className="trace-panel" aria-label="本轮分析证据链">
       {trace.map((step, index) => (
@@ -509,10 +518,107 @@ function TraceTimeline({ trace }: { trace: TraceStep[] }) {
                 <pre><code>{step.code.content}</code></pre>
               </details>
             )}
+            {step.kind === "query_plan" && analysisRun ? (
+              <AnalysisRunTrace run={analysisRun} />
+            ) : null}
           </div>
         </div>
       ))}
     </div>
+  );
+}
+
+function AnalysisRunTrace({ run }: { run: AnalysisRun }) {
+  const completed = run.steps.filter((step) => step.status === "completed").length;
+  return (
+    <section className="analysis-run-trace" aria-label="多步分析路径">
+      <div className="analysis-run-heading">
+        <div>
+          <strong>
+            {run.mode === "DIAGNOSTIC_ANALYSIS" ? "原因诊断路径" : "开放分析路径"}
+          </strong>
+          <span>
+            {run.rootObjectLabel ?? "正在选择事实对象"} · {completed}/{run.maxSteps} 条查询
+          </span>
+        </div>
+        <span className={`analysis-run-state ${run.status}`}>
+          {run.status === "completed"
+            ? "已完成"
+            : run.status === "failed"
+              ? "已停止"
+              : "分析中"}
+        </span>
+      </div>
+      {run.availableMetrics.length ? (
+        <p className="analysis-space-summary">
+          可用指标：
+          {run.availableMetrics.slice(0, 8).map((metric) => metric.label).join("、")}
+          {run.availableMetrics.length > 8
+            ? ` 等 ${run.availableMetrics.length} 项`
+            : ""}
+        </p>
+      ) : null}
+      <ol className="analysis-step-list">
+        {run.steps.map((step) => (
+          <li className={step.status} key={step.callId}>
+            <span className="analysis-step-index">
+              {step.status === "completed" ? (
+                <Check size={11} weight="bold" />
+              ) : step.status === "failed" ? (
+                <X size={11} weight="bold" />
+              ) : (
+                step.sequence
+              )}
+            </span>
+            <div>
+              <div className="analysis-step-title">
+                <strong>{step.title}</strong>
+                <span>
+                  {step.role === "OVERVIEW"
+                    ? "总览"
+                    : step.role === "DIAGNOSTIC"
+                      ? "诊断"
+                      : "佐证"}
+                </span>
+              </div>
+              <p>{step.objective}</p>
+              {step.rationale ? (
+                <p className="analysis-step-rationale">
+                  选择依据：{step.rationale}
+                </p>
+              ) : null}
+              <small>{step.summary}</small>
+              {step.ir || step.sql || step.rows?.length ? (
+                <details className="analysis-step-evidence">
+                  <summary>查看本步 IR、SQL 与结果</summary>
+                  {step.ir ? (
+                    <>
+                      <span>Query IR</span>
+                      <pre><code>{JSON.stringify(step.ir, null, 2)}</code></pre>
+                    </>
+                  ) : null}
+                  {step.sql ? (
+                    <>
+                      <span>编译 SQL</span>
+                      <pre><code>{`${step.sql}\n\n-- 参数：${JSON.stringify(step.parameters ?? [])}`}</code></pre>
+                    </>
+                  ) : null}
+                  {step.rows?.length ? (
+                    <>
+                      <span>结果样例</span>
+                      <pre><code>{JSON.stringify(step.rows, null, 2)}</code></pre>
+                    </>
+                  ) : null}
+                </details>
+              ) : null}
+            </div>
+          </li>
+        ))}
+      </ol>
+      {!run.steps.length ? (
+        <p className="analysis-run-empty">Montane 正在从已发布指标中选择首轮总览。</p>
+      ) : null}
+    </section>
   );
 }
 
@@ -557,7 +663,10 @@ function ResultCard({ turn }: { turn: Turn }) {
           <strong>分析完成</strong>
         </div>
         <span className="completed-chip">
-          <CheckCircle size={15} weight="fill" /> 真实查询
+          <CheckCircle size={15} weight="fill" />
+          {turn.analysisRun?.steps.length
+            ? `${turn.analysisRun.steps.filter((step) => step.status === "completed").length} 步真实查询`
+            : "真实查询"}
         </span>
       </div>
       <p className="conclusion">{result.conclusion}</p>

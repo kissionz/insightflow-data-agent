@@ -1,9 +1,9 @@
 # InsightFlow Data Agent MVP 产品实现文档
 
-版本：1.3
+版本：1.4
 
-状态：产品方案已确认，本体编辑核心链路已实现
-日期：2026-07-26
+状态：MVP 核心链路已实现，进入真实业务迭代
+日期：2026-07-27
 目标终端：桌面 Web  
 目标用户：本地单用户  
 数据平台：阿里云 SelectDB  
@@ -37,6 +37,7 @@ InsightFlow 是基于现有 Montane Code Agent Runtime 构建的本地 Data Agen
 6. 历史会话重新打开后，结果和追踪仍可查看。
 7. 多轮追问能明确显示继承、增加、修改和移除的条件。
 8. 新增物理表不会触发已发布 Ontology 的全量重建。
+9. 未指定单一指标的开放问题可以在一个受控事实对象内执行多步分析，并保留每步证据。
 
 ## 3. 已确认的产品决策
 
@@ -57,7 +58,7 @@ InsightFlow 是基于现有 Montane Code Agent Runtime 构建的本地 Data Agen
 | Ontology 编辑 | 发布版只读；任何修改先克隆为隔离草稿 |
 | 属性建模 | 字段含义直接约束检索和 SQL；ID、关联实体、数字规则与可见性边界明确 |
 | 属性可见性 | 分析可用、仅明细、完全隐藏三档 |
-| 指标定义 | 支持可视化聚合配置和直接 SQL 表达式 |
+| 指标定义 | 独立指标目录；支持属性聚合基础指标与同事实对象内的强类型复合指标 |
 | Ontology 存储 | 本地 SQLite |
 | Ontology 检索 | 发布时编译本地语义索引 |
 | 追踪模型 | 每轮对话独立追踪 |
@@ -73,6 +74,7 @@ InsightFlow 是基于现有 Montane Code Agent Runtime 构建的本地 Data Agen
 
 - 新建、重命名、删除和恢复分析会话
 - 多轮自然语言问数
+- Montane 驱动的单事实对象多步开放分析与原因诊断
 - Agent 流式输出与任务状态
 - SelectDB 连接测试和元数据扫描
 - 用户勾选物理表进行增量 Ontology 建模
@@ -136,17 +138,24 @@ InsightFlow 是基于现有 Montane Code Agent Runtime 构建的本地 Data Agen
 2. 输入自然语言问题。
 3. 系统创建独立 `turn_id`。
 4. Agent 识别本轮意图和继承上下文。
-5. Montane 先提交强类型问题语言框架：时间、指标、对象、完整业务值、分组、
-   计算方式和展现方式。
+5. Montane 先提交强类型问题语言框架：分析类型、时间、指标、对象、完整业务值、
+   分组、计算方式和展现方式。分析类型分为明确指标问数、开放分析和原因诊断；
+   具体商品名、组织名等业务值不能同时作为对象词。
 6. Semantic Retriever 按语言角色匹配已发布 Ontology；完整业务值优先查询值索引。
 7. 值索引生成本轮不可改写的 `valueBindingId`，Montane 只提交本体 ID、
    操作符和绑定句柄。
-8. IR 规则引擎解析绑定句柄、时间、关系路径和数据粒度。
-9. Doris SQL Compiler 生成参数化 SelectDB SQL。
-10. SQL Guard 执行只读、范围和行数检查。
-11. 系统执行查询并返回结论、图表和数据表。
-12. 本轮分析证据链完整保存，最终业务绑定与候选诊断分开展示。
-13. 用户基于结果继续追问。
+8. 明确指标问数直接生成查询计划；开放分析和原因诊断先发现单一事实对象内的
+   已发布分析空间。
+9. Montane 提交一步或多步结构化计划，IR 规则引擎逐步解析绑定句柄、时间、
+   关系路径和数据粒度。
+10. Doris SQL Compiler 生成参数化 SelectDB SQL。
+11. SQL Guard 执行只读、范围和行数检查。
+12. 每条查询返回精简 observation；开放分析只有在真实结果产生新诊断问题时才
+   继续下一步，否则提前停止。
+13. 系统返回综合结论、主结果图表和数据表。
+14. 本轮分析证据链完整保存，最终业务绑定、候选诊断以及每一步 IR、SQL、结果
+   分开展示。
+15. 用户基于结果继续追问。
 
 ## 6. 信息架构
 
@@ -259,6 +268,18 @@ Conversation
 SQL 与参数，数据结果保存行数、字段和截断状态。理解错误从意图层纠正，绑定
 错误从本体候选纠正，SQL 不允许绕过 IR 直接修改。
 
+开放分析在“查询方案”步骤内追加展示 `AnalysisRun`：
+
+```text
+开放分析路径
+  -> Step 1 总览：目标、选择依据、IR、SQL、结果
+  -> Step 2 诊断：由 Step 1 observation 触发
+  -> Step 3 佐证：由前一步真实变化触发
+  -> Montane 综合结论
+```
+
+后一步不能覆盖前一步证据。失败重试也保留为独立步骤，便于定位计划或本体错误。
+
 ```ts
 type TraceStepStatus =
   | "pending"
@@ -306,6 +327,8 @@ SQL：未执行
 | Relation | 对象之间的业务关系 |
 | Metric | 可复用的统一业务指标 |
 | Dimension | 时间、地区、渠道等分析维度 |
+| AnalysisRun | 开放或诊断问题的一次受控多步分析运行 |
+| AnalysisStep | 单条动态查询的目标、依据、IR、SQL、结果与状态 |
 | Policy | 默认筛选、敏感字段和查询限制 |
 | Synonym | 中文术语、别名和自然语言映射 |
 | Lineage | 语义元素到表、字段和 SQL 的映射 |
@@ -613,19 +636,24 @@ MVP 不部署独立向量数据库。Ontology 达到更大规模后，可以通�
 - `InspectQueryResult`
 - `CreateVisualizationSpec`
 
-MVP 当前将上述职责收敛为四个组合工具：
+MVP 当前将上述职责收敛为五个组合工具：
 
 - `SubmitQuestionFrame`：保存本轮强类型问题语言框架，不绑定具体字段。
 - `OntologySearch`：返回精简的已发布对象、度量和候选关系；度量候选包括正式
   Metric，以及带默认聚合规则的数字属性。词形匹配只作为候选诊断，且不会用
   业务值短语搜索属性名称。相同问题框架的重复检索复用首次结果。
+- `DiscoverAnalysisSpace`：仅用于开放分析和原因诊断，按对象优先级选出一个
+  事实对象，并返回其已发布正式指标、受控数字属性、时间字段和可安全到达的诊断维度。它不执行
+  查询，也不把“销售表现”等主题词伪造成指标。
 - `PropertyValueSearch`：全局检索发布值索引，再通过缓存和小范围 SelectDB 兜底
-  定位业务值；唯一胜出项返回 `valueBindingId`。
+  定位问题框架中声明的原始业务值；唯一胜出项返回 `valueBindingId`。指标名、
+  计算词和模型扩展近义词会被拒绝。
 - `ExecuteAnalysisPlan`：接收结构化本体 ID 和值绑定句柄，生成强类型 IR、编译
   参数化 Doris SQL 并执行。关联对象仅用于筛选时默认生成相关 `EXISTS` 子查询；
-  若同一对象还用于分组或明细展示，则复用主查询 JOIN。
+  若同一对象还用于分组或明细展示，则复用主查询 JOIN。开放分析的每次调用必须
+  携带 `analysis_step`，说明本步目标、真实证据依据和结果角色。
 
-四个工具均注册到 `ToolRegistry`，由 `AgentLoop` 调用并经过 `PermissionGate`。
+五个工具均注册到 `ToolRegistry`，由 `AgentLoop` 调用并经过 `PermissionGate`。
 `AgentReporter` 将实际工具状态投影为每轮 UI 追踪，`SessionStore` 保存
 `assistant_tool_calls`、`tool_result` 和 `assistant_final` 原始事件。
 
@@ -640,7 +668,8 @@ Montane 提示词分为不可修改的核心执行协议和可配置的工作区
 - LLM 不能直接调用 Bash 连接数据库。
 - Montane 不持有自由 SQL 工具，查询只能通过 `ExecuteAnalysisPlan`。
 - Agent 不得绕过已发布 Ontology 猜测字段关系。
-- `measure_ids` 只接受 `OntologySearch.metrics[]` 返回的 ID。正式 Metric ID
+- `measure_ids` 只接受 `OntologySearch.metrics[]` 或
+  `DiscoverAnalysisSpace.spaces[].metrics[]` 返回的 ID。正式 Metric ID
   按治理口径执行；`measureKind=PROPERTY` 的数字属性 ID 按默认聚合规则生成
   受控度量；普通属性 ID 仍会被拒绝。若数字属性唯一对应一个正式治理指标，
   规则引擎优先映射到正式指标并显示纠正来源。
@@ -658,10 +687,17 @@ Montane 提示词分为不可修改的核心执行协议和可配置的工作区
 - 聚合安全规则禁止多个事实对象直接混算，阻止会放大事实行的一对多/多对多路径，
   禁止比例或不可加数字求和，并禁止半可加指标跨时间直接求和。
 - SQL 和查询参数必须写入对应轮次追踪。
+- 明确指标问数最多保留一条成功查询；开放分析和原因诊断最多四条成功查询，并且
+  始终保持同一查询根事实对象。
+- 成功计划按结构化 IR 去重；后续步骤必须引用上一条 observation 中的真实发现，
+  没有新证据时提前停止，不允许机械遍历全部维度。
+- 固定分析模板可以作为未来推荐路径，但不是开放分析的前置条件。Montane 在受控
+  分析空间内动态规划，SQL 仍完全由 IR 编译器负责。
 
 Montane 会话启用事件压缩，模型侧 Ontology 工具结果只返回当前问题所需的对象、
-属性和指标。本轮累计输入预算为 240,000 token，避免一次可恢复的 IR 校验错误
-耗尽后续重试空间。
+属性和指标。当前通用循环最多 14 个模型回合、18 次工具调用和 360,000 输入
+token；开放分析在此之外还有独立的四条成功查询预算。重复本体搜索、重复 IR、
+跨事实对象和越界属性值搜索会被工具层拒绝，不能通过扩大预算掩盖循环。
 
 ## 14. SelectDB 适配
 
@@ -885,6 +921,8 @@ React Web UI
   -> Node Web BFF
   -> Montane Agent Runtime
   -> Semantic Retriever
+  -> Governed Analysis Space
+  -> Bounded Analysis Loop
   -> Typed Query IR
   -> Doris SQL Compiler
   -> SQL Guard
@@ -1065,6 +1103,8 @@ GET    /api/events
 - 已建模表不进入新建模默认选择。
 - 未发布对象不进入问数语义索引。
 - 历史会话恢复后结果与追踪一致。
+- 开放分析最多执行四条成功查询，重复计划和跨事实对象计划必须被拒绝。
+- 多步分析的目标、选择依据、IR、SQL 和结果样例必须按执行顺序持久化。
 - 正文与控件达到 WCAG AA。
 - 现有 CLI 行为和测试不得回归。
 
@@ -1101,8 +1141,10 @@ GET    /api/events
 ### 阶段 4：Data Agent
 
 - Semantic Retriever
-- Query Planner
-- SelectDB SQL 生成
+- Montane 动态 Query Planner
+- 单事实对象 Governed Analysis Space
+- 基于 observation 的有界多步分析循环
+- 强类型 Query IR 与确定性 SelectDB SQL 编译
 - 多轮上下文
 - 每轮分析证据链
 - 结果解释
@@ -1126,9 +1168,9 @@ GET    /api/events
 - 浏览器视觉验收
 - 修复后提交并推送 `main`
 
-## 25. 开发开始条件
+## 25. 当前交付与真实联调条件
 
-产品级决策已经闭合。开发开始仍需用户明确授权。
+产品级决策已经闭合，MVP 开发已启动并持续迭代。
 
 真实 SelectDB 联调需要后续提供：
 
@@ -1140,4 +1182,4 @@ GET    /api/events
 
 模型联调需要使用当前 CLI 支持的模型配置和有效凭据。
 
-在用户明确回复“开始开发”之前，只允许继续审阅和修订本文档。
+真实实例参数和业务预期只用于联调与验收，不影响本地代码构建。

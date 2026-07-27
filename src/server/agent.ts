@@ -4,7 +4,12 @@ import type {
   ToolOutcome,
   ToolStatus,
 } from "montane-code";
-import type { TraceStep, Turn } from "../shared/types.js";
+import type {
+  AnalysisRun,
+  AnalysisRunStep,
+  TraceStep,
+  Turn,
+} from "../shared/types.js";
 import { EventHub } from "./events.js";
 import { DataAgentHarness } from "./harness.js";
 import { createId } from "./id.js";
@@ -126,8 +131,16 @@ export class DataAgent {
           if (kind === "execution" && status === "running") turn.status = "querying";
           updateStep(kind, status, patch);
         },
+        (analysisRun) => {
+          turn.analysisRun = structuredClone(analysisRun);
+          persist("turn_updated");
+        },
       );
       const output = await this.harness.run(conversation, turn, reporter);
+      if (turn.analysisRun) {
+        turn.analysisRun.status =
+          output.responseKind === "analysis" ? "completed" : "failed";
+      }
       completeUnusedTrace(turn, output.responseKind);
       turn.status =
         output.responseKind === "configuration_required" ||
@@ -150,6 +163,7 @@ export class DataAgent {
       const message = error instanceof Error ? error.message : "Harness 分析失败";
       const running = turn.trace.find((step) => step.status === "running");
       if (running) updateStep(running.kind, "failed", { summary: message });
+      if (turn.analysisRun) turn.analysisRun.status = "failed";
       turn.status = "failed";
       turn.answer = message;
       turn.completedAt = new Date().toISOString();
@@ -186,6 +200,15 @@ export function mergeTraceFacts(
 class HarnessTurnReporter implements AgentReporter {
   private ontologyDiagnostics: unknown;
   private hasResolvedValueBinding = false;
+  private analysisRun?: AnalysisRun;
+  private readonly analysisSpaces = new Map<
+    string,
+    {
+      label: string;
+      metrics: AnalysisRun["availableMetrics"];
+      dimensions: AnalysisRun["availableDimensions"];
+    }
+  >();
 
   constructor(
     private readonly update: (
@@ -194,6 +217,7 @@ class HarnessTurnReporter implements AgentReporter {
       patch: Pick<TraceStep, "summary"> &
         Partial<Pick<TraceStep, "detail" | "facts" | "code">>,
     ) => void,
+    private readonly publishAnalysisRun: (run: AnalysisRun) => void = () => {},
   ) {}
 
   onTextDelta(_delta: string): void {}
@@ -211,6 +235,10 @@ class HarnessTurnReporter implements AgentReporter {
     }
     if (call.name === "OntologySearch") {
       this.handleOntologyStatus(status, result);
+      return;
+    }
+    if (call.name === "DiscoverAnalysisSpace") {
+      this.handleAnalysisSpaceStatus(status, result);
       return;
     }
     if (call.name === "PropertyValueSearch") {
@@ -236,6 +264,8 @@ class HarnessTurnReporter implements AgentReporter {
       const data = result?.data as
         | {
             frame?: {
+              originalQuestion?: string;
+              intentKind?: string;
               metricTerms?: string[];
               timeTerms?: string[];
               objectTerms?: string[];
@@ -248,9 +278,15 @@ class HarnessTurnReporter implements AgentReporter {
         | undefined;
       const frame = data?.frame;
       const facts = [
+        [
+          "分析类型",
+          frame?.intentKind
+            ? [analysisIntentKindLabel(frame.intentKind)]
+            : [],
+        ],
         ["指标", frame?.metricTerms],
         ["时间", frame?.timeTerms],
-        ["业务对象", frame?.objectTerms],
+        ["对象词（待绑定）", frame?.objectTerms],
         ["业务值", frame?.businessValueTerms],
         ["分组", frame?.groupingTerms],
         ["计算方式", frame?.calculationTerms],
@@ -266,11 +302,126 @@ class HarnessTurnReporter implements AgentReporter {
             source: "Montane 结构化理解",
           })),
       });
+      if (
+        frame?.intentKind === "EXPLORATORY_ANALYSIS" ||
+        frame?.intentKind === "DIAGNOSTIC_ANALYSIS"
+      ) {
+        this.analysisRun = {
+          mode: frame.intentKind,
+          objective: frame.originalQuestion ?? "开放式业务分析",
+          status: "planning",
+          maxSteps: 4,
+          availableMetrics: [],
+          availableDimensions: [],
+          steps: [],
+        };
+        this.publishAnalysisRun(this.analysisRun);
+      }
       return;
     }
     if (isFailure(status)) {
       this.update("understanding", "failed", {
         summary: result?.content || "问题语言框架提交失败",
+      });
+    }
+  }
+
+  private handleAnalysisSpaceStatus(
+    status: ToolStatus,
+    result?: ToolOutcome,
+  ): void {
+    if (status === "running") {
+      this.update("query_plan", "running", {
+        summary: "正在读取候选事实对象的指标、时间字段和诊断维度",
+      });
+      return;
+    }
+    if (status === "succeeded") {
+      const data = result?.data as
+        | {
+            spaces?: Array<{
+              object?: { id?: string; label?: string };
+              metrics?: Array<{ id?: string; label?: string }>;
+              dimensions?: Array<{
+                id?: string;
+                label?: string;
+                objectLabel?: string;
+              }>;
+            }>;
+            limits?: { maxSuccessfulQueries?: number };
+          }
+        | undefined;
+      const space = data?.spaces?.[0];
+      this.analysisSpaces.clear();
+      for (const candidate of data?.spaces ?? []) {
+        if (!candidate.object?.id || !candidate.object.label) continue;
+        this.analysisSpaces.set(candidate.object.id, {
+          label: candidate.object.label,
+          metrics: (candidate.metrics ?? []).flatMap((metric) =>
+            metric.id && metric.label
+              ? [{ id: metric.id, label: metric.label }]
+              : [],
+          ),
+          dimensions: (candidate.dimensions ?? []).flatMap((dimension) =>
+            dimension.id && dimension.label
+              ? [{
+                  id: dimension.id,
+                  label: dimension.label,
+                  objectLabel: dimension.objectLabel ?? "当前对象",
+                }]
+              : [],
+          ),
+        });
+      }
+      if (this.analysisRun) {
+        const selectedSpace = space?.object?.id
+          ? this.analysisSpaces.get(space.object.id)
+          : undefined;
+        this.analysisRun = {
+          ...this.analysisRun,
+          status: "running",
+          maxSteps:
+            data?.limits?.maxSuccessfulQueries ?? this.analysisRun.maxSteps,
+          rootObjectId: space?.object?.id,
+          rootObjectLabel: space?.object?.label,
+          availableMetrics: selectedSpace?.metrics ?? [],
+          availableDimensions: selectedSpace?.dimensions ?? [],
+        };
+        this.publishAnalysisRun(this.analysisRun);
+      }
+      this.update("query_plan", "completed", {
+        summary: space?.object?.label
+          ? `已选择 ${space.object.label} 作为单一事实对象，Montane 将根据真实结果动态推进`
+          : "未找到可用于开放分析的事实对象",
+        facts: [
+          {
+            label: "事实对象",
+            value: space?.object?.label ?? "未确定",
+            source: "已发布本体",
+            entityId: space?.object?.id,
+          },
+          {
+            label: "可用指标",
+            value: String(space?.metrics?.length ?? 0),
+            source: "分析空间",
+          },
+          {
+            label: "诊断维度",
+            value: String(space?.dimensions?.length ?? 0),
+            source: "分析空间",
+          },
+          {
+            label: "查询预算",
+            value: `${data?.limits?.maxSuccessfulQueries ?? 4} 步`,
+            source: "受控分析循环",
+          },
+        ],
+      });
+      return;
+    }
+    if (isFailure(status)) {
+      this.update("query_plan", "failed", {
+        summary: result?.content || "分析空间发现失败",
       });
     }
   }
@@ -290,12 +441,13 @@ class HarnessTurnReporter implements AgentReporter {
     if (status === "succeeded") {
       const data = result?.data as
         | {
-          matches?: Array<{ label?: string }>;
+            matches?: Array<{ label?: string }>;
             relations?: Array<{
               name?: string;
               cardinality?: string;
               fanoutRisk?: string;
             }>;
+            unpublishedMetricLabels?: string[];
           }
         | undefined;
       const matches = (data?.matches ?? []) as Array<{
@@ -311,20 +463,30 @@ class HarnessTurnReporter implements AgentReporter {
           .filter((label): label is string => Boolean(label))
           .slice(0, 5) ?? [];
       const relations = data?.relations ?? [];
+      const unpublishedMetricLabels = data?.unpublishedMetricLabels ?? [];
       this.ontologyDiagnostics = {
         candidates: matches,
         relations,
+        unpublishedMetricLabels,
       };
       this.update(
         "semantic_binding",
         "completed",
         {
-          summary: labels.length
-            ? `候选语义：${labels.join("、")}`
-            : "未命中可用本体语义",
-          detail: relations.length
-            ? `发现 ${relations.length} 条候选对象关系。词形候选不代表属性值归属，具体值仍由全局值索引验证。`
-            : "词形候选不代表属性值归属，具体值仍由全局值索引验证。",
+          summary: unpublishedMetricLabels.length
+            ? `指标 ${unpublishedMetricLabels.join("、")} 尚未发布，本轮只能使用当前发布版本`
+            : labels.length
+              ? `候选语义：${labels.join("、")}`
+              : "未命中可用本体语义",
+          detail: [
+            relations.length
+              ? `发现 ${relations.length} 条候选对象关系。`
+              : "",
+            "词形候选不代表属性值归属，具体值仍由全局值索引验证。",
+            unpublishedMetricLabels.length
+              ? "请先校验并发布本体草稿，再重新问数；系统不会读取未发布指标。"
+              : "",
+          ].filter(Boolean).join(""),
           code: {
             language: "json",
             content: JSON.stringify(
@@ -446,6 +608,7 @@ class HarnessTurnReporter implements AgentReporter {
     result?: ToolOutcome,
   ): void {
     if (status === "running") {
+      this.startAnalysisStep(call);
       const measureCount = Array.isArray(call.args.measure_ids)
         ? call.args.measure_ids.length
         : 0;
@@ -522,6 +685,14 @@ class HarnessTurnReporter implements AgentReporter {
             rowCount?: number;
             columns?: string[];
             truncated?: boolean;
+            rows?: Array<Record<string, string | number>>;
+            analysisStep?: {
+              id?: string;
+              objective?: string;
+              rationale?: string;
+              role?: AnalysisRunStep["role"];
+            };
+            observation?: Record<string, unknown>;
           }
         | undefined;
       const bindings = data?.bindings ?? [];
@@ -604,9 +775,11 @@ class HarnessTurnReporter implements AgentReporter {
           },
         ],
       });
+      this.finishAnalysisStep(call, "completed", result);
       return;
     }
     if (isFailure(status)) {
+      this.finishAnalysisStep(call, "failed", result);
       const data = result?.data as
         | {
             stage?: string;
@@ -690,6 +863,90 @@ class HarnessTurnReporter implements AgentReporter {
       );
     }
   }
+
+  private startAnalysisStep(call: ToolCall): void {
+    if (!this.analysisRun) return;
+    const raw = call.args.analysis_step as Record<string, unknown> | undefined;
+    const step: AnalysisRunStep = {
+      id: String(raw?.id ?? call.id),
+      callId: call.id,
+      sequence: this.analysisRun.steps.length + 1,
+      title: String(call.args.title ?? `分析步骤 ${this.analysisRun.steps.length + 1}`),
+      objective: String(raw?.objective ?? call.args.title ?? "执行受控查询"),
+      rationale: raw?.rationale ? String(raw.rationale) : undefined,
+      role: ["DIAGNOSTIC", "SUPPORTING"].includes(String(raw?.role))
+        ? String(raw?.role) as AnalysisRunStep["role"]
+        : "OVERVIEW",
+      status: "running",
+      summary: "IR 正在校验并执行",
+      startedAt: new Date().toISOString(),
+    };
+    this.analysisRun = {
+      ...this.analysisRun,
+      status: "running",
+      steps: [...this.analysisRun.steps, step],
+    };
+    this.publishAnalysisRun(this.analysisRun);
+  }
+
+  private finishAnalysisStep(
+    call: ToolCall,
+    status: "completed" | "failed",
+    result?: ToolOutcome,
+  ): void {
+    if (!this.analysisRun) return;
+    const data = (result?.data ?? {}) as {
+      ir?: AnalysisRunStep["ir"] & { rootObjectId?: string };
+      sql?: string;
+      parameters?: unknown[];
+      columns?: string[];
+      rows?: Array<Record<string, string | number>>;
+      rowCount?: number;
+      truncated?: boolean;
+      observation?: Record<string, unknown>;
+    };
+    const executedSpace = data.ir?.rootObjectId
+      ? this.analysisSpaces.get(data.ir.rootObjectId)
+      : undefined;
+    this.analysisRun = {
+      ...this.analysisRun,
+      rootObjectId: data.ir?.rootObjectId ?? this.analysisRun.rootObjectId,
+      rootObjectLabel:
+        executedSpace?.label ?? this.analysisRun.rootObjectLabel,
+      availableMetrics:
+        executedSpace?.metrics ?? this.analysisRun.availableMetrics,
+      availableDimensions:
+        executedSpace?.dimensions ?? this.analysisRun.availableDimensions,
+      steps: this.analysisRun.steps.map((step) =>
+        step.callId === call.id
+          ? {
+              ...step,
+              status,
+              summary:
+                status === "completed"
+                  ? `返回 ${data.rowCount ?? 0} 行，Montane 正在判断是否需要继续分析`
+                  : result?.content?.split("\n")[0] || "本步查询失败",
+              ir: data.ir,
+              sql: data.sql,
+              parameters: data.parameters,
+              columns: data.columns,
+              rows: data.rows,
+              rowCount: data.rowCount,
+              truncated: data.truncated,
+              error: status === "failed" ? result?.content : undefined,
+              completedAt: new Date().toISOString(),
+            }
+          : step,
+      ),
+    };
+    this.publishAnalysisRun(this.analysisRun);
+  }
+}
+
+function analysisIntentKindLabel(kind: string): string {
+  if (kind === "EXPLORATORY_ANALYSIS") return "开放式分析";
+  if (kind === "DIAGNOSTIC_ANALYSIS") return "原因诊断";
+  return "明确指标问数";
 }
 
 function isFailure(status: ToolStatus): boolean {

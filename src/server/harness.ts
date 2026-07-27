@@ -15,6 +15,7 @@ import {
 } from "montane-code";
 import type {
   AnalysisIntent,
+  AnalysisRunStep,
   Conversation,
   Metric,
   OntologyObject,
@@ -36,14 +37,17 @@ const DATA_AGENT_SYSTEM_PROMPT = `
 必须遵循以下执行协议：
 1. 先判断用户是在打招呼、询问能力，还是提出数据分析请求。
 2. 打招呼或询问能力时直接简短回答，不调用数据工具，不生成图表或业务结论。
-3. 数据分析请求必须先调用一次 SubmitQuestionFrame，把原问题按时间、指标、对象、完整业务值、分组、计算方式和展现方式结构化；不得先猜字段归属，也不得在同一轮重复提交或改写问题框架。
-4. 随后调用 OntologySearch。业务值短语不参与属性名称词形检索；OntologySearch 的词形匹配只是候选证据，不能证明用户词一定是属性名称。相同问题框架只能调用一次 OntologySearch；若没有可用候选，应澄清而不是重复调用。
-5. question_frame.business_value_terms 中的每个完整短语都必须调用 PropertyValueSearch。具体值的真实字段归属以全局已发布值索引为准。工具返回 resolved 时，后续筛选只能把 selectedMatch.valueBindingId 提交为 value_binding_id，不得重新选择 property_id 或改写值；返回 ambiguous 时必须让用户澄清。
+3. 数据分析请求必须先单独调用一次 SubmitQuestionFrame，把原问题按分析类型、时间、指标、对象、完整业务值、分组、计算方式和展现方式结构化；不得把具体商品名、组织名等业务值放进 object_terms，不得并行调用后续工具，也不得在同一轮重复提交或改写问题框架。
+4. 随后只调用一次 OntologySearch。业务值短语不参与属性名称词形检索；OntologySearch 的词形匹配只是候选证据，不能证明用户词一定是属性名称。若明确指标没有候选，应澄清或提示发布草稿，不得改写同义词重复搜索。
+4.1 当 intent_kind 为 EXPLORATORY_ANALYSIS 或 DIAGNOSTIC_ANALYSIS 时，在 OntologySearch 后调用一次 DiscoverAnalysisSpace，查看候选事实对象下已发布的指标、受控数字属性、时间和诊断维度。不得把“销售表现”等主题词伪造成正式指标。
+5. question_frame.business_value_terms 中的每个完整短语都必须且只能调用 PropertyValueSearch。不得把指标名、计算词或自己扩展的近义词提交为属性值。具体值的真实字段归属以全局已发布值索引为准。工具返回 resolved 时，后续筛选只能把 selectedMatch.valueBindingId 提交为 value_binding_id，不得重新选择 property_id 或改写值；返回 ambiguous 时必须让用户澄清。
 6. 你不能生成 SQL。完成语义理解后，必须调用 ExecuteAnalysisPlan，提交本体返回的对象、度量和维度属性 ID；业务值筛选只提交 value_binding_id。measure_ids 只能使用 metrics 中返回的 ID，其中既可能是正式指标，也可能是带默认聚合规则的数字属性。
 7. 用户要求按日、周、月、季度或年展示时，必须提交 time_grain，分别使用 DAY、WEEK、MONTH、QUARTER、YEAR；“月度趋势”不能把原始日期字段直接作为普通维度。
 8. 同比、环比、占比、差值、排名、累计或移动平均只能使用 ExecuteAnalysisPlan 提供的强类型计算结构；不得自行改写 SQL。同比使用 YEAR_OVER_YEAR，环比使用 PREVIOUS_PERIOD。
 8.1 OntologySearch 返回 metricType=DERIVED 的正式复合指标时，直接把该指标 ID 放入 measure_ids，不要再次用 derived_calculations 重建其公式；其依赖 DAG 由 IR 自动展开。
 9. ExecuteAnalysisPlan 是唯一查询入口，它会通过规则引擎生成 IR、校验关系、粒度、可加性、筛选逻辑和窗口计算，编译参数化 Doris SQL 并执行查询。
+9.1 直接问数通常只执行一次。探索或诊断分析可以根据真实结果最多执行四步；每一步必须提供 analysis_step，说明本步目标、依据和结果角色。先用一条查询同时获取多个核心指标，再根据结果决定是否按一个高价值维度继续诊断。不得重复相同计划，不得跨事实对象，已有证据足够时立即停止。
+9.2 每次 ExecuteAnalysisPlan 返回 observation。继续查询前必须基于该 observation 说明新查询要验证的具体问题；不得为了“多分析一步”而机械穷举所有维度。
 10. 不得猜测或创造对象 ID、指标 ID、属性 ID、数据库值、绑定 ID 或关系。计算项的本地 ID 可以使用 calc_ 前缀，但其输入必须引用工具返回的真实 ID。
 11. 最终使用中文给出简洁、可验证的结论，只能引用 ExecuteAnalysisPlan 返回的数据。
 12. 信息不足、语义存在多个候选或工具拒绝计划时，向用户说明需要补充的具体条件。
@@ -67,6 +71,14 @@ interface CapturedAnalysis {
   sql: string;
   parameters: unknown[];
   compiled: CompiledQuery;
+  stepId?: string;
+  role: AnalysisRunStep["role"];
+}
+
+interface AnalysisExecutionState {
+  captures: CapturedAnalysis[];
+  seenPlanHashes: Set<string>;
+  rootObjectId?: string;
 }
 
 interface ResolvedValueBinding {
@@ -116,10 +128,14 @@ export class DataAgentHarness {
     const source = this.repository.getDataSource();
     const runtime = await this.getModelRuntime();
     const agentConfig = this.repository.getAgentConfig();
-    let captured: CapturedAnalysis | null = null;
+    const analysisState: AnalysisExecutionState = {
+      captures: [],
+      seenPlanHashes: new Set(),
+    };
     let questionFrame: QuestionLanguageFrame | undefined;
     const valueBindings = new Map<string, ResolvedValueBinding>();
     const ontologySearchCache = new Map<string, ToolOutcome>();
+    const analysisSpaceCache = new Map<string, ToolOutcome>();
     const tools = new ToolRegistry();
     tools.register(
       this.questionFrameTool(turn.question, (frame) => {
@@ -130,21 +146,31 @@ export class DataAgentHarness {
     tools.register(
       this.ontologySearchTool(() => questionFrame, ontologySearchCache),
     );
-    tools.register(this.propertyValueSearchTool(valueBindings));
+    tools.register(
+      this.discoverAnalysisSpaceTool(
+        () => questionFrame,
+        analysisSpaceCache,
+      ),
+    );
+    tools.register(
+      this.propertyValueSearchTool(valueBindings, () => questionFrame),
+    );
     tools.register(
       this.executeAnalysisPlanTool(
         (analysis) => {
-          captured = analysis;
+          analysisState.captures.push(analysis);
         },
         agentConfig.timezone,
         valueBindings,
         () => questionFrame,
+        analysisState,
       ),
     );
 
     const policy = defaultPolicy();
     policy.allowedTools.add("SubmitQuestionFrame");
     policy.allowedTools.add("OntologySearch");
+    policy.allowedTools.add("DiscoverAnalysisSpace");
     policy.allowedTools.add("PropertyValueSearch");
     policy.allowedTools.add("ExecuteAnalysisPlan");
     const permissions = new PermissionGate(policy, this.workspaceRoot);
@@ -176,17 +202,19 @@ export class DataAgentHarness {
         await managed.updateStatus(status);
       },
       {
-        maxTurns: 8,
-        maxWallTimeMs: 190_000,
-        maxInputTokens: 240_000,
-        maxOutputTokens: 12_000,
-        maxToolCalls: 8,
+        maxTurns: 14,
+        maxWallTimeMs: 480_000,
+        maxInputTokens: 360_000,
+        maxOutputTokens: 18_000,
+        maxToolCalls: 18,
         maxModelRetries: 2,
       },
     );
 
     const answer = localizeHarnessStop(await loop.run(turn.question));
-    const completed = captured as CapturedAnalysis | null;
+    const completed = analysisState.captures.find(
+      (analysis) => analysis.role === "OVERVIEW",
+    ) ?? analysisState.captures[0];
     const asksForData = isLikelyDataQuestion(turn.question);
     const responseKind: HarnessRunResult["responseKind"] = completed
       ? "analysis"
@@ -286,9 +314,24 @@ export class DataAgentHarness {
         additionalProperties: false,
         properties: {
           original_question: { type: "string" },
+          intent_kind: {
+            type: "string",
+            enum: [
+              "DIRECT_QUERY",
+              "EXPLORATORY_ANALYSIS",
+              "DIAGNOSTIC_ANALYSIS",
+            ],
+            description:
+              "明确指标问数用 DIRECT_QUERY；未指定单一指标、要求整体表现或开放探索用 EXPLORATORY_ANALYSIS；询问原因、异常或驱动因素用 DIAGNOSTIC_ANALYSIS",
+          },
           metric_terms: { type: "array", items: { type: "string" } },
           time_terms: { type: "array", items: { type: "string" } },
-          object_terms: { type: "array", items: { type: "string" } },
+          object_terms: {
+            type: "array",
+            items: { type: "string" },
+            description:
+              "业务对象类别，例如商品、销售、组织；不得填写具体商品名、组织名或其他业务值",
+          },
           business_value_terms: {
             type: "array",
             items: { type: "string" },
@@ -312,6 +355,7 @@ export class DataAgentHarness {
         },
         required: [
           "original_question",
+          "intent_kind",
           "metric_terms",
           "time_terms",
           "object_terms",
@@ -335,12 +379,24 @@ export class DataAgentHarness {
             : [];
         const rawPresentation =
           (args.presentation as Record<string, unknown> | undefined) ?? {};
+        const businessValueTerms = list("business_value_terms");
+        const businessValues = new Set(
+          businessValueTerms.map(normalizePropertyValue),
+        );
         const frame: QuestionLanguageFrame = {
           originalQuestion: String(args.original_question ?? "").trim(),
+          intentKind: [
+            "EXPLORATORY_ANALYSIS",
+            "DIAGNOSTIC_ANALYSIS",
+          ].includes(String(args.intent_kind))
+            ? String(args.intent_kind) as QuestionLanguageFrame["intentKind"]
+            : "DIRECT_QUERY",
           metricTerms: list("metric_terms"),
           timeTerms: list("time_terms"),
-          objectTerms: list("object_terms"),
-          businessValueTerms: list("business_value_terms"),
+          objectTerms: list("object_terms").filter(
+            (term) => !businessValues.has(normalizePropertyValue(term)),
+          ),
+          businessValueTerms,
           groupingTerms: list("grouping_terms"),
           calculationTerms: list("calculation_terms"),
           presentation: {
@@ -377,7 +433,10 @@ export class DataAgentHarness {
           content: JSON.stringify({
             accepted: true,
             frame: acceptedFrame,
-            next: "调用 OntologySearch；对每个 businessValueTerm 调用 PropertyValueSearch",
+            next:
+              acceptedFrame.intentKind === "DIRECT_QUERY"
+                ? "调用一次 OntologySearch；对每个 businessValueTerm 调用一次 PropertyValueSearch"
+                : "调用一次 OntologySearch，再调用一次 DiscoverAnalysisSpace；对每个 businessValueTerm 调用一次 PropertyValueSearch",
           }),
           data: { frame: acceptedFrame },
         };
@@ -524,6 +583,24 @@ export class DataAgentHarness {
                 : binding.property.numericSpec?.unit,
           }];
         });
+        const draft = this.repository.getDraftOntology();
+        const unpublishedMetricLabels = draft
+          ? [
+              ...new Set(
+                frame?.metricTerms.flatMap((term) =>
+                  new SemanticIndex(draft)
+                    .search(term, 6, ["metric"])
+                    .filter(
+                      (match) =>
+                        !ontology.metrics.some(
+                          (metric) => metric.id === match.id,
+                        ),
+                    )
+                    .map((match) => match.label),
+                ) ?? [],
+              ),
+            ]
+          : [];
         const relations = ontology.relations.filter(
           (relation) =>
             relation.enabled &&
@@ -625,11 +702,14 @@ export class DataAgentHarness {
             cardinality: relation.cardinality,
             fanoutRisk: relation.fanoutRisk,
           })),
+          unpublishedMetricLabels,
           instructions: [
             "matches 是词形候选，不代表具体业务值的字段归属",
             "具体值必须调用 PropertyValueSearch 做全局值索引验证",
             "measure_ids 只能使用 metrics[].id；measureKind=PROPERTY 表示由数字属性默认聚合生成的受控度量",
-            "不得对相同问题重复调用 OntologySearch；没有候选时应向用户澄清",
+            unpublishedMetricLabels.length
+              ? `指标 ${unpublishedMetricLabels.join("、")} 仅存在于草稿，正式问数不可使用；请提示用户校验并发布草稿，不得重复搜索或改写近义词`
+              : "不得对相同问题重复调用 OntologySearch；没有候选时应向用户澄清",
           ],
         };
         const outcome: ToolOutcome = {
@@ -639,7 +719,158 @@ export class DataAgentHarness {
             ontologyVersion: ontology.version,
             matches,
             relations,
+            unpublishedMetricLabels,
           },
+        };
+        cache.set(cacheKey, outcome);
+        return outcome;
+      },
+    };
+  }
+
+  private discoverAnalysisSpaceTool(
+    getQuestionFrame: () => QuestionLanguageFrame | undefined,
+    cache: Map<string, ToolOutcome> = new Map(),
+  ): Tool {
+    return {
+      name: "DiscoverAnalysisSpace",
+      description:
+        "为探索或诊断问题返回单一事实对象内可用的已发布指标、受控数字属性、时间字段和诊断维度。它只发现分析空间，不执行查询。",
+      effect: "readonly",
+      inputSchema: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          objective: {
+            type: "string",
+            description: "用户希望分析的业务目标，必须忠实保留原问题含义",
+          },
+          object_ids: {
+            type: "array",
+            items: { type: "string" },
+            description:
+              "可选，OntologySearch 返回的候选对象 ID；不得猜测不存在的 ID",
+          },
+        },
+        required: ["objective"],
+      },
+      execute: async (args): Promise<ToolOutcome> => {
+        const frame = getQuestionFrame();
+        if (!frame) {
+          return {
+            ok: false,
+            content: "分析空间发现失败：请先单独提交问题语言框架",
+          };
+        }
+        if (frame.intentKind === "DIRECT_QUERY") {
+          return {
+            ok: false,
+            content:
+              "当前是明确指标问数，不需要发现分析空间。请使用 OntologySearch 返回的指标执行一次查询。",
+          };
+        }
+        const ontology = this.repository.getPublishedOntology();
+        const objective = String(args.objective ?? "").trim();
+        const requestedIds = Array.isArray(args.object_ids)
+          ? args.object_ids.map(String)
+          : [];
+        const cacheKey = JSON.stringify({
+          ontologyVersion: ontology.version,
+          objective: normalizePropertyValue(objective),
+          objectIds: [...requestedIds].sort(),
+        });
+        const cached = cache.get(cacheKey);
+        if (cached) {
+          const duplicatePayload = {
+            ...((cached.data as Record<string, unknown> | undefined) ?? {}),
+            duplicateSuppressed: true,
+            duplicateInstruction:
+              "本轮分析空间已经确定，禁止继续调用 DiscoverAnalysisSpace；请执行受控分析计划或基于已有证据总结。",
+          };
+          return {
+            ...cached,
+            content: JSON.stringify(duplicatePayload),
+            data: duplicatePayload,
+          };
+        }
+
+        const index = new SemanticIndex(ontology);
+        const candidateIds = new Set(
+          requestedIds.filter((id) =>
+            ontology.objects.some((object) => object.id === id),
+          ),
+        );
+        for (const term of [
+          ...frame.objectTerms,
+          ...frame.metricTerms,
+          objective,
+        ]) {
+          for (const match of index.search(term, 8)) {
+            if (match.kind === "object") candidateIds.add(match.id);
+            if (match.objectId) candidateIds.add(match.objectId);
+          }
+        }
+
+        const measureObjectIds = new Set(
+          [
+            ...ontology.metrics.map((metric) => metric.objectId),
+            ...ontology.objects.flatMap((object) =>
+              object.properties.some((property) =>
+                isAggregatableProperty(ontology, property.id),
+              )
+                ? [object.id]
+                : [],
+            ),
+          ],
+        );
+        const measurableObjects = ontology.objects.filter((object) =>
+          measureObjectIds.has(object.id),
+        );
+        const factObjects = measurableObjects.filter((object) =>
+          ["EVENT", "AGGREGATE", "SNAPSHOT"].includes(object.objectType),
+        );
+        const rankedObjects = (factObjects.length ? factObjects : measurableObjects)
+          .sort((left, right) => {
+            const leftRequested = Number(candidateIds.has(left.id));
+            const rightRequested = Number(candidateIds.has(right.id));
+            const leftFact = Number(
+              ["EVENT", "AGGREGATE", "SNAPSHOT"].includes(left.objectType),
+            );
+            const rightFact = Number(
+              ["EVENT", "AGGREGATE", "SNAPSHOT"].includes(right.objectType),
+            );
+            return (
+              rightRequested - leftRequested ||
+              rightFact - leftFact ||
+              right.bindingPriority - left.bindingPriority ||
+              left.label.localeCompare(right.label, "zh-CN")
+            );
+          })
+          .slice(0, 1);
+        const spaces = rankedObjects.map((object) =>
+          buildAnalysisSpace(ontology, object),
+        );
+        const payload = {
+          ontologyVersion: ontology.version,
+          intentKind: frame.intentKind,
+          objective,
+          spaces,
+          limits: {
+            factObjectsPerRun: 1,
+            maxSuccessfulQueries: 4,
+            maxReturnedDimensionsPerObject: 32,
+          },
+          instructions: [
+            "选择一个事实对象完成本轮分析，不得跨事实对象混算",
+            "第一步优先在一条查询中同时获取多个核心指标",
+            "后续查询必须由上一查询 observation 中的真实变化触发",
+            "每次 ExecuteAnalysisPlan 都要提交 analysis_step；证据足够时停止并总结",
+          ],
+        };
+        const outcome: ToolOutcome = {
+          ok: true,
+          content: JSON.stringify(payload),
+          data: payload,
         };
         cache.set(cacheKey, outcome);
         return outcome;
@@ -649,6 +880,7 @@ export class DataAgentHarness {
 
   private propertyValueSearchTool(
     valueBindings: Map<string, ResolvedValueBinding> = new Map(),
+    getQuestionFrame: () => QuestionLanguageFrame | undefined = () => undefined,
   ): Tool {
     return {
       name: "PropertyValueSearch",
@@ -686,6 +918,24 @@ export class DataAgentHarness {
         const value = String(args.value ?? "").trim();
         if (!value) {
           return { ok: false, content: "属性值不能为空" };
+        }
+        const frame = getQuestionFrame();
+        if (
+          frame &&
+          !frame.businessValueTerms.some(
+            (term) =>
+              normalizePropertyValue(term) === normalizePropertyValue(value),
+          )
+        ) {
+          return {
+            ok: false,
+            content:
+              "属性值检索被拒绝：只能检索问题框架 business_value_terms 中的原始完整短语，不得检索指标名、计算词或扩展近义词。",
+            data: {
+              stage: "semantic_binding",
+              allowedBusinessValues: frame.businessValueTerms,
+            },
+          };
         }
         const ontology = this.repository.getPublishedOntology();
         const propertyIds = new Set(
@@ -907,6 +1157,10 @@ export class DataAgentHarness {
     timezone: string,
     valueBindings: Map<string, ResolvedValueBinding>,
     getQuestionFrame: () => QuestionLanguageFrame | undefined,
+    state: AnalysisExecutionState = {
+      captures: [],
+      seenPlanHashes: new Set(),
+    },
   ): Tool {
     return {
       name: "ExecuteAnalysisPlan",
@@ -920,13 +1174,14 @@ export class DataAgentHarness {
         properties: {
           root_object_id: {
             type: "string",
-            description: "OntologySearch 返回的主业务对象 ID",
+            description:
+              "OntologySearch 或 DiscoverAnalysisSpace 返回的主业务对象 ID",
           },
           measure_ids: {
             type: "array",
             items: { type: "string" },
             description:
-              "只能填写 OntologySearch 的 metrics[].id。metrics 中既包含正式指标，也可能包含 measureKind=PROPERTY 的受控数字属性；未作为 metrics 返回的普通属性不能填写",
+              "只能填写 OntologySearch.metrics[] 或 DiscoverAnalysisSpace.spaces[].metrics[] 返回的 ID。metrics 中既包含正式指标，也可能包含 measureKind=PROPERTY 的受控数字属性；未作为 metrics 返回的普通属性不能填写",
           },
           dimension_property_ids: {
             type: "array",
@@ -1129,6 +1384,32 @@ export class DataAgentHarness {
             type: "string",
             enum: ["aggregate", "detail"],
           },
+          analysis_step: {
+            type: "object",
+            additionalProperties: false,
+            description:
+              "探索或诊断分析必填，用于记录本步目标、继续查询依据和结果角色",
+            properties: {
+              id: {
+                type: "string",
+                description: "本轮唯一 step_ 前缀 ID",
+              },
+              objective: {
+                type: "string",
+                description: "本步要回答的具体问题",
+              },
+              rationale: {
+                type: "string",
+                description:
+                  "首步说明为何选择这些核心指标；后续步骤必须引用上一 observation 的真实发现",
+              },
+              role: {
+                type: "string",
+                enum: ["OVERVIEW", "DIAGNOSTIC", "SUPPORTING"],
+              },
+            },
+            required: ["id", "objective", "rationale", "role"],
+          },
           title: {
             type: "string",
             description: "结果图表的中文标题",
@@ -1158,6 +1439,37 @@ export class DataAgentHarness {
           return {
             ok: false,
             content: "IR规则校验失败：尚未提交问题语言框架",
+          };
+        }
+        const exploratory = frame.intentKind !== "DIRECT_QUERY";
+        const rawAnalysisStep = args.analysis_step as
+          | Record<string, unknown>
+          | undefined;
+        if (exploratory && !rawAnalysisStep) {
+          return {
+            ok: false,
+            content:
+              "IR规则校验失败：探索或诊断分析必须提供 analysis_step，说明本步目标、依据和结果角色",
+            data: {
+              stage: "planning",
+              retryInstruction:
+                "补充 analysis_step 后重试；首步优先同时查询多个核心指标。",
+            },
+          };
+        }
+        const maxSuccessfulQueries = exploratory ? 4 : 1;
+        if (state.captures.length >= maxSuccessfulQueries) {
+          return {
+            ok: false,
+            content: exploratory
+              ? `分析步骤预算已用完：最多执行 ${maxSuccessfulQueries} 条成功查询。请基于现有 observation 生成结论。`
+              : "直接问数已经获得真实结果，不得继续执行查询。请基于现有结果回答。",
+            data: {
+              stage: "planning",
+              code: "ANALYSIS_STEP_BUDGET_REACHED",
+              successfulQueries: state.captures.length,
+              maxSuccessfulQueries,
+            },
           };
         }
         const boundSourceTexts = new Set(
@@ -1195,6 +1507,19 @@ export class DataAgentHarness {
             },
           };
         }
+        const planHash = stableAnalysisPlanHash(intent);
+        if (state.seenPlanHashes.has(planHash)) {
+          return {
+            ok: false,
+            content:
+              "IR规则校验失败：该查询计划已成功执行，不得重复调用。请基于已有 observation 选择不同诊断问题或直接总结。",
+            data: {
+              stage: "planning",
+              code: "DUPLICATE_ANALYSIS_PLAN",
+              intent: intent as unknown as Record<string, unknown>,
+            },
+          };
+        }
         let compiled: CompiledQuery;
         try {
           compiled = this.queryCompiler.compile(
@@ -1214,8 +1539,25 @@ export class DataAgentHarness {
               stage: "planning",
               intent: intent as unknown as Record<string, unknown>,
               retryInstruction:
-                "根据错误重新检查 ID 类型并再次调用 ExecuteAnalysisPlan。measure_ids 只能使用 OntologySearch 返回的 metrics[].id，其中 measureKind=PROPERTY 的数字属性允许按默认聚合执行。",
+                "根据错误重新检查 ID 类型并再次调用 ExecuteAnalysisPlan。measure_ids 只能使用 OntologySearch 或 DiscoverAnalysisSpace 返回的 metrics[].id，其中 measureKind=PROPERTY 的数字属性允许按默认聚合执行。",
               availableMetrics,
+            },
+          };
+        }
+        if (
+          exploratory &&
+          state.rootObjectId &&
+          compiled.ir.rootObjectId !== state.rootObjectId
+        ) {
+          return {
+            ok: false,
+            content:
+              "IR规则校验失败：探索分析必须保持同一个事实对象，不得在同一轮切换查询根对象",
+            data: {
+              stage: "planning",
+              code: "CROSS_FACT_ANALYSIS_NOT_ALLOWED",
+              expectedRootObjectId: state.rootObjectId,
+              receivedRootObjectId: compiled.ir.rootObjectId,
             },
           };
         }
@@ -1246,6 +1588,7 @@ export class DataAgentHarness {
             data: {
               stage: "execution",
               ...evidence,
+              analysisStep: normalizeAnalysisStep(rawAnalysisStep, intent.title),
             },
           };
         }
@@ -1259,7 +1602,15 @@ export class DataAgentHarness {
           sql: compiled.sql,
           parameters: compiled.parameters,
           compiled,
+          stepId: rawAnalysisStep?.id
+            ? String(rawAnalysisStep.id)
+            : undefined,
+          role: normalizeAnalysisStep(rawAnalysisStep, intent.title).role,
         });
+        state.rootObjectId ??= compiled.ir.rootObjectId;
+        state.seenPlanHashes.add(planHash);
+        const observation = summarizeAnalysisObservation(query, artifact);
+        const analysisStep = normalizeAnalysisStep(rawAnalysisStep, intent.title);
         return {
           ok: true,
           content: JSON.stringify({
@@ -1268,16 +1619,36 @@ export class DataAgentHarness {
             ...evidence,
             rowCount: artifact.rowCount,
             columns: artifact.columns,
-            rows: artifact.rows.slice(0, 50),
+            rows: artifact.rows.slice(0, 20),
             truncated: artifact.truncated,
+            analysisStep,
+            observation,
+            analysisProgress: {
+              successfulQueries: state.captures.length,
+              maxSuccessfulQueries,
+              remainingQueries:
+                maxSuccessfulQueries - state.captures.length,
+            },
+            nextInstruction:
+              exploratory && state.captures.length < maxSuccessfulQueries
+                ? "只有当 observation 暴露了需要验证的具体变化时才继续下一步；否则立即基于现有证据总结。"
+                : "请基于现有真实结果生成最终结论。",
           }),
           data: {
             mode: artifact.mode,
             ...evidence,
             rowCount: artifact.rowCount,
             columns: artifact.columns,
-            rows: artifact.rows.slice(0, 50),
+            rows: artifact.rows.slice(0, 20),
             truncated: artifact.truncated,
+            analysisStep,
+            observation,
+            analysisProgress: {
+              successfulQueries: state.captures.length,
+              maxSuccessfulQueries,
+              remainingQueries:
+                maxSuccessfulQueries - state.captures.length,
+            },
           },
         };
       },
@@ -1741,6 +2112,128 @@ function listAvailableMeasures(
   ];
 }
 
+function buildAnalysisSpace(
+  ontology: OntologySnapshot,
+  root: OntologyObject,
+): Record<string, unknown> {
+  const formalMetrics = ontology.metrics
+    .filter((metric) => metric.objectId === root.id)
+    .map((metric) => ({
+      id: metric.id,
+      label: metric.label,
+      description: metric.description,
+      measureKind: "METRIC" as const,
+      metricType: metric.metricType ?? "BASE",
+      format: metric.format,
+      aggregation: metric.aggregation,
+      timePropertyId: metric.timePropertyId,
+      formula:
+        metric.metricType === "DERIVED"
+          ? metricFormulaLabel(metric, ontology.metrics)
+          : undefined,
+    }));
+  const propertyMeasures = root.properties.flatMap((property) =>
+    isAggregatableProperty(ontology, property.id)
+      ? [{
+          id: property.id,
+          label: property.label,
+          description: property.description,
+          measureKind: "PROPERTY" as const,
+          aggregation: property.numericSpec!.defaultAggregation,
+          numericKind: property.numericSpec!.kind,
+          unit:
+            property.numericSpec!.kind === "CURRENCY"
+              ? property.numericSpec!.currency
+              : property.numericSpec!.unit,
+          timePropertyId: root.defaultTimePropertyId,
+        }]
+      : [],
+  );
+  const dimensionMeanings = new Set([
+    "NAME",
+    "CODE",
+    "CATEGORY",
+    "BOOLEAN",
+    "GEOGRAPHY",
+    "TEXT",
+  ]);
+  const dimensions = root.properties
+    .filter(
+      (property) =>
+        property.visibility === "ANALYTICAL" &&
+        !property.sensitive &&
+        dimensionMeanings.has(property.meaning) &&
+        (property.meaning !== "TEXT" || property.defaultDisplay),
+    )
+    .map((property) => ({
+      id: property.id,
+      label: property.label,
+      objectId: root.id,
+      objectLabel: root.label,
+      meaning: property.meaning,
+      relationIds: [] as string[],
+    }));
+  for (const relation of ontology.relations.filter(
+    (candidate) =>
+      candidate.enabled &&
+      candidate.fanoutRisk !== "HIGH" &&
+      (candidate.sourceObjectId === root.id ||
+        candidate.targetObjectId === root.id),
+  )) {
+    const neighborId =
+      relation.sourceObjectId === root.id
+        ? relation.targetObjectId
+        : relation.sourceObjectId;
+    const neighbor = ontology.objects.find((object) => object.id === neighborId);
+    if (!neighbor) continue;
+    dimensions.push(
+      ...neighbor.properties
+        .filter(
+          (property) =>
+            property.visibility === "ANALYTICAL" &&
+            !property.sensitive &&
+            dimensionMeanings.has(property.meaning) &&
+            (property.meaning !== "TEXT" || property.defaultDisplay),
+        )
+        .map((property) => ({
+          id: property.id,
+          label: property.label,
+          objectId: neighbor.id,
+          objectLabel: neighbor.label,
+          meaning: property.meaning,
+          relationIds: [relation.id],
+        })),
+    );
+  }
+  const timeProperties = root.properties
+    .filter(
+      (property) =>
+        property.visibility === "ANALYTICAL" &&
+        !property.sensitive &&
+        property.meaning === "TIME",
+    )
+    .map((property) => ({
+      id: property.id,
+      label: property.label,
+      isDefault: property.id === root.defaultTimePropertyId,
+    }));
+  return {
+    object: {
+      id: root.id,
+      label: root.label,
+      objectType: root.objectType,
+      description: root.description,
+      grain: effectiveGrainLabels(root),
+      defaultTimePropertyId: root.defaultTimePropertyId,
+    },
+    metrics: [...formalMetrics, ...propertyMeasures].slice(0, 24),
+    timeProperties: timeProperties.slice(0, 8),
+    dimensions: [
+      ...new Map(dimensions.map((dimension) => [dimension.id, dimension])).values(),
+    ].slice(0, 32),
+  };
+}
+
 function metricFormulaLabel(metric: Metric, metrics: Metric[]): string {
   if (metric.metricType !== "DERIVED") return metric.expression;
   const left =
@@ -1907,6 +2400,86 @@ function isLikelyDataQuestion(question: string): boolean {
   return /分析|数据|指标|销售|订单|成交|收入|营收|金额|客户|会员|商品|品类|门店|区域|趋势|增长|下降|环比|同比|对比|排名|占比|多少|几|哪些|最高|最低|平均|总计|汇总|明细|GMV|AOV|TOP\s*\d*/i.test(
     question,
   );
+}
+
+function normalizeAnalysisStep(
+  raw: Record<string, unknown> | undefined,
+  fallbackTitle: string,
+): {
+  id: string;
+  objective: string;
+  rationale: string;
+  role: AnalysisRunStep["role"];
+} {
+  const role = ["DIAGNOSTIC", "SUPPORTING"].includes(String(raw?.role))
+    ? String(raw?.role) as AnalysisRunStep["role"]
+    : "OVERVIEW";
+  return {
+    id: String(raw?.id ?? createId("step")),
+    objective: String(raw?.objective ?? fallbackTitle),
+    rationale: String(
+      raw?.rationale ?? "根据用户问题执行受控语义查询",
+    ),
+    role,
+  };
+}
+
+function stableAnalysisPlanHash(intent: AnalysisIntent): string {
+  return JSON.stringify({
+    rootObjectId: intent.rootObjectId,
+    measureIds: [...intent.measureIds].sort(),
+    dimensionPropertyIds: [...intent.dimensionPropertyIds].sort(),
+    filters: intent.filters,
+    filterExpression: intent.filterExpression,
+    timeRange: intent.timeRange,
+    timeGrain: intent.timeGrain,
+    derivedMeasures: intent.derivedMeasures,
+    timeComparisons: intent.timeComparisons,
+    windowCalculations: intent.windowCalculations,
+    sort: intent.sort,
+    limit: intent.limit,
+    resultKind: intent.resultKind,
+  });
+}
+
+function summarizeAnalysisObservation(
+  query: QueryResult,
+  artifact: ResultArtifact,
+): Record<string, unknown> {
+  const numericColumns = artifact.columns.filter((column) =>
+    artifact.rows.some((row) => typeof row[column] === "number"),
+  );
+  const numericSummary = numericColumns.slice(0, 8).map((column) => {
+    const values = artifact.rows
+      .map((row) => row[column])
+      .filter((value): value is number => typeof value === "number");
+    const first = values[0];
+    const last = values.at(-1);
+    return {
+      column,
+      count: values.length,
+      min: values.length ? Math.min(...values) : undefined,
+      max: values.length ? Math.max(...values) : undefined,
+      sum: values.reduce((total, value) => total + value, 0),
+      average: values.length
+        ? values.reduce((total, value) => total + value, 0) / values.length
+        : undefined,
+      first,
+      last,
+      change:
+        first != null && last != null && first !== 0
+          ? (last - first) / Math.abs(first)
+          : undefined,
+    };
+  });
+  return {
+    rowCount: artifact.rowCount,
+    columns: artifact.columns,
+    truncated: artifact.truncated,
+    durationMs: query.durationMs,
+    numericSummary,
+    sampleRows: artifact.rows.slice(0, 12),
+  };
 }
 
 function createLiveResult(

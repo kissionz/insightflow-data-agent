@@ -457,6 +457,7 @@ describe("DataAgentHarness", () => {
     ).ontologySearchTool(
       () => ({
         originalQuestion: "今年销售金额",
+        intentKind: "DIRECT_QUERY",
         metricTerms: ["实付金额"],
         timeTerms: ["今年"],
         objectTerms: [],
@@ -602,6 +603,287 @@ describe("DataAgentHarness", () => {
     await harness.close();
     repository.close();
   });
+
+  it("keeps concrete business values out of object terms", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-harness-"));
+    roots.push(root);
+    const repository = new Repository(
+      path.join(root, ".montane/data-agent/ontology.sqlite"),
+    );
+    const harness = new DataAgentHarness(
+      root,
+      repository,
+      async () => {
+        throw new Error("question framing must not query SelectDB");
+      },
+      () => runtimeFor(new ScriptedMontaneModel()),
+    );
+    let captured:
+      | {
+          intentKind: string;
+          objectTerms: string[];
+          businessValueTerms: string[];
+        }
+      | undefined;
+    const tool = (
+      harness as unknown as {
+        questionFrameTool(
+          question: string,
+          capture: (frame: {
+            intentKind: string;
+            objectTerms: string[];
+            businessValueTerms: string[];
+          }) => unknown,
+        ): Tool;
+      }
+    ).questionFrameTool(
+      "舒敏保湿特护霜今年销售表现",
+      (frame) => {
+        captured = frame;
+        return frame;
+      },
+    );
+
+    const outcome = await tool.execute({
+      original_question: "舒敏保湿特护霜今年销售表现",
+      intent_kind: "EXPLORATORY_ANALYSIS",
+      metric_terms: [],
+      time_terms: ["今年"],
+      object_terms: ["商品", "舒敏保湿特护霜"],
+      business_value_terms: ["舒敏保湿特护霜"],
+      grouping_terms: [],
+      calculation_terms: [],
+      presentation: { kind: "AUTO" },
+    });
+
+    expect(outcome.ok).toBe(true);
+    expect(captured).toMatchObject({
+      intentKind: "EXPLORATORY_ANALYSIS",
+      objectTerms: ["商品"],
+      businessValueTerms: ["舒敏保湿特护霜"],
+    });
+    await harness.close();
+    repository.close();
+  });
+
+  it("rejects value-index searches that were not declared as business values", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-harness-"));
+    roots.push(root);
+    const repository = new Repository(
+      path.join(root, ".montane/data-agent/ontology.sqlite"),
+    );
+    const harness = new DataAgentHarness(
+      root,
+      repository,
+      async () => {
+        throw new Error("undeclared value lookup must be rejected before SelectDB");
+      },
+      () => runtimeFor(new ScriptedMontaneModel()),
+    );
+    const tool = (
+      harness as unknown as {
+        propertyValueSearchTool(
+          bindings: Map<string, unknown>,
+          getFrame: () => {
+            businessValueTerms: string[];
+          },
+        ): Tool;
+      }
+    ).propertyValueSearchTool(
+      new Map(),
+      () => ({ businessValueTerms: ["舒敏保湿特护霜"] }),
+    );
+
+    const outcome = await tool.execute({
+      value: "毛利率",
+      match_mode: "exact",
+    });
+
+    expect(outcome.ok).toBe(false);
+    expect(outcome.content).toContain("只能检索问题框架");
+    expect(outcome.data).toMatchObject({
+      allowedBusinessValues: ["舒敏保湿特护霜"],
+    });
+    await harness.close();
+    repository.close();
+  });
+
+  it("keeps exploratory analysis rooted on a measurable fact object", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-harness-"));
+    roots.push(root);
+    const repository = new Repository(
+      path.join(root, ".montane/data-agent/ontology.sqlite"),
+    );
+    const ontology = structuredClone(testOntology);
+    const customer = ontology.objects.find((object) => object.id === "o_customer")!;
+    const amountProperty = ontology.objects
+      .find((object) => object.id === "o_order")!
+      .properties.find((property) => property.id === "p_order_amount")!;
+    customer.bindingPriority = 100;
+    customer.properties.push({
+      ...structuredClone(amountProperty),
+      id: "p_customer_value",
+      name: "customer_value",
+      label: "客户价值",
+      sourceColumn: "customer_value",
+    });
+    repository.saveOntology(ontology);
+    const harness = new DataAgentHarness(
+      root,
+      repository,
+      async () => {
+        throw new Error("analysis-space discovery must not query SelectDB");
+      },
+      () => runtimeFor(new ScriptedMontaneModel()),
+    );
+    const tool = (
+      harness as unknown as {
+        discoverAnalysisSpaceTool(
+          getFrame: () => unknown,
+          cache: Map<string, ToolOutcome>,
+        ): Tool;
+      }
+    ).discoverAnalysisSpaceTool(
+      () => ({
+        originalQuestion: "客户销售表现怎么样",
+        intentKind: "EXPLORATORY_ANALYSIS",
+        metricTerms: [],
+        timeTerms: [],
+        objectTerms: ["客户"],
+        businessValueTerms: [],
+        groupingTerms: [],
+        calculationTerms: [],
+        presentation: { kind: "AUTO" },
+      }),
+      new Map(),
+    );
+
+    const outcome = await tool.execute({
+      objective: "客户销售表现怎么样",
+      object_ids: ["o_customer", "o_order"],
+    });
+    const data = outcome.data as {
+      spaces: Array<{ object: { id: string } }>;
+    };
+
+    expect(outcome.ok).toBe(true);
+    expect(data.spaces).toHaveLength(1);
+    expect(data.spaces[0].object.id).toBe("o_order");
+    await harness.close();
+    repository.close();
+  });
+
+  it("lets Montane explore one published fact object through multiple governed IR queries", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-harness-"));
+    roots.push(root);
+    const repository = new Repository(
+      path.join(root, ".montane/data-agent/ontology.sqlite"),
+    );
+    const ontology = structuredClone(testOntology);
+    repository.saveOntology(ontology);
+    repository.upsertScannedTables([
+      {
+        id: "t_orders",
+        catalog: "internal",
+        database: "retail",
+        name: "fact_orders",
+        type: "TABLE",
+        status: "MODELED",
+        columns: [],
+        fingerprint: "fact_orders:exploration",
+        scannedAt: "2026-07-27T00:00:00.000Z",
+      },
+      {
+        id: "t_customers",
+        catalog: "internal",
+        database: "retail",
+        name: "dim_customers",
+        type: "TABLE",
+        status: "MODELED",
+        columns: [],
+        fingerprint: "dim_customers:exploration",
+        scannedAt: "2026-07-27T00:00:00.000Z",
+      },
+    ]);
+    repository.saveDataSource({
+      configured: true,
+      host: "selectdb.test",
+      port: 9030,
+      username: "reader",
+      database: "retail",
+      catalog: "internal",
+      tls: false,
+      passwordStored: true,
+    });
+    const conversation = createConversation();
+    repository.saveConversation(conversation);
+    const model = new ExploratoryMontaneModel();
+    const queries: string[] = [];
+    const rejectedPlanCodes: string[] = [];
+    const harness = new DataAgentHarness(
+      root,
+      repository,
+      async (sql) => {
+        queries.push(sql);
+        return queries.length === 1
+          ? {
+              columns: ["成交金额"],
+              rows: [{ 成交金额: 128000 }],
+              durationMs: 8,
+              truncated: false,
+            }
+          : {
+              columns: ["会员等级", "成交金额"],
+              rows: [
+                { 会员等级: "VIP", 成交金额: 88000 },
+                { 会员等级: "普通", 成交金额: 40000 },
+              ],
+              durationMs: 11,
+              truncated: false,
+            };
+      },
+      () => runtimeFor(model),
+    );
+
+    const output = await harness.run(
+      conversation,
+      {
+        id: "turn_exploration",
+        conversationId: conversation.id,
+        question: "订单销售表现怎么样",
+        status: "planning",
+        createdAt: new Date().toISOString(),
+        ontologyVersion: ontology.version,
+        trace: [],
+      },
+      {
+        onTextDelta() {},
+        onTextEnd() {},
+        onToolStatus(call, status, result) {
+          if (
+            call.id === "call_explore_duplicate" &&
+            status === "failed"
+          ) {
+            rejectedPlanCodes.push(
+              String(
+                (result?.data as { code?: string } | undefined)?.code ?? "",
+              ),
+            );
+          }
+        },
+      },
+    );
+
+    expect(model.seenTools).toContain("DiscoverAnalysisSpace");
+    expect(rejectedPlanCodes).toContain("DUPLICATE_ANALYSIS_PLAN");
+    expect(queries).toHaveLength(2);
+    expect(queries[1]).toContain("member_level");
+    expect(output.responseKind).toBe("analysis");
+    expect(output.result?.rows).toEqual([{ 成交金额: 128000 }]);
+    expect(output.answer).toContain("VIP");
+    await harness.close();
+    repository.close();
+  });
 });
 
 class ScriptedMontaneModel implements ModelClient {
@@ -654,6 +936,7 @@ class PlanningMontaneModel implements ModelClient {
           name: "SubmitQuestionFrame",
           args: {
             original_question: "今年线上渠道销售额",
+            intent_kind: "DIRECT_QUERY",
             metric_terms: ["销售额"],
             time_terms: ["今年"],
             object_terms: [],
@@ -749,6 +1032,7 @@ class MonthlyPlanningMontaneModel implements ModelClient {
           name: "SubmitQuestionFrame",
           args: {
             original_question: "今年销售额按月看",
+            intent_kind: "DIRECT_QUERY",
             metric_terms: ["销售额"],
             time_terms: ["今年"],
             object_terms: [],
@@ -793,6 +1077,146 @@ class MonthlyPlanningMontaneModel implements ModelClient {
       };
     }
     const finalText = "已按月返回今年销售额。";
+    options.onTextDelta?.(finalText);
+    return { finalText, stopReason: "end_turn" };
+  }
+}
+
+class ExploratoryMontaneModel implements ModelClient {
+  readonly capabilities = {
+    contextWindow: 64_000,
+    maxOutputTokens: 4_000,
+    supportsStreaming: true,
+    supportsToolUse: true,
+    supportsImages: false,
+  };
+  private step = 0;
+  seenTools: string[] = [];
+
+  async complete(options: {
+    messages: AgentMessage[];
+    tools: Array<Record<string, unknown>>;
+    onTextDelta?: (delta: string) => void;
+  }): Promise<AgentResponse> {
+    this.step += 1;
+    this.seenTools = options.tools.map((tool) => String(tool.name));
+    if (this.step === 1) {
+      return {
+        toolCalls: [{
+          id: "call_explore_frame",
+          name: "SubmitQuestionFrame",
+          args: {
+            original_question: "订单销售表现怎么样",
+            intent_kind: "EXPLORATORY_ANALYSIS",
+            metric_terms: [],
+            time_terms: [],
+            object_terms: ["订单"],
+            business_value_terms: [],
+            grouping_terms: [],
+            calculation_terms: [],
+            presentation: { kind: "AUTO" },
+          },
+        }],
+        stopReason: "tool_use",
+      };
+    }
+    if (this.step === 2) {
+      return {
+        toolCalls: [{
+          id: "call_explore_ontology",
+          name: "OntologySearch",
+          args: { query: "订单销售表现怎么样" },
+        }],
+        stopReason: "tool_use",
+      };
+    }
+    if (this.step === 3) {
+      return {
+        toolCalls: [{
+          id: "call_explore_space",
+          name: "DiscoverAnalysisSpace",
+          args: {
+            objective: "订单销售表现怎么样",
+            object_ids: ["o_order"],
+          },
+        }],
+        stopReason: "tool_use",
+      };
+    }
+    if (this.step === 4) {
+      return {
+        toolCalls: [{
+          id: "call_explore_overview",
+          name: "ExecuteAnalysisPlan",
+          args: {
+            root_object_id: "o_order",
+            measure_ids: ["m_gmv"],
+            dimension_property_ids: [],
+            filters: [],
+            result_kind: "aggregate",
+            title: "订单销售总览",
+            analysis_step: {
+              id: "step_overview",
+              objective: "确认整体成交金额",
+              rationale: "先取得核心销售指标，判断是否需要继续拆解",
+              role: "OVERVIEW",
+            },
+          },
+        }],
+        stopReason: "tool_use",
+      };
+    }
+    if (this.step === 5) {
+      return {
+        toolCalls: [{
+          id: "call_explore_diagnostic",
+          name: "ExecuteAnalysisPlan",
+          args: {
+            root_object_id: "o_order",
+            measure_ids: ["m_gmv"],
+            dimension_property_ids: ["p_customer_level"],
+            filters: [],
+            sort: [{ entity_id: "m_gmv", direction: "DESC" }],
+            limit: 10,
+            result_kind: "aggregate",
+            title: "会员等级贡献",
+            analysis_step: {
+              id: "step_customer_level",
+              objective: "定位不同会员等级的成交贡献",
+              rationale: "总览确认有真实成交额，继续验证客户结构贡献",
+              role: "DIAGNOSTIC",
+            },
+          },
+        }],
+        stopReason: "tool_use",
+      };
+    }
+    if (this.step === 6) {
+      return {
+        toolCalls: [{
+          id: "call_explore_duplicate",
+          name: "ExecuteAnalysisPlan",
+          args: {
+            root_object_id: "o_order",
+            measure_ids: ["m_gmv"],
+            dimension_property_ids: ["p_customer_level"],
+            filters: [],
+            sort: [{ entity_id: "m_gmv", direction: "DESC" }],
+            limit: 10,
+            result_kind: "aggregate",
+            title: "会员等级贡献",
+            analysis_step: {
+              id: "step_duplicate",
+              objective: "重复确认会员等级贡献",
+              rationale: "验证重复计划保护",
+              role: "DIAGNOSTIC",
+            },
+          },
+        }],
+        stopReason: "tool_use",
+      };
+    }
+    const finalText = "成交金额为 128,000 元，其中 VIP 客户贡献 88,000 元。";
     options.onTextDelta?.(finalText);
     return { finalText, stopReason: "end_turn" };
   }

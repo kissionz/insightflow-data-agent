@@ -64,6 +64,7 @@ export type TimeGrain = "DAY" | "WEEK" | "MONTH" | "QUARTER" | "YEAR";
 
 export interface QuestionLanguageFrame {
   originalQuestion: string;
+  intentKind: "DIRECT_QUERY" | "EXPLORATORY_ANALYSIS" | "DIAGNOSTIC_ANALYSIS";
   metricTerms: string[];
   timeTerms: string[];
   objectTerms: string[];
@@ -75,6 +76,44 @@ export interface QuestionLanguageFrame {
     limit?: number;
     sortDirection?: "ASC" | "DESC";
   };
+}
+
+export interface AnalysisRunStep {
+  id: string;
+  callId: string;
+  sequence: number;
+  title: string;
+  objective: string;
+  rationale?: string;
+  role: "OVERVIEW" | "DIAGNOSTIC" | "SUPPORTING";
+  status: "running" | "completed" | "failed";
+  summary: string;
+  ir?: QueryIR;
+  sql?: string;
+  parameters?: unknown[];
+  columns?: string[];
+  rows?: Array<Record<string, string | number>>;
+  rowCount?: number;
+  truncated?: boolean;
+  error?: string;
+  startedAt: string;
+  completedAt?: string;
+}
+
+export interface AnalysisRun {
+  mode: "EXPLORATORY_ANALYSIS" | "DIAGNOSTIC_ANALYSIS";
+  objective: string;
+  status: "planning" | "running" | "completed" | "failed";
+  maxSteps: number;
+  rootObjectId?: string;
+  rootObjectLabel?: string;
+  availableMetrics: Array<{ id: string; label: string }>;
+  availableDimensions: Array<{
+    id: string;
+    label: string;
+    objectLabel: string;
+  }>;
+  steps: AnalysisRunStep[];
 }
 
 export interface DirectAnalysisFilter {
@@ -285,6 +324,7 @@ export interface Turn {
   ontologyVersion: number;
   promptVersion?: number;
   trace: TraceStep[];
+  analysisRun?: AnalysisRun;
   responseKind?: "analysis" | "conversation" | "configuration_required" | "clarification";
   result?: ResultArtifact;
 }

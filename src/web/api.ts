@@ -92,6 +92,21 @@ export const api = {
       method: "PUT",
       body: JSON.stringify({ object, metrics, relations }),
     }),
+  saveOntologyMetric: (metric: Metric) =>
+    request<{
+      ontology: OntologySnapshot;
+      validation: OntologyValidationResult;
+    }>(`/api/ontology/draft/metrics/${metric.id}`, {
+      method: "PUT",
+      body: JSON.stringify({ metric }),
+    }),
+  deleteOntologyMetric: (metricId: string) =>
+    request<{
+      ontology: OntologySnapshot;
+      validation: OntologyValidationResult;
+    }>(`/api/ontology/draft/metrics/${metricId}`, {
+      method: "DELETE",
+    }),
   deleteOntologyObject: (objectId: string) =>
     request<{
       ontology: OntologySnapshot;

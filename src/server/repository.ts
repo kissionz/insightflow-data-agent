@@ -826,6 +826,7 @@ function normalizeOntology(input: OntologySnapshot): OntologySnapshot {
     })),
     metrics: snapshot.metrics.map((metric) => ({
       ...metric,
+      metricType: metric.metricType ?? "BASE",
       definitionMode: metric.definitionMode ?? "SQL",
     })),
   };

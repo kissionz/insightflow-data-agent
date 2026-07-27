@@ -841,19 +841,32 @@ function OntologyPage({
   const [validation, setValidation] = useState<OntologyValidationResult | null>(null);
   const [pendingDeleteId, setPendingDeleteId] = useState("");
   const [deletingId, setDeletingId] = useState("");
+  const [catalogMode, setCatalogMode] = useState<"objects" | "metrics">("objects");
   const working = ontologyDraft ?? ontology;
   const [focusedId, setFocusedId] = useState(working.objects[0]?.id ?? "");
+  const [focusedMetricId, setFocusedMetricId] = useState(
+    working.metrics[0]?.id ?? "",
+  );
   const available = tables.filter((table) => table.status === "UNMODELED");
   const drafting = Boolean(ontologyDraft);
   const focusedObject =
     working.objects.find((object) => object.id === focusedId) ??
     working.objects[0] ??
     null;
+  const focusedMetric =
+    working.metrics.find((metric) => metric.id === focusedMetricId) ??
+    working.metrics[0] ??
+    null;
   useEffect(() => {
     if (!focusedObject && working.objects[0]) {
       setFocusedId(working.objects[0].id);
     }
   }, [focusedObject, working.objects]);
+  useEffect(() => {
+    if (!focusedMetric && working.metrics[0]) {
+      setFocusedMetricId(working.metrics[0].id);
+    }
+  }, [focusedMetric, working.metrics]);
   async function draft() {
     try {
       const result = await api.createDrafts(selected);
@@ -948,6 +961,65 @@ function OntologyPage({
       setDeletingId("");
     }
   }
+  async function addCatalogMetric(metricType: "BASE" | "DERIVED") {
+    const object = working.objects[0];
+    if (!object) {
+      onError("请先创建业务对象");
+      return;
+    }
+    const sameObjectMetrics = working.metrics.filter(
+      (metric) => metric.objectId === object.id,
+    );
+    if (metricType === "DERIVED" && sameObjectMetrics.length < 2) {
+      onError("复合指标至少需要两个来自同一事实对象的基础或复合指标");
+      return;
+    }
+    const sourceProperty = object.properties.find(
+      (property) =>
+        property.visibility === "ANALYTICAL" &&
+        property.meaning === "NUMBER" &&
+        property.numericSpec?.defaultAggregation !== "NONE",
+    );
+    const defaultAggregation =
+      sourceProperty?.numericSpec?.defaultAggregation ?? "COUNT";
+    const metric: Metric = {
+      id: createClientId("metric"),
+      metricType,
+      objectId: object.id,
+      name: `metric_${working.metrics.length + 1}`,
+      label: metricType === "DERIVED" ? "新复合指标" : "新基础指标",
+      description: "",
+      expression: "",
+      definitionMode: "VISUAL",
+      sourcePropertyId:
+        metricType === "BASE" ? sourceProperty?.id : undefined,
+      timePropertyId: object.defaultTimePropertyId,
+      leftMetricId:
+        metricType === "DERIVED" ? sameObjectMetrics[0]?.id : undefined,
+      rightMetricId:
+        metricType === "DERIVED" ? sameObjectMetrics[1]?.id : undefined,
+      calculationOperator: metricType === "DERIVED" ? "SUBTRACT" : undefined,
+      aggregation:
+        metricType === "DERIVED"
+          ? "CUSTOM"
+          : defaultAggregation === "NONE"
+            ? "COUNT"
+            : defaultAggregation,
+      format: "number",
+      synonyms: [],
+      status: "DRAFT",
+    };
+    try {
+      const result = await api.saveOntologyMetric(metric);
+      onState((previous) =>
+        previous ? { ...previous, ontologyDraft: result.ontology } : previous,
+      );
+      setValidation(result.validation);
+      setFocusedMetricId(metric.id);
+    } catch (reason) {
+      onError(asMessage(reason));
+    }
+  }
   return (
     <div className="management-content ontology-management-content">
       <div className="stats-row">
@@ -961,13 +1033,27 @@ function OntologyPage({
           <div className="panel-heading">
             <div>
               <span className="section-kicker">业务语义</span>
-              <h2>对象目录</h2>
+              <h2>{catalogMode === "objects" ? "对象目录" : "指标中心"}</h2>
             </div>
             <span className={`status-pill ${drafting ? "warning" : "success"}`}>
               {drafting ? "草稿待发布" : "已发布"}
             </span>
           </div>
-          {working.objects.length ? (
+          <div className="catalog-switch" role="tablist" aria-label="本体目录">
+            <button
+              className={catalogMode === "objects" ? "active" : ""}
+              onClick={() => setCatalogMode("objects")}
+            >
+              <CirclesFour size={15} /> 对象
+            </button>
+            <button
+              className={catalogMode === "metrics" ? "active" : ""}
+              onClick={() => setCatalogMode("metrics")}
+            >
+              <ChartBar size={15} /> 指标
+            </button>
+          </div>
+          {catalogMode === "objects" ? (working.objects.length ? (
             working.objects.map((object) => (
               <div
                 className={`ontology-object-row ${drafting ? "editable" : ""} ${
@@ -1028,21 +1114,86 @@ function OntologyPage({
               <strong>还没有本体对象</strong>
               <p>先到数据管理扫描 Schema，再勾选待建模表生成草稿。</p>
             </div>
+          )) : (
+            <>
+              {drafting && (
+                <div className="metric-catalog-actions">
+                  <button
+                    className="subtle-button"
+                    onClick={() => void addCatalogMetric("BASE")}
+                  >
+                    <Plus size={14} /> 基础指标
+                  </button>
+                  <button
+                    className="subtle-button"
+                    onClick={() => void addCatalogMetric("DERIVED")}
+                  >
+                    <Plus size={14} /> 复合指标
+                  </button>
+                </div>
+              )}
+              {working.metrics.length ? (
+                working.metrics.map((metric) => (
+                  <button
+                    key={metric.id}
+                    className={`ontology-object ${
+                      focusedMetric?.id === metric.id ? "selected" : ""
+                    }`}
+                    onClick={() => setFocusedMetricId(metric.id)}
+                  >
+                    <span className="object-icon">
+                      <ChartBar size={18} />
+                    </span>
+                    <span>
+                      <strong>{metric.label}</strong>
+                      <small>
+                        {metric.metricType === "DERIVED" ? "复合指标" : "基础指标"}
+                        {" · "}
+                        {working.objects.find(
+                          (object) => object.id === metric.objectId,
+                        )?.label ?? "未知对象"}
+                      </small>
+                    </span>
+                    <CaretRight size={16} />
+                  </button>
+                ))
+              ) : (
+                <div className="ontology-empty">
+                  <ChartBar size={24} />
+                  <strong>还没有业务指标</strong>
+                  <p>进入草稿编辑后新增基础指标或复合指标。</p>
+                </div>
+              )}
+            </>
           )}
         </section>
         <section className="panel object-inspector">
           <div className="panel-heading">
             <div>
-              <span className="section-kicker">对象定义</span>
-              <h2>{focusedObject?.label || "对象详情"}</h2>
+              <span className="section-kicker">
+                {catalogMode === "objects" ? "对象定义" : "指标定义"}
+              </span>
+              <h2>
+                {catalogMode === "objects"
+                  ? focusedObject?.label || "对象详情"
+                  : focusedMetric?.label || "指标详情"}
+              </h2>
             </div>
-            {focusedObject && (
-              <span className={`status-pill ${focusedObject.status === "DRAFT" ? "warning" : "success"}`}>
-                {ontologyStatusLabel(focusedObject.status)}
+            {(catalogMode === "objects" ? focusedObject : focusedMetric) && (
+              <span className={`status-pill ${
+                (catalogMode === "objects" ? focusedObject?.status : focusedMetric?.status) === "DRAFT"
+                  ? "warning"
+                  : "success"
+              }`}>
+                {ontologyStatusLabel(
+                  (catalogMode === "objects"
+                    ? focusedObject?.status
+                    : focusedMetric?.status) ?? "PUBLISHED",
+                )}
               </span>
             )}
           </div>
-          {focusedObject ? (
+          {catalogMode === "objects" ? (focusedObject ? (
             <OntologyObjectInspector
               key={`${working.version}-${working.objects.length}-${working.metrics.length}-${working.relations.length}-${focusedObject.id}`}
               object={focusedObject}
@@ -1063,6 +1214,33 @@ function OntologyPage({
               <Database size={28} />
               <strong>等待 Schema 建模</strong>
               <p>对象生成后可在这里检查来源表、属性、指标和关系。</p>
+            </div>
+          )) : focusedMetric ? (
+            <MetricCatalogInspector
+              key={`${working.version}-${focusedMetric.id}-${focusedMetric.expression}`}
+              metric={focusedMetric}
+              ontology={working}
+              editable={drafting}
+              onSaved={(updated, result) => {
+                onState((previous) =>
+                  previous ? { ...previous, ontologyDraft: updated } : previous,
+                );
+                setValidation(result);
+              }}
+              onDeleted={(updated, result) => {
+                onState((previous) =>
+                  previous ? { ...previous, ontologyDraft: updated } : previous,
+                );
+                setValidation(result);
+                setFocusedMetricId(updated.metrics[0]?.id ?? "");
+              }}
+              onError={onError}
+            />
+          ) : (
+            <div className="inspector-empty">
+              <ChartBar size={28} />
+              <strong>等待指标定义</strong>
+              <p>基础指标引用对象属性，复合指标引用同一事实对象的其他指标。</p>
             </div>
           )}
         </section>
@@ -1143,6 +1321,417 @@ function OntologyPage({
             </div>
           )}
         </section>
+      </div>
+    </div>
+  );
+}
+
+function MetricCatalogInspector({
+  metric,
+  ontology,
+  editable,
+  onSaved,
+  onDeleted,
+  onError,
+}: {
+  metric: Metric;
+  ontology: OntologySnapshot;
+  editable: boolean;
+  onSaved: (
+    ontology: OntologySnapshot,
+    validation: OntologyValidationResult,
+  ) => void;
+  onDeleted: (
+    ontology: OntologySnapshot,
+    validation: OntologyValidationResult,
+  ) => void;
+  onError: (message: string) => void;
+}) {
+  const [draftMetric, setDraftMetric] = useState(() => structuredClone(metric));
+  const [saving, setSaving] = useState(false);
+  const sourceObject = ontology.objects.find(
+    (object) => object.id === draftMetric.objectId,
+  );
+  const dependencyCandidates = ontology.metrics.filter(
+    (candidate) =>
+      candidate.id !== draftMetric.id &&
+      candidate.objectId === draftMetric.objectId &&
+      !metricDependsOn(candidate.id, draftMetric.id, ontology.metrics),
+  );
+  const sourceProperties =
+    sourceObject?.properties.filter(
+      (property) =>
+        property.visibility === "ANALYTICAL" &&
+        property.meaning === "NUMBER",
+    ) ?? [];
+  const formula = metricFormulaDisplay(draftMetric, ontology.metrics);
+  function change(patch: Partial<Metric>) {
+    setDraftMetric((current) => ({ ...current, ...patch }));
+  }
+  async function save() {
+    if (
+      draftMetric.metricType === "DERIVED" &&
+      draftMetric.leftMetricId === draftMetric.rightMetricId
+    ) {
+      onError("复合指标的左右指标不能相同");
+      return;
+    }
+    setSaving(true);
+    try {
+      const next: Metric = {
+        ...draftMetric,
+        metricType: draftMetric.metricType ?? "BASE",
+        aggregation:
+          draftMetric.metricType === "DERIVED"
+            ? "CUSTOM"
+            : draftMetric.aggregation,
+        sourcePropertyId:
+          draftMetric.metricType === "DERIVED"
+            ? undefined
+            : draftMetric.sourcePropertyId,
+        expression:
+          draftMetric.metricType === "DERIVED"
+            ? formula
+            : draftMetric.definitionMode === "VISUAL" && sourceObject
+              ? visualMetricExpression(draftMetric, sourceObject)
+              : draftMetric.expression,
+      };
+      const result = await api.saveOntologyMetric(next);
+      setDraftMetric(next);
+      onSaved(result.ontology, result.validation);
+    } catch (reason) {
+      onError(asMessage(reason));
+    } finally {
+      setSaving(false);
+    }
+  }
+  async function remove() {
+    setSaving(true);
+    try {
+      const result = await api.deleteOntologyMetric(draftMetric.id);
+      onDeleted(result.ontology, result.validation);
+    } catch (reason) {
+      onError(asMessage(reason));
+    } finally {
+      setSaving(false);
+    }
+  }
+  if (!editable) {
+    return (
+      <div className="object-detail metric-detail">
+        <div className="object-summary">
+          <div>
+            <span>指标类型</span>
+            <strong>
+              {draftMetric.metricType === "DERIVED" ? "复合指标" : "基础指标"}
+            </strong>
+          </div>
+          <div>
+            <span>分析对象</span>
+            <strong>{sourceObject?.label ?? "未知对象"}</strong>
+          </div>
+          <div>
+            <span>展示格式</span>
+            <strong>{draftMetric.format}</strong>
+          </div>
+          <div>
+            <span>时间口径</span>
+            <strong>
+              {sourceObject?.properties.find(
+                (property) => property.id === draftMetric.timePropertyId,
+              )?.label ?? "对象默认"}
+            </strong>
+          </div>
+        </div>
+        <div className="metric-formula-card">
+          <span>治理公式</span>
+          <strong>{formula || draftMetric.expression || "尚未定义"}</strong>
+        </div>
+        <p className="object-description">
+          {draftMetric.description || "暂无业务描述"}
+        </p>
+      </div>
+    );
+  }
+  return (
+    <div className="ontology-editor metric-catalog-editor">
+      <div className="editor-toolbar">
+        <div>
+          <strong>独立指标定义</strong>
+          <small>基础指标保留来源对象；复合指标只能引用同一事实对象。</small>
+        </div>
+        <div className="editor-actions">
+          <button
+            className="subtle-button danger-text"
+            onClick={() => void remove()}
+            disabled={saving}
+          >
+            <Trash size={15} /> 删除
+          </button>
+          <button
+            className="primary-button"
+            onClick={() => void save()}
+            disabled={saving}
+          >
+            <FloppyDisk size={16} /> {saving ? "保存中" : "保存指标"}
+          </button>
+        </div>
+      </div>
+      <div className="editor-section">
+        <div className="form-grid ontology-form-grid">
+          <EditorField label="指标名称">
+            <input
+              value={draftMetric.label}
+              onChange={(event) => change({ label: event.target.value })}
+            />
+          </EditorField>
+          <EditorField label="指标标识">
+            <input
+              value={draftMetric.name}
+              onChange={(event) => change({ name: event.target.value })}
+            />
+          </EditorField>
+          <EditorField label="指标类型">
+            <select
+              value={draftMetric.metricType ?? "BASE"}
+              onChange={(event) => {
+                const metricType = event.target.value as "BASE" | "DERIVED";
+                const candidates = ontology.metrics.filter(
+                  (candidate) =>
+                    candidate.id !== draftMetric.id &&
+                    candidate.objectId === draftMetric.objectId,
+                );
+                change({
+                  metricType,
+                  aggregation:
+                    metricType === "DERIVED" ? "CUSTOM" : "SUM",
+                  leftMetricId:
+                    metricType === "DERIVED" ? candidates[0]?.id : undefined,
+                  rightMetricId:
+                    metricType === "DERIVED" ? candidates[1]?.id : undefined,
+                  calculationOperator:
+                    metricType === "DERIVED" ? "SUBTRACT" : undefined,
+                  scale: metricType === "DERIVED" ? 1 : undefined,
+                });
+              }}
+            >
+              <option value="BASE">基础指标</option>
+              <option value="DERIVED">复合指标</option>
+            </select>
+          </EditorField>
+          <EditorField label="事实对象">
+            <select
+              value={draftMetric.objectId}
+              onChange={(event) => {
+                const objectId = event.target.value;
+                const nextObject = ontology.objects.find(
+                  (object) => object.id === objectId,
+                );
+                const candidates = ontology.metrics.filter(
+                  (candidate) =>
+                    candidate.id !== draftMetric.id &&
+                    candidate.objectId === objectId,
+                );
+                change({
+                  objectId,
+                  sourcePropertyId:
+                    nextObject?.properties.find(
+                      (property) =>
+                        property.visibility === "ANALYTICAL" &&
+                        property.meaning === "NUMBER",
+                    )?.id,
+                  timePropertyId: nextObject?.defaultTimePropertyId,
+                  leftMetricId:
+                    draftMetric.metricType === "DERIVED"
+                      ? candidates[0]?.id
+                      : undefined,
+                  rightMetricId:
+                    draftMetric.metricType === "DERIVED"
+                      ? candidates[1]?.id
+                      : undefined,
+                });
+              }}
+            >
+              {ontology.objects.map((object) => (
+                <option key={object.id} value={object.id}>
+                  {object.label}
+                </option>
+              ))}
+            </select>
+          </EditorField>
+          {draftMetric.metricType === "DERIVED" ? (
+            <>
+              <EditorField label="左侧指标">
+                <select
+                  value={draftMetric.leftMetricId ?? ""}
+                  onChange={(event) =>
+                    change({ leftMetricId: event.target.value || undefined })
+                  }
+                >
+                  <option value="">请选择指标</option>
+                  {dependencyCandidates.map((candidate) => (
+                    <option key={candidate.id} value={candidate.id}>
+                      {candidate.label}
+                    </option>
+                  ))}
+                </select>
+              </EditorField>
+              <EditorField label="运算方式">
+                <select
+                  value={draftMetric.calculationOperator ?? "SUBTRACT"}
+                  onChange={(event) => {
+                    const calculationOperator = event.target
+                      .value as NonNullable<Metric["calculationOperator"]>;
+                    change({
+                      calculationOperator,
+                      format:
+                        calculationOperator === "RATIO"
+                          ? "percent"
+                          : draftMetric.format,
+                      scale:
+                        calculationOperator === "RATIO"
+                          ? 100
+                          : draftMetric.scale ?? 1,
+                    });
+                  }}
+                >
+                  <option value="ADD">相加</option>
+                  <option value="SUBTRACT">相减</option>
+                  <option value="MULTIPLY">相乘</option>
+                  <option value="DIVIDE">相除</option>
+                  <option value="RATIO">比率</option>
+                </select>
+              </EditorField>
+              <EditorField label="右侧指标">
+                <select
+                  value={draftMetric.rightMetricId ?? ""}
+                  onChange={(event) =>
+                    change({ rightMetricId: event.target.value || undefined })
+                  }
+                >
+                  <option value="">请选择指标</option>
+                  {dependencyCandidates.map((candidate) => (
+                    <option key={candidate.id} value={candidate.id}>
+                      {candidate.label}
+                    </option>
+                  ))}
+                </select>
+              </EditorField>
+              <EditorField label="缩放系数">
+                <input
+                  type="number"
+                  min="0.000001"
+                  value={draftMetric.scale ?? 1}
+                  onChange={(event) =>
+                    change({ scale: Number(event.target.value) || 1 })
+                  }
+                />
+              </EditorField>
+              <EditorField label="公式预览" wide>
+                <code className="expression-preview">
+                  {formula || "等待选择依赖指标"}
+                </code>
+              </EditorField>
+            </>
+          ) : (
+            <>
+              <EditorField label="定义方式">
+                <select
+                  value={draftMetric.definitionMode}
+                  onChange={(event) =>
+                    change({
+                      definitionMode: event.target
+                        .value as Metric["definitionMode"],
+                      aggregation:
+                        event.target.value === "SQL"
+                          ? "CUSTOM"
+                          : draftMetric.aggregation === "CUSTOM"
+                            ? "SUM"
+                            : draftMetric.aggregation,
+                    })
+                  }
+                >
+                  <option value="VISUAL">可视化配置</option>
+                  <option value="SQL">高级 SQL 表达式</option>
+                </select>
+              </EditorField>
+              {draftMetric.definitionMode === "VISUAL" ? (
+                <>
+                  <EditorField label="聚合方式">
+                    <select
+                      value={draftMetric.aggregation}
+                      onChange={(event) =>
+                        change({
+                          aggregation: event.target
+                            .value as Metric["aggregation"],
+                        })
+                      }
+                    >
+                      {["SUM", "COUNT", "COUNT_DISTINCT", "AVG", "MIN", "MAX"].map(
+                        (aggregation) => (
+                          <option key={aggregation}>{aggregation}</option>
+                        ),
+                      )}
+                    </select>
+                  </EditorField>
+                  <EditorField label="计算属性">
+                    <select
+                      value={draftMetric.sourcePropertyId ?? ""}
+                      disabled={draftMetric.aggregation === "COUNT"}
+                      onChange={(event) =>
+                        change({
+                          sourcePropertyId: event.target.value || undefined,
+                        })
+                      }
+                    >
+                      <option value="">请选择数字属性</option>
+                      {sourceProperties.map((property) => (
+                        <option key={property.id} value={property.id}>
+                          {property.label}
+                        </option>
+                      ))}
+                    </select>
+                  </EditorField>
+                </>
+              ) : (
+                <EditorField label="SQL 表达式" wide>
+                  <textarea
+                    rows={4}
+                    value={draftMetric.expression}
+                    onChange={(event) => change({ expression: event.target.value })}
+                  />
+                </EditorField>
+              )}
+            </>
+          )}
+          <EditorField label="展示格式">
+            <select
+              value={draftMetric.format}
+              onChange={(event) =>
+                change({ format: event.target.value as Metric["format"] })
+              }
+            >
+              <option value="number">数字</option>
+              <option value="currency">金额</option>
+              <option value="percent">百分比</option>
+            </select>
+          </EditorField>
+          <EditorField label="业务描述" wide>
+            <textarea
+              rows={3}
+              value={draftMetric.description}
+              onChange={(event) => change({ description: event.target.value })}
+            />
+          </EditorField>
+          <EditorField label="同义词" wide>
+            <input
+              value={draftMetric.synonyms.join("、")}
+              onChange={(event) =>
+                change({ synonyms: splitTerms(event.target.value) })
+              }
+            />
+          </EditorField>
+        </div>
       </div>
     </div>
   );
@@ -1634,7 +2223,6 @@ function OntologyObjectEditor({
   const tabs: Array<{ id: OntologyEditorTab; label: string; count?: number }> = [
     { id: "basic", label: "基本信息" },
     { id: "properties", label: "属性", count: draftObject.properties.length },
-    { id: "metrics", label: "指标", count: draftMetrics.length },
     { id: "relations", label: "关系", count: draftRelations.length },
     { id: "rules", label: "规则" },
   ];
@@ -3335,6 +3923,62 @@ function propertyVisibilityLabel(
     DETAIL_ONLY: "仅明细展示",
     HIDDEN: "完全隐藏",
   }[visibility];
+}
+
+function metricDependsOn(
+  metricId: string,
+  dependencyId: string,
+  metrics: Metric[],
+  visited = new Set<string>(),
+): boolean {
+  if (metricId === dependencyId) return true;
+  if (visited.has(metricId)) return false;
+  visited.add(metricId);
+  const metric = metrics.find((candidate) => candidate.id === metricId);
+  if (!metric || metric.metricType !== "DERIVED") return false;
+  return [metric.leftMetricId, metric.rightMetricId].some(
+    (id) =>
+      Boolean(id) &&
+      (id === dependencyId ||
+        metricDependsOn(id!, dependencyId, metrics, visited)),
+  );
+}
+
+function metricFormulaDisplay(
+  metric: Metric,
+  metrics: Metric[],
+  resolving = new Set<string>(),
+): string {
+  if (metric.metricType !== "DERIVED") {
+    return metric.expression || metric.label;
+  }
+  if (resolving.has(metric.id)) return "循环依赖";
+  const next = new Set(resolving).add(metric.id);
+  const left = metrics.find(
+    (candidate) => candidate.id === metric.leftMetricId,
+  );
+  const right = metrics.find(
+    (candidate) => candidate.id === metric.rightMetricId,
+  );
+  if (!left || !right || !metric.calculationOperator) return "";
+  const operator = {
+    ADD: "+",
+    SUBTRACT: "-",
+    MULTIPLY: "×",
+    DIVIDE: "÷",
+    RATIO: "÷",
+  }[metric.calculationOperator];
+  const leftExpression =
+    left.metricType === "DERIVED"
+      ? metricFormulaDisplay(left, metrics, next)
+      : left.label;
+  const rightExpression =
+    right.metricType === "DERIVED"
+      ? metricFormulaDisplay(right, metrics, next)
+      : right.label;
+  const scale =
+    metric.scale && metric.scale !== 1 ? ` × ${metric.scale}` : "";
+  return `( ${leftExpression} ${operator} ${rightExpression} )${scale}`;
 }
 
 function objectTypeLabel(type: OntologyObject["objectType"]): string {

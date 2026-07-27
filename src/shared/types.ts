@@ -441,6 +441,7 @@ export interface OntologyRelation {
 
 export interface Metric {
   id: string;
+  metricType?: "BASE" | "DERIVED";
   name: string;
   label: string;
   description: string;
@@ -450,6 +451,10 @@ export interface Metric {
   sourcePropertyId?: string;
   filterExpression?: string;
   timePropertyId?: string;
+  leftMetricId?: string;
+  rightMetricId?: string;
+  calculationOperator?: "ADD" | "SUBTRACT" | "MULTIPLY" | "DIVIDE" | "RATIO";
+  scale?: number;
   aggregation:
     | "SUM"
     | "COUNT"

@@ -3,7 +3,9 @@ import {
   createDraftFromPublished,
   metricExpression,
   publishDraft,
+  removeMetricFromDraft,
   removeObjectFromDraft,
+  upsertMetricInDraft,
   validateOntology,
 } from "../src/server/ontology.js";
 import { testOntology } from "./fixtures.js";
@@ -198,6 +200,84 @@ describe("ontology lifecycle", () => {
       result.issues.some(
         (issue) => issue.code === "NUMBER_DEFAULT_SUM_NOT_ALLOWED",
       ),
+    ).toBe(true);
+  });
+
+  it("stores independent composite metrics and protects their dependencies", () => {
+    let draft = createDraftFromPublished(testOntology);
+    const costMetric = {
+      ...draft.metrics[0]!,
+      id: "m_cost",
+      metricType: "BASE" as const,
+      name: "cost",
+      label: "成本额",
+    };
+    draft = upsertMetricInDraft(draft, costMetric);
+    draft = upsertMetricInDraft(draft, {
+      ...draft.metrics[0]!,
+      id: "m_gross_margin",
+      metricType: "DERIVED",
+      name: "gross_margin",
+      label: "毛利率",
+      expression: "(成交金额 - 成本额) / 成交金额",
+      aggregation: "CUSTOM",
+      sourcePropertyId: undefined,
+      leftMetricId: "m_gmv",
+      rightMetricId: "m_cost",
+      calculationOperator: "SUBTRACT",
+    });
+
+    expect(draft.metrics).toHaveLength(3);
+    expect(() => removeMetricFromDraft(draft, "m_cost")).toThrow(
+      "正被 毛利率 引用",
+    );
+  });
+
+  it("detects cycles in composite metrics", () => {
+    const draft = createDraftFromPublished(testOntology);
+    draft.metrics.push(
+      {
+        ...draft.metrics[0]!,
+        id: "m_a",
+        metricType: "DERIVED",
+        name: "metric_a",
+        label: "指标A",
+        aggregation: "CUSTOM",
+        sourcePropertyId: undefined,
+        leftMetricId: "m_b",
+        rightMetricId: "m_gmv",
+        calculationOperator: "ADD",
+      },
+      {
+        ...draft.metrics[0]!,
+        id: "m_b",
+        metricType: "DERIVED",
+        name: "metric_b",
+        label: "指标B",
+        aggregation: "CUSTOM",
+        sourcePropertyId: undefined,
+        leftMetricId: "m_a",
+        rightMetricId: "m_gmv",
+        calculationOperator: "SUBTRACT",
+      },
+    );
+    const result = validateOntology(
+      draft,
+      draft.objects.map((object) => ({
+        id: object.sourceTableId,
+        catalog: "internal",
+        database: "retail",
+        name: object.name,
+        type: "TABLE",
+        status: "MODELED",
+        columns: [],
+        fingerprint: "v1",
+        scannedAt: new Date().toISOString(),
+      })),
+    );
+
+    expect(
+      result.issues.some((issue) => issue.code === "DERIVED_METRIC_CYCLE"),
     ).toBe(true);
   });
 });

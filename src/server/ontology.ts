@@ -86,15 +86,22 @@ const objectSchema = z.object({
 
 const metricSchema = z.object({
   id: z.string().min(1),
+  metricType: z.enum(["BASE", "DERIVED"]).optional(),
   name: z.string().trim().min(1).max(120),
   label: z.string().trim().min(1).max(120),
   description: z.string().max(4_000),
   objectId: z.string().min(1),
-  expression: z.string().trim().min(1).max(8_000),
+  expression: z.string().max(8_000),
   definitionMode: z.enum(["VISUAL", "SQL"]),
   sourcePropertyId: z.string().min(1).optional(),
   filterExpression: z.string().max(4_000).optional(),
   timePropertyId: z.string().min(1).optional(),
+  leftMetricId: z.string().min(1).optional(),
+  rightMetricId: z.string().min(1).optional(),
+  calculationOperator: z
+    .enum(["ADD", "SUBTRACT", "MULTIPLY", "DIVIDE", "RATIO"])
+    .optional(),
+  scale: z.number().positive().max(1_000_000).optional(),
   aggregation: z.enum([
     "SUM",
     "COUNT",
@@ -108,6 +115,10 @@ const metricSchema = z.object({
   unit: z.string().max(50).optional(),
   synonyms: z.array(z.string().trim().min(1).max(120)).max(50),
   status: entityStatusSchema,
+});
+
+export const metricEditSchema = z.object({
+  metric: metricSchema,
 });
 
 const relationSchema = z.object({
@@ -271,9 +282,6 @@ export function applyObjectEdit(
   ) {
     throw new Error("属性必须保持与已扫描 Schema 的物理字段一致");
   }
-  if (input.metrics.some((metric) => metric.objectId !== objectId)) {
-    throw new Error("指标必须归属于当前对象");
-  }
   if (
     input.relations.some(
       (relation) =>
@@ -299,10 +307,7 @@ export function applyObjectEdit(
           }
         : object,
     ),
-    metrics: [
-      ...draft.metrics.filter((metric) => metric.objectId !== objectId),
-      ...input.metrics.map((metric) => ({ ...metric, status: "DRAFT" as const })),
-    ],
+    metrics: draft.metrics,
     relations: [
       ...otherRelations,
       ...deduplicateById(
@@ -318,6 +323,51 @@ export function applyObjectEdit(
         })),
       ),
     ],
+  };
+}
+
+export function upsertMetricInDraft(
+  draft: OntologySnapshot,
+  metric: Metric,
+): OntologySnapshot {
+  if (!draft.objects.some((object) => object.id === metric.objectId)) {
+    throw new Error("指标的分析对象不存在");
+  }
+  const normalized = {
+    ...metric,
+    metricType: metric.metricType ?? "BASE",
+    status: "DRAFT" as const,
+  };
+  return {
+    ...draft,
+    metrics: draft.metrics.some((candidate) => candidate.id === metric.id)
+      ? draft.metrics.map((candidate) =>
+          candidate.id === metric.id ? normalized : candidate,
+        )
+      : [...draft.metrics, normalized],
+  };
+}
+
+export function removeMetricFromDraft(
+  draft: OntologySnapshot,
+  metricId: string,
+): OntologySnapshot {
+  const metric = draft.metrics.find((candidate) => candidate.id === metricId);
+  if (!metric) throw new Error("指标不存在");
+  const dependents = draft.metrics.filter(
+    (candidate) =>
+      candidate.metricType === "DERIVED" &&
+      (candidate.leftMetricId === metricId ||
+        candidate.rightMetricId === metricId),
+  );
+  if (dependents.length) {
+    throw new Error(
+      `指标 ${metric.label} 正被 ${dependents.map((candidate) => candidate.label).join("、")} 引用，不能删除`,
+    );
+  }
+  return {
+    ...draft,
+    metrics: draft.metrics.filter((candidate) => candidate.id !== metricId),
   };
 }
 
@@ -575,6 +625,67 @@ export function validateOntology(
       issues.push(error("METRIC_OBJECT_MISSING", "指标所属对象不存在", undefined, metric.id));
       continue;
     }
+    if (metric.metricType === "DERIVED") {
+      const left = snapshot.metrics.find(
+        (candidate) => candidate.id === metric.leftMetricId,
+      );
+      const right = snapshot.metrics.find(
+        (candidate) => candidate.id === metric.rightMetricId,
+      );
+      if (!metric.leftMetricId || !metric.rightMetricId || !metric.calculationOperator) {
+        issues.push(
+          error(
+            "DERIVED_METRIC_DEFINITION_REQUIRED",
+            `复合指标 ${metric.label} 缺少左右指标或运算方式`,
+            object.id,
+            metric.id,
+          ),
+        );
+        continue;
+      }
+      if (metric.leftMetricId === metric.rightMetricId) {
+        issues.push(
+          error(
+            "DERIVED_METRIC_DUPLICATE_OPERAND",
+            `复合指标 ${metric.label} 的左右指标不能相同`,
+            object.id,
+            metric.id,
+          ),
+        );
+      }
+      if (!left || !right) {
+        issues.push(
+          error(
+            "DERIVED_METRIC_REFERENCE_MISSING",
+            `复合指标 ${metric.label} 引用了不存在的指标`,
+            object.id,
+            metric.id,
+          ),
+        );
+        continue;
+      }
+      if (left.objectId !== object.id || right.objectId !== object.id) {
+        issues.push(
+          error(
+            "DERIVED_METRIC_CROSS_OBJECT",
+            `复合指标 ${metric.label} 的依赖指标必须来自同一个事实对象`,
+            object.id,
+            metric.id,
+          ),
+        );
+      }
+      continue;
+    }
+    if (metric.definitionMode === "SQL" && !metric.expression.trim()) {
+      issues.push(
+        error(
+          "METRIC_EXPRESSION_REQUIRED",
+          `指标 ${metric.label} 缺少 SQL 表达式`,
+          object.id,
+          metric.id,
+        ),
+      );
+    }
     if (containsUnsafeExpression(metric.expression)) {
       issues.push(error("METRIC_SQL_UNSAFE", `指标 ${metric.label} 表达式不安全`, object.id, metric.id));
     }
@@ -648,6 +759,7 @@ export function validateOntology(
       );
     }
   }
+  validateMetricDependencyGraph(snapshot, issues);
 
   for (const relation of snapshot.relations) {
     const source = snapshot.objects.find((object) => object.id === relation.sourceObjectId);
@@ -866,6 +978,41 @@ function containsUnsafeExpression(value?: string): boolean {
   return /;|--|\/\*|\b(insert|update|delete|drop|alter|truncate|grant|revoke|call)\b/i.test(
     value,
   );
+}
+
+function validateMetricDependencyGraph(
+  snapshot: OntologySnapshot,
+  issues: OntologyValidationIssue[],
+): void {
+  const metricById = new Map(
+    snapshot.metrics.map((metric) => [metric.id, metric]),
+  );
+  const visited = new Set<string>();
+  const visiting = new Set<string>();
+  const visit = (metric: Metric): void => {
+    if (visited.has(metric.id) || metric.metricType !== "DERIVED") return;
+    if (visiting.has(metric.id)) {
+      issues.push(
+        error(
+          "DERIVED_METRIC_CYCLE",
+          `复合指标 ${metric.label} 存在循环依赖`,
+          metric.objectId,
+          metric.id,
+        ),
+      );
+      return;
+    }
+    visiting.add(metric.id);
+    for (const dependencyId of [metric.leftMetricId, metric.rightMetricId]) {
+      const dependency = dependencyId
+        ? metricById.get(dependencyId)
+        : undefined;
+      if (dependency) visit(dependency);
+    }
+    visiting.delete(metric.id);
+    visited.add(metric.id);
+  };
+  for (const metric of snapshot.metrics) visit(metric);
 }
 
 function findNonAnalyticalReference(

@@ -16,6 +16,7 @@ import {
 import type {
   AnalysisIntent,
   Conversation,
+  Metric,
   OntologyObject,
   OntologySnapshot,
   QuestionLanguageFrame,
@@ -41,6 +42,7 @@ const DATA_AGENT_SYSTEM_PROMPT = `
 6. 你不能生成 SQL。完成语义理解后，必须调用 ExecuteAnalysisPlan，提交本体返回的对象、度量和维度属性 ID；业务值筛选只提交 value_binding_id。measure_ids 只能使用 metrics 中返回的 ID，其中既可能是正式指标，也可能是带默认聚合规则的数字属性。
 7. 用户要求按日、周、月、季度或年展示时，必须提交 time_grain，分别使用 DAY、WEEK、MONTH、QUARTER、YEAR；“月度趋势”不能把原始日期字段直接作为普通维度。
 8. 同比、环比、占比、差值、排名、累计或移动平均只能使用 ExecuteAnalysisPlan 提供的强类型计算结构；不得自行改写 SQL。同比使用 YEAR_OVER_YEAR，环比使用 PREVIOUS_PERIOD。
+8.1 OntologySearch 返回 metricType=DERIVED 的正式复合指标时，直接把该指标 ID 放入 measure_ids，不要再次用 derived_calculations 重建其公式；其依赖 DAG 由 IR 自动展开。
 9. ExecuteAnalysisPlan 是唯一查询入口，它会通过规则引擎生成 IR、校验关系、粒度、可加性、筛选逻辑和窗口计算，编译参数化 Doris SQL 并执行查询。
 10. 不得猜测或创造对象 ID、指标 ID、属性 ID、数据库值、绑定 ID 或关系。计算项的本地 ID 可以使用 calc_ 前缀，但其输入必须引用工具返回的真实 ID。
 11. 最终使用中文给出简洁、可验证的结论，只能引用 ExecuteAnalysisPlan 返回的数据。
@@ -598,9 +600,18 @@ export class DataAgentHarness {
               id: metric.id,
               objectId: metric.objectId,
               label: metric.label,
+              metricType: metric.metricType ?? "BASE",
               aggregation: metric.aggregation,
               sourcePropertyId: metric.sourcePropertyId,
               timePropertyId: metric.timePropertyId,
+              leftMetricId: metric.leftMetricId,
+              rightMetricId: metric.rightMetricId,
+              calculationOperator: metric.calculationOperator,
+              scale: metric.scale,
+              formula:
+                metric.metricType === "DERIVED"
+                  ? metricFormulaLabel(metric, ontology.metrics)
+                  : undefined,
               measureKind: "METRIC" as const,
             })),
             ...propertyMeasures,
@@ -1728,6 +1739,26 @@ function listAvailableMeasures(
       ),
     ),
   ];
+}
+
+function metricFormulaLabel(metric: Metric, metrics: Metric[]): string {
+  if (metric.metricType !== "DERIVED") return metric.expression;
+  const left =
+    metrics.find((candidate) => candidate.id === metric.leftMetricId)?.label ??
+    metric.leftMetricId ??
+    "?";
+  const right =
+    metrics.find((candidate) => candidate.id === metric.rightMetricId)?.label ??
+    metric.rightMetricId ??
+    "?";
+  const operator = {
+    ADD: "+",
+    SUBTRACT: "-",
+    MULTIPLY: "×",
+    DIVIDE: "÷",
+    RATIO: "÷",
+  }[metric.calculationOperator ?? "DIVIDE"];
+  return `(${left} ${operator} ${right})${metric.scale && metric.scale !== 1 ? ` × ${metric.scale}` : ""}`;
 }
 
 function normalizePropertyValue(value: string): string {

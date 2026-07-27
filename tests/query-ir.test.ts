@@ -370,6 +370,167 @@ describe("QueryIrCompiler", () => {
     expect(compiled.sql).toContain("AS `退款率`");
   });
 
+  it("preserves nested derived calculation dependencies for gross margin", () => {
+    const ontology = ontologyWithTime();
+    ontology.metrics = [];
+    ontology.objects[0]!.properties.push({
+      ...ontology.objects[0]!.properties[1]!,
+      id: "p_cost_amount",
+      name: "cost_amount",
+      label: "成本额",
+      sourceColumn: "cost_amount",
+    });
+    const compiler = new QueryIrCompiler();
+    const compiled = compiler.compile(
+      {
+        rootObjectId: "o_order",
+        measureIds: ["p_order_amount", "p_cost_amount"],
+        dimensionPropertyIds: [],
+        filters: [],
+        derivedMeasures: [
+          {
+            id: "calc_gross_profit",
+            label: "毛利额",
+            operator: "SUBTRACT",
+            leftMeasureId: "p_order_amount",
+            rightMeasureId: "p_cost_amount",
+          },
+          {
+            id: "calc_gross_margin",
+            label: "毛利率",
+            operator: "RATIO",
+            leftMeasureId: "calc_gross_profit",
+            rightMeasureId: "p_order_amount",
+            scale: 100,
+          },
+        ],
+        resultKind: "aggregate",
+        title: "毛利率",
+      },
+      ontology,
+      [ordersTable()],
+    );
+
+    expect(compiled.sql).toContain(
+      "((SUM(t0.`pay_amount`) - SUM(t0.`cost_amount`))) / NULLIF((SUM(t0.`pay_amount`)), 0) * 100",
+    );
+    expect(compiled.sql).not.toContain(
+      "(SUM(t0.`pay_amount`)) / NULLIF((SUM(t0.`cost_amount`)), 0)",
+    );
+  });
+
+  it("rejects cycles between temporary derived calculations", () => {
+    const ontology = ontologyWithTime();
+    const compiler = new QueryIrCompiler();
+
+    expect(() =>
+      compiler.compile(
+        {
+          rootObjectId: "o_order",
+          measureIds: ["m_gmv"],
+          dimensionPropertyIds: [],
+          filters: [],
+          derivedMeasures: [
+            {
+              id: "calc_a",
+              label: "计算A",
+              operator: "ADD",
+              leftMeasureId: "calc_b",
+              rightMeasureId: "m_gmv",
+            },
+            {
+              id: "calc_b",
+              label: "计算B",
+              operator: "SUBTRACT",
+              leftMeasureId: "calc_a",
+              rightMeasureId: "m_gmv",
+            },
+          ],
+          resultKind: "aggregate",
+          title: "循环指标",
+        },
+        ontology,
+        [ordersTable()],
+      ),
+    ).toThrow("循环依赖");
+  });
+
+  it("compiles a persisted composite metric dependency DAG", () => {
+    const ontology = ontologyWithTime();
+    ontology.objects[0]!.properties.push({
+      ...ontology.objects[0]!.properties[1]!,
+      id: "p_cost_amount",
+      name: "cost_amount",
+      label: "成本额",
+      sourceColumn: "cost_amount",
+    });
+    ontology.metrics.push(
+      {
+        ...ontology.metrics[0]!,
+        id: "m_cost",
+        metricType: "BASE",
+        name: "cost_amount",
+        label: "成本额",
+        sourcePropertyId: "p_cost_amount",
+        expression: "SUM(fact_orders.cost_amount)",
+      },
+      {
+        ...ontology.metrics[0]!,
+        id: "m_gross_profit",
+        metricType: "DERIVED",
+        name: "gross_profit",
+        label: "毛利额",
+        sourcePropertyId: undefined,
+        aggregation: "CUSTOM",
+        leftMetricId: "m_gmv",
+        rightMetricId: "m_cost",
+        calculationOperator: "SUBTRACT",
+        scale: 1,
+        expression: "(成交金额 - 成本额)",
+      },
+      {
+        ...ontology.metrics[0]!,
+        id: "m_gross_margin",
+        metricType: "DERIVED",
+        name: "gross_margin",
+        label: "毛利率",
+        sourcePropertyId: undefined,
+        aggregation: "CUSTOM",
+        leftMetricId: "m_gross_profit",
+        rightMetricId: "m_gmv",
+        calculationOperator: "RATIO",
+        scale: 100,
+        format: "percent",
+        expression: "(毛利额 / 成交金额) * 100",
+      },
+    );
+    const compiler = new QueryIrCompiler();
+    const compiled = compiler.compile(
+      {
+        rootObjectId: "o_order",
+        measureIds: ["m_gross_margin"],
+        dimensionPropertyIds: [],
+        filters: [],
+        resultKind: "aggregate",
+        title: "毛利率",
+      },
+      ontology,
+      [ordersTable()],
+    );
+
+    expect(compiled.sql).toContain(
+      "((SUM(t0.`pay_amount`) - SUM(t0.`cost_amount`))) / NULLIF((SUM(t0.`pay_amount`)), 0) * 100",
+    );
+    expect(compiled.sql).toContain("AS `毛利率`");
+    expect(compiled.bindings).toContainEqual(
+      expect.objectContaining({
+        label: "指标",
+        value: "毛利率",
+        source: expect.stringContaining("毛利额"),
+      }),
+    );
+  });
+
   it("compiles nested OR and NOT filter logic with parameters", () => {
     const ontology = ontologyWithTime();
     ontology.objects[0]!.properties.push(

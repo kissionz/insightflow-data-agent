@@ -164,7 +164,7 @@ export class QueryIrCompiler {
       const object = objectById.get(metric.objectId);
       if (!object) throw new Error(`指标 ${metric.label} 的所属对象不存在`);
       selectParts.push(
-        `${compileMetric(metric, object, aliases, tablesByObject)} AS ${quoteIdentifier(metric.label)}`,
+        `${compileMetric(metric, object, aliases, tablesByObject, metricById, objectById)} AS ${quoteIdentifier(metric.label)}`,
       );
     }
     const measureByReference = buildMeasureReferenceMap(
@@ -181,7 +181,9 @@ export class QueryIrCompiler {
       selectParts.push(
         `${compileDerivedMeasure(
           calculation,
+          intent.derivedMeasures ?? [],
           measureByReference,
+          metricById,
           objectById,
           aliases,
           tablesByObject,
@@ -337,6 +339,7 @@ export class QueryIrCompiler {
           dimensions,
           measures,
           measureByReference,
+          metricById,
           objectById,
           aliases,
           tablesByObject,
@@ -546,8 +549,6 @@ function validateCalculations(
     ids.add(calculation.id);
   }
   for (const calculation of intent.derivedMeasures ?? []) {
-    requireMeasureReference(measures, calculation.leftMeasureId, calculation.label);
-    requireMeasureReference(measures, calculation.rightMeasureId, calculation.label);
     if (
       calculation.scale != null &&
       (!Number.isFinite(calculation.scale) ||
@@ -557,6 +558,7 @@ function validateCalculations(
       throw new Error(`派生计算 ${calculation.label} 的缩放系数无效`);
     }
   }
+  validateDerivedCalculationGraph(intent.derivedMeasures ?? [], measures);
   if (intent.timeComparisons?.length) {
     if (!intent.timeGrain || !timeBinding) {
       throw new Error("同比或环比计算必须指定时间粒度");
@@ -622,34 +624,82 @@ function requireMeasureReference(
   return metric;
 }
 
+function validateDerivedCalculationGraph(
+  calculations: DerivedMeasureCalculation[],
+  measures: Map<string, Metric>,
+): void {
+  const calculationById = new Map(
+    calculations.map((calculation) => [calculation.id, calculation]),
+  );
+  const visited = new Set<string>();
+  const visiting = new Set<string>();
+  const visit = (id: string, parentLabel: string): void => {
+    if (measures.has(id) || visited.has(id)) return;
+    const calculation = calculationById.get(id);
+    if (!calculation) {
+      throw new Error(`派生计算 ${parentLabel} 引用了未提交的指标或计算项：${id}`);
+    }
+    if (visiting.has(id)) {
+      throw new Error(`派生计算存在循环依赖：${calculation.label}`);
+    }
+    visiting.add(id);
+    visit(calculation.leftMeasureId, calculation.label);
+    visit(calculation.rightMeasureId, calculation.label);
+    visiting.delete(id);
+    visited.add(id);
+  };
+  for (const calculation of calculations) visit(calculation.id, calculation.label);
+}
+
 function compileDerivedMeasure(
   calculation: DerivedMeasureCalculation,
+  calculations: DerivedMeasureCalculation[],
   measures: Map<string, Metric>,
+  allMetrics: Map<string, Metric>,
   objects: Map<string, OntologyObject>,
   aliases: Map<string, string>,
   tables: Map<string, PhysicalTable>,
 ): string {
-  const left = requireMeasureReference(
-    measures,
-    calculation.leftMeasureId,
-    calculation.label,
+  const calculationById = new Map(
+    calculations.map((candidate) => [candidate.id, candidate]),
   );
-  const right = requireMeasureReference(
-    measures,
-    calculation.rightMeasureId,
-    calculation.label,
-  );
-  const leftObject = objects.get(left.objectId);
-  const rightObject = objects.get(right.objectId);
-  if (!leftObject || !rightObject) {
-    throw new Error(`派生计算 ${calculation.label} 的指标对象不存在`);
-  }
-  return compileArithmeticExpression(
-    calculation.operator,
-    compileMetric(left, leftObject, aliases, tables),
-    compileMetric(right, rightObject, aliases, tables),
-    calculation.scale,
-  );
+  const cache = new Map<string, string>();
+  const resolving = new Set<string>();
+  const resolve = (id: string): string => {
+    const cached = cache.get(id);
+    if (cached) return cached;
+    const metric = measures.get(id);
+    if (metric) {
+      const object = objects.get(metric.objectId);
+      if (!object) throw new Error(`指标 ${metric.label} 的所属对象不存在`);
+      const expression = compileMetric(
+        metric,
+        object,
+        aliases,
+        tables,
+        allMetrics,
+        objects,
+      );
+      cache.set(id, expression);
+      return expression;
+    }
+    const derived = calculationById.get(id);
+    if (!derived) {
+      throw new Error(`派生计算 ${calculation.label} 引用了不存在的计算项：${id}`);
+    }
+    if (resolving.has(id)) throw new Error(`派生计算存在循环依赖：${derived.label}`);
+    resolving.add(id);
+    const expression = compileArithmeticExpression(
+      derived.operator,
+      resolve(derived.leftMeasureId),
+      resolve(derived.rightMeasureId),
+      derived.scale,
+    );
+    resolving.delete(id);
+    cache.set(id, expression);
+    return expression;
+  };
+  return resolve(calculation.id);
 }
 
 function compileArithmeticExpression(
@@ -680,11 +730,35 @@ function validateAggregationSafety(
   relationIds: string[],
   ontology: OntologySnapshot,
 ): void {
-  const measureObjects = new Set(measures.map((metric) => metric.objectId));
+  const metricById = new Map(
+    ontology.metrics.map((metric) => [metric.id, metric]),
+  );
+  const expandedMeasures = new Map<string, Metric>();
+  const expand = (metric: Metric, visiting = new Set<string>()): void => {
+    if (expandedMeasures.has(metric.id)) return;
+    if (visiting.has(metric.id)) {
+      throw new Error(`复合指标存在循环依赖：${metric.label}`);
+    }
+    if (metric.metricType !== "DERIVED") {
+      expandedMeasures.set(metric.id, metric);
+      return;
+    }
+    const next = new Set(visiting).add(metric.id);
+    for (const dependencyId of [metric.leftMetricId, metric.rightMetricId]) {
+      const dependency = dependencyId
+        ? metricById.get(dependencyId)
+        : undefined;
+      if (!dependency) throw new Error(`复合指标 ${metric.label} 的依赖指标不存在`);
+      expand(dependency, next);
+    }
+  };
+  for (const metric of measures) expand(metric);
+  const governedMeasures = [...expandedMeasures.values()];
+  const measureObjects = new Set(governedMeasures.map((metric) => metric.objectId));
   if (measureObjects.size > 1) {
     throw new Error("当前 IR 不允许直接混合多个事实对象的指标，请先配置同粒度派生对象");
   }
-  for (const metric of measures) {
+  for (const metric of governedMeasures) {
     const object = ontology.objects.find((candidate) => candidate.id === metric.objectId);
     const property = object?.properties.find(
       (candidate) => candidate.id === metric.sourcePropertyId,
@@ -750,6 +824,7 @@ interface LayeredAnalysisContext {
   dimensions: Array<{ object: OntologyObject; property: OntologyProperty }>;
   measures: Metric[];
   measureByReference: Map<string, Metric>;
+  metricById: Map<string, Metric>;
   objectById: Map<string, OntologyObject>;
   aliases: Map<string, string>;
   tablesByObject: Map<string, PhysicalTable>;
@@ -769,6 +844,7 @@ function compileLayeredAnalysis(context: LayeredAnalysisContext): string {
     dimensions,
     measures,
     measureByReference,
+    metricById,
     objectById,
     aliases,
     tablesByObject,
@@ -808,7 +884,7 @@ function compileLayeredAnalysis(context: LayeredAnalysisContext): string {
     const object = objectById.get(metric.objectId);
     if (!object) throw new Error(`指标 ${metric.label} 的所属对象不存在`);
     baseSelect.push(
-      `${compileMetric(metric, object, aliases, tablesByObject)} AS ${quoteIdentifier(alias)}`,
+      `${compileMetric(metric, object, aliases, tablesByObject, metricById, objectById)} AS ${quoteIdentifier(alias)}`,
     );
   });
 
@@ -868,24 +944,14 @@ function compileLayeredAnalysis(context: LayeredAnalysisContext): string {
       `c.${quoteIdentifier(measureAliases.get(metric.id)!)} AS ${quoteIdentifier(metric.label)}`,
     );
   }
+  const layeredDerivedExpressions = compileLayeredDerivedExpressions(
+    intent.derivedMeasures ?? [],
+    measureByReference,
+    measureAliases,
+  );
   for (const calculation of intent.derivedMeasures ?? []) {
-    const left = requireMeasureReference(
-      measureByReference,
-      calculation.leftMeasureId,
-      calculation.label,
-    );
-    const right = requireMeasureReference(
-      measureByReference,
-      calculation.rightMeasureId,
-      calculation.label,
-    );
     finalSelect.push(
-      `${compileArithmeticExpression(
-        calculation.operator,
-        `c.${quoteIdentifier(measureAliases.get(left.id)!)}`,
-        `c.${quoteIdentifier(measureAliases.get(right.id)!)}`,
-        calculation.scale,
-      )} AS ${quoteIdentifier(calculation.label)}`,
+      `${layeredDerivedExpressions.get(calculation.id)} AS ${quoteIdentifier(calculation.label)}`,
     );
   }
   for (const calculation of intent.timeComparisons ?? []) {
@@ -934,6 +1000,43 @@ function compileLayeredAnalysis(context: LayeredAnalysisContext): string {
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+function compileLayeredDerivedExpressions(
+  calculations: DerivedMeasureCalculation[],
+  measures: Map<string, Metric>,
+  measureAliases: Map<string, string>,
+): Map<string, string> {
+  const calculationById = new Map(
+    calculations.map((calculation) => [calculation.id, calculation]),
+  );
+  const cache = new Map<string, string>();
+  const resolving = new Set<string>();
+  const resolve = (id: string): string => {
+    const cached = cache.get(id);
+    if (cached) return cached;
+    const metric = measures.get(id);
+    if (metric) {
+      const expression = `c.${quoteIdentifier(measureAliases.get(metric.id)!)}`;
+      cache.set(id, expression);
+      return expression;
+    }
+    const calculation = calculationById.get(id);
+    if (!calculation) throw new Error(`派生计算引用了不存在的计算项：${id}`);
+    if (resolving.has(id)) throw new Error(`派生计算存在循环依赖：${calculation.label}`);
+    resolving.add(id);
+    const expression = compileArithmeticExpression(
+      calculation.operator,
+      resolve(calculation.leftMeasureId),
+      resolve(calculation.rightMeasureId),
+      calculation.scale,
+    );
+    resolving.delete(id);
+    cache.set(id, expression);
+    return expression;
+  };
+  for (const calculation of calculations) resolve(calculation.id);
+  return cache;
 }
 
 function compileWindowExpression(
@@ -1056,7 +1159,13 @@ function resolveMeasureReference(
 ): { metric: Metric; source: string } {
   const metric = ontology.metrics.find((candidate) => candidate.id === id);
   if (metric) {
-    return { metric, source: "指标ID精确绑定" };
+    return {
+      metric,
+      source:
+        metric.metricType === "DERIVED"
+          ? `复合指标ID精确绑定 · ${governedMetricFormula(metric, ontology.metrics)} · 依赖 ${collectMetricDependencyLabels(metric, ontology.metrics).join("、")}`
+          : "指标ID精确绑定",
+    };
   }
   const propertyBinding = owners.find(
     (candidate) => candidate.property.id === id,
@@ -1097,6 +1206,57 @@ function resolveMeasureReference(
   throw new Error(
     `“${propertyBinding.property.label}”（${id}）不是可聚合数字属性。measure_ids 只能使用 OntologySearch 返回的 metrics[].id${availableMetrics ? `；当前可用指标：${availableMetrics}` : ""}`,
   );
+}
+
+function collectMetricDependencyLabels(
+  metric: Metric,
+  metrics: Metric[],
+  visited = new Set<string>(),
+): string[] {
+  if (metric.metricType !== "DERIVED" || visited.has(metric.id)) return [];
+  visited.add(metric.id);
+  const dependencies = [metric.leftMetricId, metric.rightMetricId]
+    .map((id) => metrics.find((candidate) => candidate.id === id))
+    .filter((candidate): candidate is Metric => Boolean(candidate));
+  return [
+    ...new Set(
+      dependencies.flatMap((dependency) => [
+        dependency.label,
+        ...collectMetricDependencyLabels(dependency, metrics, visited),
+      ]),
+    ),
+  ];
+}
+
+function governedMetricFormula(
+  metric: Metric,
+  metrics: Metric[],
+  resolving = new Set<string>(),
+): string {
+  if (metric.metricType !== "DERIVED") return metric.label;
+  if (resolving.has(metric.id)) return "循环依赖";
+  const next = new Set(resolving).add(metric.id);
+  const left = metrics.find((candidate) => candidate.id === metric.leftMetricId);
+  const right = metrics.find((candidate) => candidate.id === metric.rightMetricId);
+  if (!left || !right || !metric.calculationOperator) return "定义不完整";
+  const operator = {
+    ADD: "+",
+    SUBTRACT: "-",
+    MULTIPLY: "×",
+    DIVIDE: "÷",
+    RATIO: "÷",
+  }[metric.calculationOperator];
+  const leftLabel =
+    left.metricType === "DERIVED"
+      ? governedMetricFormula(left, metrics, next)
+      : left.label;
+  const rightLabel =
+    right.metricType === "DERIVED"
+      ? governedMetricFormula(right, metrics, next)
+      : right.label;
+  return `( ${leftLabel} ${operator} ${rightLabel} )${
+    metric.scale && metric.scale !== 1 ? ` × ${metric.scale}` : ""
+  }`;
 }
 
 function createImplicitPropertyMetric(
@@ -1204,7 +1364,55 @@ function compileMetric(
   object: OntologyObject,
   aliases: Map<string, string>,
   tables: Map<string, PhysicalTable>,
+  metrics: Map<string, Metric>,
+  objects: Map<string, OntologyObject>,
+  resolving: Set<string> = new Set(),
 ): string {
+  if (metric.metricType === "DERIVED") {
+    if (resolving.has(metric.id)) {
+      throw new Error(`复合指标存在循环依赖：${metric.label}`);
+    }
+    const left = metric.leftMetricId
+      ? metrics.get(metric.leftMetricId)
+      : undefined;
+    const right = metric.rightMetricId
+      ? metrics.get(metric.rightMetricId)
+      : undefined;
+    if (!left || !right || !metric.calculationOperator) {
+      throw new Error(`复合指标 ${metric.label} 的定义不完整`);
+    }
+    if (left.objectId !== metric.objectId || right.objectId !== metric.objectId) {
+      throw new Error(`复合指标 ${metric.label} 只能引用同一事实对象的指标`);
+    }
+    const nextResolving = new Set(resolving).add(metric.id);
+    const leftObject = objects.get(left.objectId);
+    const rightObject = objects.get(right.objectId);
+    if (!leftObject || !rightObject) {
+      throw new Error(`复合指标 ${metric.label} 的依赖对象不存在`);
+    }
+    return compileArithmeticExpression(
+      metric.calculationOperator,
+      compileMetric(
+        left,
+        leftObject,
+        aliases,
+        tables,
+        metrics,
+        objects,
+        nextResolving,
+      ),
+      compileMetric(
+        right,
+        rightObject,
+        aliases,
+        tables,
+        metrics,
+        objects,
+        nextResolving,
+      ),
+      metric.scale,
+    );
+  }
   const alias = aliases.get(object.id)!;
   if (metric.definitionMode === "SQL") {
     return rewriteGovernedExpression(metric.expression, aliases, tables);

@@ -480,28 +480,42 @@ Ontology 快照使用 `schemaVersion: 2`。旧版对象级 `primaryKey`、属性
 ```ts
 interface MetricDefinition {
   id: string;
+  metricType: "BASE" | "DERIVED";
   name: string;
+  label: string;
   description: string;
-  objectTypeId: string;
+  objectId: string;
   definitionMode: "VISUAL" | "SQL";
   expression: string;
   aggregation: "SUM" | "COUNT" | "COUNT_DISTINCT" | "AVG" | "MIN" | "MAX" | "CUSTOM";
   sourcePropertyId?: string;
   filterExpression?: string;
   timePropertyId?: string;
-  grain: string[];
-  allowedDimensions: string[];
-  defaultTimeDimension?: string;
-  defaultFilters: FilterDefinition[];
+  leftMetricId?: string;
+  rightMetricId?: string;
+  calculationOperator?: "ADD" | "SUBTRACT" | "MULTIPLY" | "DIVIDE" | "RATIO";
+  scale?: number;
   unit?: string;
-  format?: string;
+  format: "currency" | "number" | "percent";
   synonyms: string[];
-  validationQuery?: string;
-  status: "DRAFT" | "VERIFIED" | "PUBLISHED" | "DEPRECATED";
+  status: "DRAFT" | "PUBLISHED" | "DEPRECATED";
 }
 ```
 
-可视化模式通过聚合方式、来源属性和可选过滤条件生成 SelectDB 兼容表达式；SQL 模式允许直接维护只读指标表达式。两种模式都必须显式声明所属对象、口径和格式，并在发布前经过危险语句与字段映射校验。
+指标在独立的指标中心维护，不再作为对象编辑页的子表单。基础指标通过聚合方式、
+来源属性和可选过滤条件生成 SelectDB 兼容表达式，也可以使用高级 SQL 表达式。
+复合指标通过左右指标、受控运算符和缩放系数组成依赖图，左右指标可以继续引用复合
+指标。当前 MVP 仅允许同一事实对象内组合，并在保存、发布和编译阶段拒绝缺失依赖、
+重复操作数、循环依赖和跨事实对象公式；多事实来源的指标编排留待后续版本。
+
+Montane 命中已发布复合指标时只提交该指标 ID，不重新生成临时公式。IR 编译器递归
+展开治理公式，除法和比率统一使用 `NULLIF` 保护除零，并在查询追踪中展示命中的
+复合指标、展开公式和依赖指标。临时派生指标同样保留有向无环依赖图，例如：
+
+```text
+毛利额 = 销售额 - 成本额
+毛利率 = 毛利额 / 销售额 × 100
+```
 
 ## 11. Ontology 存储
 
@@ -632,8 +646,10 @@ Montane 提示词分为不可修改的核心执行协议和可配置的工作区
   规则引擎优先映射到正式指标并显示纠正来源。
 - Query IR v2 将时间粒度与普通维度分离，支持 `DAY/WEEK/MONTH/QUARTER/YEAR`，
   月度问题必须编译为 `DATE_TRUNC(..., 'month')`，不能直接按原始日期分组。
-- 派生计算仅支持强类型 `ADD/SUBTRACT/MULTIPLY/DIVIDE/RATIO`，除零通过
-  `NULLIF` 保护；同比和环比由 `YEAR_OVER_YEAR/PREVIOUS_PERIOD` 指定，
+- 派生计算和正式复合指标仅支持强类型
+  `ADD/SUBTRACT/MULTIPLY/DIVIDE/RATIO`。依赖可以指向同一查询中的其他派生
+  计算或同一事实对象内的正式指标，编译器按有向无环图递归展开并拒绝循环；除零通过
+  `NULLIF` 保护。同比和环比由 `YEAR_OVER_YEAR/PREVIOUS_PERIOD` 指定，
   规则引擎自动扩展底层取数时间并裁剪最终展示区间。
 - 窗口计算支持 `RANK/DENSE_RANK/RUNNING_SUM/MOVING_AVG`，分区字段必须已
   出现在结果维度中，移动窗口限制为 2 至 365。
@@ -938,6 +954,8 @@ POST   /api/ontology/validate
 POST   /api/ontology/publish
 POST   /api/ontology/rollback
 PATCH  /api/ontology/:entityType/:id
+PUT    /api/ontology/draft/metrics/:id
+DELETE /api/ontology/draft/metrics/:id
 
 GET    /api/data-source
 PUT    /api/data-source

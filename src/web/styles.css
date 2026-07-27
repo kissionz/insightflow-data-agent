@@ -1517,6 +1517,48 @@ tbody tr:hover {
   white-space: nowrap;
 }
 
+.catalog-switch {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  margin: 8px;
+  border-radius: 8px;
+  background: #f2f4f7;
+  padding: 4px;
+}
+
+.catalog-switch button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  padding: 7px;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.catalog-switch button.active {
+  background: white;
+  color: var(--blue);
+  box-shadow: 0 1px 2px rgb(16 24 40 / 8%);
+}
+
+.metric-catalog-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 5px;
+  margin: 8px;
+}
+
+.metric-catalog-actions button {
+  min-width: 0;
+  padding-inline: 5px;
+  font-size: 10px;
+}
+
 .ontology-object-delete {
   display: grid;
   width: 28px;
@@ -1635,6 +1677,29 @@ tbody tr:hover {
   margin: 12px 0 18px;
   color: #475467;
   font-size: 12px;
+  line-height: 1.6;
+}
+
+.metric-formula-card {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  margin-top: 14px;
+  border: 1px solid #bfd3ff;
+  border-radius: 8px;
+  background: #f4f7ff;
+  padding: 14px;
+}
+
+.metric-formula-card span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.metric-formula-card strong {
+  color: #243b67;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
   line-height: 1.6;
 }
 
@@ -1898,6 +1963,23 @@ tbody tr:hover {
   gap: 12px;
   border-bottom: 1px solid var(--border);
   padding: 0 14px;
+}
+
+.editor-toolbar > div:first-child:not(.editor-tabs) {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.editor-toolbar > div:first-child:not(.editor-tabs) small {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.editor-actions {
+  display: flex;
+  align-items: center;
+  gap: 7px;
 }
 
 .editor-tabs {

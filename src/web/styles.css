@@ -32,7 +32,7 @@ body,
 }
 
 body {
-  min-width: 1120px;
+  min-width: 0;
   overflow: hidden;
 }
 
@@ -1300,12 +1300,14 @@ tbody tr:hover {
   right: 0;
   bottom: 0;
   left: 0;
+  min-width: 0;
   z-index: 3;
   background: linear-gradient(to top, #fbfcfe 72%, rgb(251 252 254 / 0%));
   padding: 42px clamp(20px, 3vw, 48px) 12px;
 }
 
 .composer {
+  width: 100%;
   max-width: 880px;
   margin: auto;
   border: 1px solid var(--border-strong);
@@ -3322,7 +3324,7 @@ tbody tr:hover {
 
 @media (max-width: 1240px) {
   .app-shell {
-    grid-template-columns: 68px 240px minmax(640px, 1fr);
+    grid-template-columns: 68px clamp(210px, 22vw, 240px) minmax(0, 1fr);
   }
 
   .context-panel {

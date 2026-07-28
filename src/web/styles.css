@@ -65,8 +65,10 @@ button:disabled {
 .app-shell {
   display: grid;
   grid-template-columns: 68px 260px minmax(640px, 1fr) 235px;
+  grid-template-rows: minmax(0, 1fr);
   width: 100%;
   height: 100%;
+  overflow: hidden;
   background: var(--canvas);
 }
 
@@ -134,8 +136,10 @@ button.brand-mark {
   position: relative;
   z-index: 4;
   display: flex;
+  min-height: 0;
   min-width: 0;
   flex-direction: column;
+  overflow: hidden;
   border-right: 1px solid var(--border);
   background: color-mix(in oklab, var(--surface), #f7f9fc 26%);
 }
@@ -1429,6 +1433,7 @@ tbody tr:hover {
 }
 
 .context-panel {
+  min-height: 0;
   overflow-y: auto;
   border-left: 1px solid var(--border);
   background: white;

@@ -69,11 +69,12 @@ describe("QueryIrCompiler", () => {
     expect(compiled.parameters).toEqual([
       "ONLINE",
       "2026-01-01 00:00:00",
-      "2027-01-01 00:00:00",
+      "2026-07-27 00:00:00",
     ]);
     expect(compiled.ir.timeRange).toMatchObject({
       propertyId: "p_paid_at",
       expression: "今年",
+      mode: "TO_DATE",
     });
     expect(compiled.bindings).toContainEqual(
       expect.objectContaining({
@@ -288,7 +289,7 @@ describe("QueryIrCompiler", () => {
     });
   });
 
-  it("compiles year-over-year growth with an expanded base range", () => {
+  it("compiles year-over-year growth with same-progress YTD ranges", () => {
     const ontology = ontologyWithTime();
     const compiler = new QueryIrCompiler(() => new Date("2026-07-26T00:00:00Z"));
     const compiled = compiler.compile(
@@ -317,13 +318,75 @@ describe("QueryIrCompiler", () => {
     expect(compiled.sql).toContain(
       "p0.`__time_bucket` = DATE_SUB(c.`__time_bucket`, INTERVAL 1 YEAR)",
     );
+    expect(compiled.sql).toContain(
+      "(t0.`paid_at` >= ? AND t0.`paid_at` < ?)",
+    );
+    expect(compiled.sql).toContain("OR");
     expect(compiled.sql).toContain("AS `销售额同比`");
     expect(compiled.parameters).toEqual([
-      "2025-01-01 00:00:00",
-      "2027-01-01 00:00:00",
       "2026-01-01 00:00:00",
-      "2027-01-01 00:00:00",
+      "2026-07-27 00:00:00",
+      "2025-01-01 00:00:00",
+      "2025-07-27 00:00:00",
+      "2026-01-01 00:00:00",
+      "2026-07-27 00:00:00",
     ]);
+    expect(compiled.ir.timeRange).toEqual({
+      propertyId: "p_paid_at",
+      expression: "今年",
+      start: "2026-01-01 00:00:00",
+      endExclusive: "2026-07-27 00:00:00",
+      mode: "TO_DATE",
+      comparisonRanges: [{
+        comparison: "YEAR_OVER_YEAR",
+        start: "2025-01-01 00:00:00",
+        endExclusive: "2025-07-27 00:00:00",
+      }],
+    });
+    expect(compiled.bindings).toContainEqual(
+      expect.objectContaining({
+        label: "同比基期",
+        value: "2025-01-01 00:00:00 至 2025-07-27 00:00:00",
+        source: "IR 同进度时间窗口",
+      }),
+    );
+  });
+
+  it("keeps an explicit completed year on full-period comparison ranges", () => {
+    const ontology = ontologyWithTime();
+    const compiler = new QueryIrCompiler(() => new Date("2026-07-26T00:00:00Z"));
+    const compiled = compiler.compile(
+      {
+        rootObjectId: "o_order",
+        measureIds: ["m_gmv"],
+        dimensionPropertyIds: [],
+        filters: [],
+        timeRange: { expression: "2025年" },
+        timeGrain: { unit: "YEAR" },
+        timeComparisons: [{
+          id: "calc_yoy",
+          label: "销售额同比",
+          measureId: "m_gmv",
+          comparison: "YEAR_OVER_YEAR",
+          output: "GROWTH_RATE",
+        }],
+        resultKind: "aggregate",
+        title: "2025年销售额同比",
+      },
+      ontology,
+      [ordersTable()],
+    );
+
+    expect(compiled.ir.timeRange).toMatchObject({
+      start: "2025-01-01 00:00:00",
+      endExclusive: "2026-01-01 00:00:00",
+      mode: "FULL_PERIOD",
+      comparisonRanges: [{
+        comparison: "YEAR_OVER_YEAR",
+        start: "2024-01-01 00:00:00",
+        endExclusive: "2025-01-01 00:00:00",
+      }],
+    });
   });
 
   it("compiles governed ratios and protects division by zero", () => {

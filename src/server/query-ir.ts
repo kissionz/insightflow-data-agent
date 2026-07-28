@@ -285,25 +285,36 @@ export class QueryIrCompiler {
         this.now(),
         timezone,
       );
-      const comparisonStart = intent.timeComparisons?.length
-        ? expandTimeRangeStart(
-            range.start,
-            intent.timeGrain?.unit,
-            intent.timeComparisons,
-          )
-        : range.start;
       const column = qualifiedColumn(
         aliases.get(timeBinding.object.id)!,
         timeBinding.property,
       );
-      whereParts.push(`${column} >= ?`);
-      parameters.push(comparisonStart);
-      whereParts.push(`${column} < ?`);
-      parameters.push(range.endExclusive);
+      const comparisonRanges = intent.timeComparisons?.length
+        ? resolveComparisonTimeRanges(
+            range,
+            intent.timeGrain?.unit,
+            intent.timeComparisons,
+          )
+        : [];
+      const queryRanges = [range, ...comparisonRanges];
+      whereParts.push(
+        queryRanges.length === 1
+          ? `${column} >= ?\n  AND ${column} < ?`
+          : `(${queryRanges
+              .map(
+                () =>
+                  `(${column} >= ? AND ${column} < ?)`,
+              )
+              .join("\n    OR ")})`,
+      );
+      for (const queryRange of queryRanges) {
+        parameters.push(queryRange.start, queryRange.endExclusive);
+      }
       resolvedTime = {
         propertyId: timeBinding.property.id,
         expression: intent.timeRange.expression,
         ...range,
+        comparisonRanges,
       };
     }
 
@@ -471,10 +482,23 @@ export class QueryIrCompiler {
         ? [{
             label: "时间范围",
             value: `${timeBinding.property.label}：${resolvedTime.start} 至 ${resolvedTime.endExclusive}`,
-            source: `自然时间“${resolvedTime.expression}”`,
+            source:
+              resolvedTime.mode === "TO_DATE"
+                ? `自然时间“${resolvedTime.expression}” · 同进度截至当前日期`
+                : `自然时间“${resolvedTime.expression}”`,
             entityId: timeBinding.property.id,
           }]
         : []),
+      ...(resolvedTime?.comparisonRanges ?? []).map((range) => ({
+        label:
+          range.comparison === "YEAR_OVER_YEAR" ? "同比基期" : "环比基期",
+        value: `${range.start} 至 ${range.endExclusive}`,
+        source:
+          resolvedTime?.mode === "TO_DATE"
+            ? "IR 同进度时间窗口"
+            : "IR 完整周期时间窗口",
+        entityId: timeBinding?.property.id,
+      })),
     ];
     return {
       ir,
@@ -1126,30 +1150,54 @@ function timeComparisonInterval(
   }[grain];
 }
 
-function expandTimeRangeStart(
-  start: string,
+function resolveComparisonTimeRanges(
+  range: {
+    start: string;
+    endExclusive: string;
+  },
   grain: TimeGrain | undefined,
   comparisons: TimeComparisonCalculation[],
-): string {
+): NonNullable<NonNullable<QueryIR["timeRange"]>["comparisonRanges"]> {
   if (!grain) throw new Error("时间比较必须指定时间粒度");
-  const date = new Date(`${start.slice(0, 10)}T00:00:00.000Z`);
-  const needsYear = comparisons.some(
-    (calculation) => calculation.comparison === "YEAR_OVER_YEAR",
-  );
-  if (needsYear) {
-    date.setUTCFullYear(date.getUTCFullYear() - 1);
-  } else if (grain === "YEAR") {
-    date.setUTCFullYear(date.getUTCFullYear() - 1);
-  } else if (grain === "QUARTER") {
-    date.setUTCMonth(date.getUTCMonth() - 3);
-  } else if (grain === "MONTH") {
-    date.setUTCMonth(date.getUTCMonth() - 1);
-  } else if (grain === "WEEK") {
-    date.setUTCDate(date.getUTCDate() - 7);
-  } else {
-    date.setUTCDate(date.getUTCDate() - 1);
+  const uniqueComparisons = [
+    ...new Set(comparisons.map((calculation) => calculation.comparison)),
+  ];
+  return uniqueComparisons.map((comparison) => {
+    const shift =
+      comparison === "YEAR_OVER_YEAR" || grain === "YEAR"
+        ? { years: -1 }
+        : grain === "QUARTER"
+          ? { months: -3 }
+          : grain === "MONTH"
+            ? { months: -1 }
+            : grain === "WEEK"
+              ? { days: -7 }
+              : { days: -1 };
+    return {
+      comparison,
+      start: shiftDateText(range.start, shift),
+      endExclusive: shiftDateText(range.endExclusive, shift),
+    };
+  });
+}
+
+function shiftDateText(
+  value: string,
+  shift: { years?: number; months?: number; days?: number },
+): string {
+  const [year, month, day] = value
+    .slice(0, 10)
+    .split("-")
+    .map(Number) as [number, number, number];
+  if (shift.days) {
+    return dateText(year, month, day + shift.days);
   }
-  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}-${String(date.getUTCDate()).padStart(2, "0")} 00:00:00`;
+  const targetMonthIndex =
+    year * 12 + month - 1 + (shift.years ?? 0) * 12 + (shift.months ?? 0);
+  const targetYear = Math.floor(targetMonthIndex / 12);
+  const targetMonth = ((targetMonthIndex % 12) + 12) % 12 + 1;
+  const lastDay = new Date(Date.UTC(targetYear, targetMonth, 0)).getUTCDate();
+  return dateText(targetYear, targetMonth, Math.min(day, lastDay));
 }
 
 function resolveMeasureReference(
@@ -1616,32 +1664,47 @@ function resolveNaturalTimeRange(
   expression: string,
   now: Date,
   timezone: string,
-): { start: string; endExclusive: string } {
+): {
+  start: string;
+  endExclusive: string;
+  mode: NonNullable<QueryIR["timeRange"]>["mode"];
+} {
   const text = expression.trim();
   const { year, month, day } = zonedDateParts(now, timezone);
   if (/^(今年|本年)$/.test(text)) {
-    return { start: dateText(year, 1, 1), endExclusive: dateText(year + 1, 1, 1) };
+    return {
+      start: dateText(year, 1, 1),
+      endExclusive: dateText(year, month, day + 1),
+      mode: "TO_DATE",
+    };
   }
   if (text === "去年") {
-    return { start: dateText(year - 1, 1, 1), endExclusive: dateText(year, 1, 1) };
+    return {
+      start: dateText(year - 1, 1, 1),
+      endExclusive: dateText(year, 1, 1),
+      mode: "FULL_PERIOD",
+    };
   }
   if (/^(本月|这个月)$/.test(text)) {
     return {
       start: dateText(year, month, 1),
-      endExclusive: dateText(year, month + 1, 1),
+      endExclusive: dateText(year, month, day + 1),
+      mode: "TO_DATE",
     };
   }
   if (text === "上月") {
     return {
       start: dateText(year, month - 1, 1),
       endExclusive: dateText(year, month, 1),
+      mode: "FULL_PERIOD",
     };
   }
   if (/^(本周|这周|本星期)$/.test(text)) {
     const weekday = zonedWeekday(now, timezone);
     return {
       start: dateText(year, month, day - weekday),
-      endExclusive: dateText(year, month, day - weekday + 7),
+      endExclusive: dateText(year, month, day + 1),
+      mode: "TO_DATE",
     };
   }
   if (/^(上周|上星期)$/.test(text)) {
@@ -1649,13 +1712,15 @@ function resolveNaturalTimeRange(
     return {
       start: dateText(year, month, day - weekday - 7),
       endExclusive: dateText(year, month, day - weekday),
+      mode: "FULL_PERIOD",
     };
   }
   if (/^(本季度|本季)$/.test(text)) {
     const quarterMonth = Math.floor((month - 1) / 3) * 3 + 1;
     return {
       start: dateText(year, quarterMonth, 1),
-      endExclusive: dateText(year, quarterMonth + 3, 1),
+      endExclusive: dateText(year, month, day + 1),
+      mode: "TO_DATE",
     };
   }
   if (/^(上季度|上季)$/.test(text)) {
@@ -1663,24 +1728,31 @@ function resolveNaturalTimeRange(
     return {
       start: dateText(year, quarterMonth - 3, 1),
       endExclusive: dateText(year, quarterMonth, 1),
+      mode: "FULL_PERIOD",
     };
   }
   if (/^(今天|今日)$/.test(text)) {
     return {
       start: dateText(year, month, day),
       endExclusive: dateText(year, month, day + 1),
+      mode: "TO_DATE",
     };
   }
   if (text === "昨天") {
     return {
       start: dateText(year, month, day - 1),
       endExclusive: dateText(year, month, day),
+      mode: "FULL_PERIOD",
     };
   }
   const explicitYear = text.match(/^(\d{4})年$/);
   if (explicitYear) {
     const parsed = Number(explicitYear[1]);
-    return { start: dateText(parsed, 1, 1), endExclusive: dateText(parsed + 1, 1, 1) };
+    return {
+      start: dateText(parsed, 1, 1),
+      endExclusive: dateText(parsed + 1, 1, 1),
+      mode: "FULL_PERIOD",
+    };
   }
   const explicitMonth = text.match(/^(\d{4})年(\d{1,2})月$/);
   if (explicitMonth) {
@@ -1692,6 +1764,7 @@ function resolveNaturalTimeRange(
     return {
       start: dateText(parsedYear, parsedMonth, 1),
       endExclusive: dateText(parsedYear, parsedMonth + 1, 1),
+      mode: "FULL_PERIOD",
     };
   }
   const recentDays = text.match(/^(?:近|最近)(\d{1,3})天$/);
@@ -1701,6 +1774,7 @@ function resolveNaturalTimeRange(
     return {
       start: dateText(year, month, day - count + 1),
       endExclusive: dateText(year, month, day + 1),
+      mode: "ROLLING",
     };
   }
   const recentMonths = text.match(/^(?:近|最近)(\d{1,2})个?月$/);
@@ -1710,6 +1784,7 @@ function resolveNaturalTimeRange(
     return {
       start: dateText(year, month - count + 1, 1),
       endExclusive: dateText(year, month + 1, 1),
+      mode: "ROLLING",
     };
   }
   throw new Error(

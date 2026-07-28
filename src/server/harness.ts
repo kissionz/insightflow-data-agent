@@ -2,7 +2,6 @@ import {
   AgentLoop,
   ContextBuilder,
   PermissionGate,
-  SessionCompactor,
   SessionManager,
   SessionStore,
   ToolRegistry,
@@ -31,6 +30,8 @@ import { SemanticIndex } from "./semantic-index.js";
 import type { QueryResult } from "./selectdb.js";
 import { guardReadOnlySql } from "./sql-guard.js";
 
+const DATA_AGENT_MAX_MODEL_TURNS = 14;
+
 const DATA_AGENT_SYSTEM_PROMPT = `
 你是 InsightFlow Data Agent，运行在 Montane Harness 中。
 
@@ -45,6 +46,7 @@ const DATA_AGENT_SYSTEM_PROMPT = `
 7. 用户要求按日、周、月、季度或年展示时，必须提交 time_grain，分别使用 DAY、WEEK、MONTH、QUARTER、YEAR；“月度趋势”不能把原始日期字段直接作为普通维度。
 8. 同比、环比、占比、差值、排名、累计或移动平均只能使用 ExecuteAnalysisPlan 提供的强类型计算结构；不得自行改写 SQL。同比使用 YEAR_OVER_YEAR，环比使用 PREVIOUS_PERIOD。
 8.1 OntologySearch 返回 metricType=DERIVED 的正式复合指标时，直接把该指标 ID 放入 measure_ids，不要再次用 derived_calculations 重建其公式；其依赖 DAG 由 IR 自动展开。
+8.2 “今年、本月、本季度、本周”等尚未结束的自然周期按截至当前日期处理；同比和环比由 IR 自动生成同进度基期，不得把未完整的当前周期与完整历史周期比较。
 9. ExecuteAnalysisPlan 是唯一查询入口，它会通过规则引擎生成 IR、校验关系、粒度、可加性、筛选逻辑和窗口计算，编译参数化 Doris SQL 并执行查询。
 9.1 直接问数通常只执行一次。探索或诊断分析可以根据真实结果最多执行四步；每一步必须提供 analysis_step，说明本步目标、依据和结果角色。先用一条查询同时获取多个核心指标，再根据结果决定是否按一个高价值维度继续诊断。不得重复相同计划，不得跨事实对象，已有证据足够时立即停止。
 9.2 每次 ExecuteAnalysisPlan 返回 observation。继续查询前必须基于该 observation 说明新查询要验证的具体问题；不得为了“多分析一步”而机械穷举所有维度。
@@ -183,26 +185,25 @@ export class DataAgentHarness {
     );
     const context = new ContextBuilder(
       this.workspaceRoot,
-      36,
+      120,
       buildSystemPrompt(agentConfig.businessInstructions, agentConfig.timezone),
     );
-    const compactor = new SessionCompactor(session, 30, 18_000);
     const loop = new AgentLoop(
       runtime.client,
       tools,
       permissions,
       context,
       session,
-      8,
+      DATA_AGENT_MAX_MODEL_TURNS,
       async () => "reject" as const,
       reporter,
-      compactor,
+      undefined,
       undefined,
       async (status) => {
         await managed.updateStatus(status);
       },
       {
-        maxTurns: 14,
+        maxTurns: DATA_AGENT_MAX_MODEL_TURNS,
         maxWallTimeMs: 480_000,
         maxInputTokens: 360_000,
         maxOutputTokens: 18_000,

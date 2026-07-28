@@ -506,7 +506,11 @@ function TraceTimeline({
               </dl>
             ) : null}
             {step.detail && <p className="trace-detail">{step.detail}</p>}
-            {step.code && (
+            {step.code &&
+              !(
+                step.kind === "sql" &&
+                analysisRun?.steps.some((analysisStep) => analysisStep.sql)
+              ) && (
               <details className="trace-code">
                 <summary>
                   查看{step.code.language === "sql"
@@ -521,6 +525,9 @@ function TraceTimeline({
             {step.kind === "query_plan" && analysisRun ? (
               <AnalysisRunTrace run={analysisRun} />
             ) : null}
+            {step.kind === "sql" && analysisRun ? (
+              <AnalysisSqlTrace run={analysisRun} />
+            ) : null}
           </div>
         </div>
       ))}
@@ -530,6 +537,10 @@ function TraceTimeline({
 
 function AnalysisRunTrace({ run }: { run: AnalysisRun }) {
   const completed = run.steps.filter((step) => step.status === "completed").length;
+  const sqlSteps = run.steps.filter((step) => step.sql);
+  const sqlOrder = new Map(
+    sqlSteps.map((step, index) => [step.callId, index + 1]),
+  );
   return (
     <section className="analysis-run-trace" aria-label="多步分析路径">
       <div className="analysis-run-heading">
@@ -539,6 +550,7 @@ function AnalysisRunTrace({ run }: { run: AnalysisRun }) {
           </strong>
           <span>
             {run.rootObjectLabel ?? "正在选择事实对象"} · {completed}/{run.maxSteps} 条查询
+            {sqlSteps.length ? ` · ${sqlSteps.length} 条 SQL` : ""}
           </span>
         </div>
         <span className={`analysis-run-state ${run.status}`}>
@@ -573,7 +585,12 @@ function AnalysisRunTrace({ run }: { run: AnalysisRun }) {
             <div>
               <div className="analysis-step-title">
                 <strong>{step.title}</strong>
-                <span>
+                {sqlOrder.has(step.callId) ? (
+                  <span className="analysis-step-sql-label">
+                    SQL {sqlOrder.get(step.callId)}
+                  </span>
+                ) : null}
+                <span className="analysis-step-role">
                   {step.role === "OVERVIEW"
                     ? "总览"
                     : step.role === "DIAGNOSTIC"
@@ -588,19 +605,13 @@ function AnalysisRunTrace({ run }: { run: AnalysisRun }) {
                 </p>
               ) : null}
               <small>{step.summary}</small>
-              {step.ir || step.sql || step.rows?.length ? (
+              {step.ir || step.rows?.length ? (
                 <details className="analysis-step-evidence">
-                  <summary>查看本步 IR、SQL 与结果</summary>
+                  <summary>查看本步 IR 与结果</summary>
                   {step.ir ? (
                     <>
                       <span>Query IR</span>
                       <pre><code>{JSON.stringify(step.ir, null, 2)}</code></pre>
-                    </>
-                  ) : null}
-                  {step.sql ? (
-                    <>
-                      <span>编译 SQL</span>
-                      <pre><code>{`${step.sql}\n\n-- 参数：${JSON.stringify(step.parameters ?? [])}`}</code></pre>
                     </>
                   ) : null}
                   {step.rows?.length ? (
@@ -618,6 +629,46 @@ function AnalysisRunTrace({ run }: { run: AnalysisRun }) {
       {!run.steps.length ? (
         <p className="analysis-run-empty">Montane 正在从已发布指标中选择首轮总览。</p>
       ) : null}
+    </section>
+  );
+}
+
+function AnalysisSqlTrace({ run }: { run: AnalysisRun }) {
+  const sqlSteps = run.steps.filter(
+    (step): step is typeof step & { sql: string } => Boolean(step.sql),
+  );
+  if (!sqlSteps.length) return null;
+  return (
+    <section className="analysis-sql-trace" aria-label="本轮全部编译 SQL">
+      <div className="analysis-sql-heading">
+        <strong>本轮编译 SQL</strong>
+        <span>{sqlSteps.length} 条，按执行顺序保留</span>
+      </div>
+      <ol>
+        {sqlSteps.map((step, index) => (
+          <li key={step.callId}>
+            <details>
+              <summary>
+                <span className="analysis-sql-index">SQL {index + 1}</span>
+                <span className="analysis-sql-title">{step.title}</span>
+                <small>
+                  {step.status === "completed"
+                    ? `返回 ${step.rowCount ?? 0} 行`
+                    : step.status === "failed"
+                      ? "执行失败"
+                      : "执行中"}
+                </small>
+                <CaretRight
+                  className="analysis-sql-caret"
+                  aria-hidden="true"
+                  size={12}
+                />
+              </summary>
+              <pre><code>{`${step.sql}\n\n-- 参数：${JSON.stringify(step.parameters ?? [])}`}</code></pre>
+            </details>
+          </li>
+        ))}
+      </ol>
     </section>
   );
 }

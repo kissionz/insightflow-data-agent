@@ -231,6 +231,12 @@ export interface QueryIR {
     expression: string;
     start: string;
     endExclusive: string;
+    mode: "TO_DATE" | "FULL_PERIOD" | "ROLLING";
+    comparisonRanges?: Array<{
+      comparison: TimeComparisonCalculation["comparison"];
+      start: string;
+      endExclusive: string;
+    }>;
   };
   timeGrain?: {
     unit: TimeGrain;

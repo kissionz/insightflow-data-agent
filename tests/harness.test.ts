@@ -861,7 +861,7 @@ describe("DataAgentHarness", () => {
         onTextEnd() {},
         onToolStatus(call, status, result) {
           if (
-            call.id === "call_explore_duplicate" &&
+            call.id.startsWith("call_explore_duplicate") &&
             status === "failed"
           ) {
             rejectedPlanCodes.push(
@@ -875,12 +875,22 @@ describe("DataAgentHarness", () => {
     );
 
     expect(model.seenTools).toContain("DiscoverAnalysisSpace");
-    expect(rejectedPlanCodes).toContain("DUPLICATE_ANALYSIS_PLAN");
+    expect(rejectedPlanCodes).toEqual([
+      "DUPLICATE_ANALYSIS_PLAN",
+      "DUPLICATE_ANALYSIS_PLAN",
+      "DUPLICATE_ANALYSIS_PLAN",
+    ]);
+    expect(model.turnCount).toBe(9);
     expect(queries).toHaveLength(2);
     expect(queries[1]).toContain("member_level");
     expect(output.responseKind).toBe("analysis");
     expect(output.result?.rows).toEqual([{ 成交金额: 128000 }]);
     expect(output.answer).toContain("VIP");
+    const events = fs.readFileSync(
+      path.join(root, ".montane", "sessions", output.sessionId, "events.jsonl"),
+      "utf8",
+    );
+    expect(events).not.toContain('"type":"summary"');
     await harness.close();
     repository.close();
   });
@@ -1093,6 +1103,10 @@ class ExploratoryMontaneModel implements ModelClient {
   private step = 0;
   seenTools: string[] = [];
 
+  get turnCount(): number {
+    return this.step;
+  }
+
   async complete(options: {
     messages: AgentMessage[];
     tools: Array<Record<string, unknown>>;
@@ -1191,10 +1205,10 @@ class ExploratoryMontaneModel implements ModelClient {
         stopReason: "tool_use",
       };
     }
-    if (this.step === 6) {
+    if ([6, 7, 8].includes(this.step)) {
       return {
         toolCalls: [{
-          id: "call_explore_duplicate",
+          id: `call_explore_duplicate_${this.step}`,
           name: "ExecuteAnalysisPlan",
           args: {
             root_object_id: "o_order",
@@ -1206,7 +1220,7 @@ class ExploratoryMontaneModel implements ModelClient {
             result_kind: "aggregate",
             title: "会员等级贡献",
             analysis_step: {
-              id: "step_duplicate",
+              id: `step_duplicate_${this.step}`,
               objective: "重复确认会员等级贡献",
               rationale: "验证重复计划保护",
               role: "DIAGNOSTIC",

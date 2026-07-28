@@ -708,6 +708,170 @@ describe("QueryIrCompiler", () => {
     );
   });
 
+  it("filters grouped base and composite metrics after aggregation", () => {
+    const ontology = ontologyWithTime();
+    ontology.objects[0]!.properties.push({
+      id: "p_cost_amount",
+      name: "cost_amount",
+      label: "成本金额",
+      description: "订单成本",
+      dataType: "DECIMAL",
+      sourceColumn: "cost_amount",
+      sensitive: false,
+      meaning: "NUMBER",
+      unique: false,
+      valueSearchable: false,
+      numericSpec: {
+        kind: "CURRENCY",
+        currency: "CNY",
+        defaultAggregation: "SUM",
+        aggregationBehavior: "ADDITIVE",
+      },
+      visibility: "ANALYTICAL",
+      synonyms: [],
+      defaultDisplay: true,
+      exportable: true,
+      bindingPriority: 50,
+    });
+    ontology.metrics.push(
+      {
+        id: "m_cost",
+        metricType: "BASE",
+        name: "cost",
+        label: "成本额",
+        description: "成本金额合计",
+        objectId: "o_order",
+        expression: "SUM(fact_orders.cost_amount)",
+        definitionMode: "VISUAL",
+        sourcePropertyId: "p_cost_amount",
+        timePropertyId: "p_paid_at",
+        aggregation: "SUM",
+        format: "currency",
+        synonyms: [],
+        status: "PUBLISHED",
+      },
+      {
+        id: "m_profit",
+        metricType: "DERIVED",
+        name: "profit",
+        label: "毛利额",
+        description: "成交金额减成本额",
+        objectId: "o_order",
+        expression: "",
+        definitionMode: "VISUAL",
+        leftMetricId: "m_gmv",
+        rightMetricId: "m_cost",
+        calculationOperator: "SUBTRACT",
+        aggregation: "CUSTOM",
+        format: "currency",
+        synonyms: [],
+        status: "PUBLISHED",
+      },
+      {
+        id: "m_margin",
+        metricType: "DERIVED",
+        name: "margin",
+        label: "毛利率",
+        description: "毛利额除以成交金额",
+        objectId: "o_order",
+        expression: "",
+        definitionMode: "VISUAL",
+        leftMetricId: "m_profit",
+        rightMetricId: "m_gmv",
+        calculationOperator: "RATIO",
+        scale: 1,
+        aggregation: "CUSTOM",
+        format: "percent",
+        synonyms: [],
+        status: "PUBLISHED",
+      },
+    );
+    const compiler = new QueryIrCompiler(() => new Date(2026, 6, 28));
+    const compiled = compiler.compile(
+      {
+        rootObjectId: "o_order",
+        measureIds: ["m_gmv", "m_margin"],
+        dimensionPropertyIds: ["p_customer_level"],
+        filters: [],
+        aggregateFilterExpression: {
+          type: "GROUP",
+          operator: "AND",
+          children: [
+            {
+              type: "CONDITION",
+              filter: {
+                entityId: "m_gmv",
+                operator: "GT",
+                value: 30_000_000,
+              },
+            },
+            {
+              type: "CONDITION",
+              filter: {
+                entityId: "m_margin",
+                operator: "GT",
+                value: 0.75,
+              },
+            },
+          ],
+        },
+        timeRange: { expression: "今年" },
+        sort: [{ entityId: "m_gmv", direction: "DESC" }],
+        resultKind: "aggregate",
+        title: "今年高销售额高毛利率客户等级",
+      },
+      ontology,
+      [ordersTable(), customerTable()],
+    );
+
+    expect(compiled.sql).toContain("WITH `base` AS (");
+    expect(compiled.sql).toContain("`analyzed` AS (");
+    expect(compiled.sql).toContain("GROUP BY t1.`member_level`");
+    expect(compiled.sql).toContain("FROM `analyzed` AS a");
+    expect(compiled.sql).toContain(
+      "WHERE ((a.`成交金额` > ?) AND (a.`毛利率` > ?))",
+    );
+    expect(compiled.sql).not.toContain("t0.`pay_amount` > ?");
+    expect(compiled.parameters).toEqual([
+      "2026-01-01 00:00:00",
+      "2026-07-29 00:00:00",
+      30_000_000,
+      0.75,
+    ]);
+    expect(compiled.ir.aggregateFilters).toEqual([
+      { entityId: "m_gmv", operator: "GT", value: 30_000_000 },
+      { entityId: "m_margin", operator: "GT", value: 0.75 },
+    ]);
+    expect(compiled.bindings).toContainEqual(
+      expect.objectContaining({
+        label: "聚合后筛选",
+        value: "毛利率 > 0.75",
+        entityId: "m_margin",
+      }),
+    );
+  });
+
+  it("rejects aggregate filters that reference unselected metrics", () => {
+    const compiler = new QueryIrCompiler();
+    expect(() =>
+      compiler.compile(
+        {
+          rootObjectId: "o_order",
+          measureIds: ["m_gmv"],
+          dimensionPropertyIds: [],
+          filters: [],
+          aggregateFilters: [
+            { entityId: "m_missing", operator: "GT", value: 100 },
+          ],
+          resultKind: "aggregate",
+          title: "错误聚合筛选",
+        },
+        testOntology,
+        [ordersTable()],
+      ),
+    ).toThrow("聚合后筛选引用了未提交的指标或计算项");
+  });
+
   it("rejects semi-additive sums across a time grain", () => {
     const ontology = ontologyWithTime();
     ontology.objects[0]!.properties[1]!.numericSpec!.aggregationBehavior =
@@ -781,5 +945,19 @@ function storeTable(): PhysicalTable {
     columns: [],
     fingerprint: "dim_stores:v3",
     scannedAt: "2026-07-26T00:00:00.000Z",
+  };
+}
+
+function customerTable(): PhysicalTable {
+  return {
+    id: "t_customers",
+    catalog: "internal",
+    database: "retail",
+    name: "dim_customers",
+    type: "TABLE",
+    status: "MODELED",
+    columns: [],
+    fingerprint: "dim_customers:v1",
+    scannedAt: "2026-07-28T00:00:00.000Z",
   };
 }

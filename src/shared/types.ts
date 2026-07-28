@@ -156,6 +156,35 @@ export type AnalysisFilterExpression =
       child: AnalysisFilterExpression;
     };
 
+export type AggregateFilterOperator =
+  | "EQ"
+  | "NE"
+  | "GT"
+  | "GTE"
+  | "LT"
+  | "LTE";
+
+export interface AggregateAnalysisFilter {
+  entityId: string;
+  operator: AggregateFilterOperator;
+  value: number;
+}
+
+export type AggregateFilterExpression =
+  | {
+      type: "CONDITION";
+      filter: AggregateAnalysisFilter;
+    }
+  | {
+      type: "GROUP";
+      operator: "AND" | "OR";
+      children: AggregateFilterExpression[];
+    }
+  | {
+      type: "NOT";
+      child: AggregateFilterExpression;
+    };
+
 export interface DerivedMeasureCalculation {
   id: string;
   label: string;
@@ -192,6 +221,8 @@ export interface AnalysisIntent {
   dimensionPropertyIds: string[];
   filters: AnalysisFilter[];
   filterExpression?: AnalysisFilterExpression;
+  aggregateFilters?: AggregateAnalysisFilter[];
+  aggregateFilterExpression?: AggregateFilterExpression;
   timeRange?: {
     expression: string;
     propertyId?: string;
@@ -226,6 +257,8 @@ export interface QueryIR {
       })
   >;
   filterExpression?: AnalysisFilterExpression;
+  aggregateFilters: AggregateAnalysisFilter[];
+  aggregateFilterExpression?: AggregateFilterExpression;
   timeRange?: {
     propertyId: string;
     expression: string;

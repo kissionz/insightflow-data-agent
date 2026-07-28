@@ -43,6 +43,7 @@ const DATA_AGENT_SYSTEM_PROMPT = `
 4.1 当 intent_kind 为 EXPLORATORY_ANALYSIS 或 DIAGNOSTIC_ANALYSIS 时，在 OntologySearch 后调用一次 DiscoverAnalysisSpace，查看候选事实对象下已发布的指标、受控数字属性、时间和诊断维度。不得把“销售表现”等主题词伪造成正式指标。
 5. question_frame.business_value_terms 中的每个完整短语都必须且只能调用 PropertyValueSearch。不得把指标名、计算词或自己扩展的近义词提交为属性值。具体值的真实字段归属以全局已发布值索引为准。工具返回 resolved 时，后续筛选只能把 selectedMatch.valueBindingId 提交为 value_binding_id，不得重新选择 property_id 或改写值；返回 ambiguous 时必须让用户澄清。
 6. 你不能生成 SQL。完成语义理解后，必须调用 ExecuteAnalysisPlan，提交本体返回的对象、度量和维度属性 ID；业务值筛选只提交 value_binding_id。measure_ids 只能使用 metrics 中返回的 ID，其中既可能是正式指标，也可能是带默认聚合规则的数字属性。
+6.1 “各SPU销售额大于3000万”“毛利率大于75%”等按分组汇总后的指标阈值必须使用 aggregate_filters 或 aggregate_filter_expression，并引用指标/计算 ID。禁止把指标阈值改成来源属性 filters；前者是聚合后筛选，后者是明细行筛选。
 7. 用户要求按日、周、月、季度或年展示时，必须提交 time_grain，分别使用 DAY、WEEK、MONTH、QUARTER、YEAR；“月度趋势”不能把原始日期字段直接作为普通维度。
 8. 同比、环比、占比、差值、排名、累计或移动平均只能使用 ExecuteAnalysisPlan 提供的强类型计算结构；不得自行改写 SQL。同比使用 YEAR_OVER_YEAR，环比使用 PREVIOUS_PERIOD。
 8.1 OntologySearch 返回 metricType=DERIVED 的正式复合指标时，直接把该指标 ID 放入 measure_ids，不要再次用 derived_calculations 重建其公式；其依赖 DAG 由 IR 自动展开。
@@ -708,6 +709,7 @@ export class DataAgentHarness {
             "matches 是词形候选，不代表具体业务值的字段归属",
             "具体值必须调用 PropertyValueSearch 做全局值索引验证",
             "measure_ids 只能使用 metrics[].id；measureKind=PROPERTY 表示由数字属性默认聚合生成的受控度量",
+            "按维度汇总后的指标阈值必须使用 aggregate_filters/aggregate_filter_expression 并引用 metrics[].id；不得改成来源属性 filters",
             unpublishedMetricLabels.length
               ? `指标 ${unpublishedMetricLabels.join("、")} 仅存在于草稿，正式问数不可使用；请提示用户校验并发布草稿，不得重复搜索或改写近义词`
               : "不得对相同问题重复调用 OntologySearch；没有候选时应向用户澄清",
@@ -1240,6 +1242,17 @@ export class DataAgentHarness {
             description:
               "可选逻辑筛选树。提交后替代 filters；支持 CONDITION、AND/OR GROUP 和 NOT，最多四层。",
           },
+          aggregate_filters: {
+            type: "array",
+            description:
+              "聚合后指标筛选，等价于 HAVING/分层结果筛选。例如各SPU销售额大于3000万、毛利率大于75%。entity_id 必须引用已提交的指标或计算 ID，禁止改用来源属性 filters。",
+            items: aggregateFilterConditionSchema(),
+          },
+          aggregate_filter_expression: {
+            ...aggregateFilterExpressionSchema(4),
+            description:
+              "可选聚合后逻辑筛选树。提交后替代 aggregate_filters；支持 CONDITION、AND/OR GROUP 和 NOT，最多四层。",
+          },
           time_range: {
             type: "object",
             additionalProperties: false,
@@ -1425,6 +1438,8 @@ export class DataAgentHarness {
         anyOf: [
           { required: ["filters"] },
           { required: ["filter_expression"] },
+          { required: ["aggregate_filters"] },
+          { required: ["aggregate_filter_expression"] },
         ],
       },
       execute: async (args): Promise<ToolOutcome> => {
@@ -1496,15 +1511,24 @@ export class DataAgentHarness {
         try {
           intent = normalizeAnalysisIntent(args, valueBindings, ontology.version);
           intent = applyDeterministicTimeGrain(intent, frame, ontology);
+          validateQuestionFrameCoverage(frame, intent, ontology);
         } catch (error) {
+          const detail =
+            error instanceof Error ? error.message : "IR规则校验失败";
+          const aggregateCoverageError =
+            /aggregate_filters|聚合后筛选|HAVING/.test(detail);
           return {
             ok: false,
-            content:
-              error instanceof Error ? `IR规则校验失败：${error.message}` : "IR规则校验失败",
+            content: `IR规则校验失败：${detail}`,
             data: {
               stage: "planning",
+              code: aggregateCoverageError
+                ? "AGGREGATE_THRESHOLD_COVERAGE_REQUIRED"
+                : "INTENT_NORMALIZATION_FAILED",
               retryInstruction:
-                "具体业务值必须重新调用 PropertyValueSearch，并原样提交其 selected_match.value_binding_id。",
+                aggregateCoverageError
+                  ? "把每个分组汇总后的指标阈值原样放入 aggregate_filters 或 aggregate_filter_expression，entity_id 使用对应指标/计算 ID；不要改写为来源属性 filters。"
+                  : "具体业务值必须重新调用 PropertyValueSearch，并原样提交其 selected_match.value_binding_id。",
             },
           };
         }
@@ -1775,6 +1799,72 @@ function analysisFilterExpressionSchema(depth: number): Record<string, unknown> 
   };
 }
 
+function aggregateFilterConditionSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      entity_id: {
+        type: "string",
+        description:
+          "已提交的基础指标、正式复合指标或本轮计算 ID",
+      },
+      operator: {
+        type: "string",
+        enum: ["EQ", "NE", "GT", "GTE", "LT", "LTE"],
+      },
+      value: {
+        type: "number",
+        description:
+          "标准数值。3000万提交30000000，75%按比例指标提交0.75",
+      },
+    },
+    required: ["entity_id", "operator", "value"],
+  };
+}
+
+function aggregateFilterExpressionSchema(depth: number): Record<string, unknown> {
+  const condition = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      type: { type: "string", enum: ["CONDITION"] },
+      condition: aggregateFilterConditionSchema(),
+    },
+    required: ["type", "condition"],
+  };
+  if (depth <= 1) return condition;
+  const child = aggregateFilterExpressionSchema(depth - 1);
+  return {
+    oneOf: [
+      condition,
+      {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          type: { type: "string", enum: ["GROUP"] },
+          operator: { type: "string", enum: ["AND", "OR"] },
+          children: {
+            type: "array",
+            minItems: 2,
+            items: child,
+          },
+        },
+        required: ["type", "operator", "children"],
+      },
+      {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          type: { type: "string", enum: ["NOT"] },
+          child,
+        },
+        required: ["type", "child"],
+      },
+    ],
+  };
+}
+
 function normalizeAnalysisIntent(
   args: Record<string, unknown>,
   valueBindings: Map<string, ResolvedValueBinding>,
@@ -1794,6 +1884,16 @@ function normalizeAnalysisIntent(
         args.filter_expression as Record<string, unknown>,
         valueBindings,
         ontologyVersion,
+      )
+    : undefined;
+  const aggregateFilters = Array.isArray(args.aggregate_filters)
+    ? args.aggregate_filters.map((raw) =>
+        normalizeAggregateFilter(raw as Record<string, unknown>),
+      )
+    : [];
+  const aggregateFilterExpression = args.aggregate_filter_expression
+    ? normalizeAggregateFilterExpression(
+        args.aggregate_filter_expression as Record<string, unknown>,
       )
     : undefined;
   const rawTime = args.time_range as Record<string, unknown> | undefined;
@@ -1820,6 +1920,8 @@ function normalizeAnalysisIntent(
       : [],
     filters,
     filterExpression,
+    aggregateFilters,
+    aggregateFilterExpression,
     timeRange: rawTime?.expression
       ? {
           expression: String(rawTime.expression),
@@ -1930,6 +2032,181 @@ function applyDeterministicTimeGrain(
   };
 }
 
+interface MetricThresholdRequirement {
+  metricTerm: string;
+  operator: NonNullable<AnalysisIntent["aggregateFilters"]>[number]["operator"];
+  numericValue: number;
+  unit?: "万" | "亿" | "%";
+  sourceText: string;
+}
+
+function validateQuestionFrameCoverage(
+  frame: QuestionLanguageFrame,
+  intent: AnalysisIntent,
+  ontology: OntologySnapshot,
+): void {
+  if (intent.resultKind !== "aggregate") return;
+  const requirements = extractMetricThresholdRequirements(frame);
+  if (!requirements.length) return;
+  const aggregateFilters = intent.aggregateFilterExpression
+    ? flattenAggregateFilterExpression(intent.aggregateFilterExpression)
+    : intent.aggregateFilters ?? [];
+  const missing = requirements.filter((requirement) =>
+    !aggregateFilters.some((filter) =>
+      aggregateFilterCoversRequirement(
+        filter,
+        requirement,
+        intent,
+        ontology,
+      ),
+    ),
+  );
+  if (!missing.length) return;
+  throw new Error(
+    `指标阈值 ${missing.map((item) => `“${item.sourceText}”`).join("、")} 必须使用 aggregate_filters 或 aggregate_filter_expression 按分组汇总结果筛选；禁止改用来源属性 filters，否则会把 HAVING 语义错误降级为明细 WHERE`,
+  );
+}
+
+function extractMetricThresholdRequirements(
+  frame: QuestionLanguageFrame,
+): MetricThresholdRequirement[] {
+  const operators = [
+    ["大于等于", "GTE"],
+    ["不低于", "GTE"],
+    ["不少于", "GTE"],
+    ["至少", "GTE"],
+    [">=", "GTE"],
+    ["小于等于", "LTE"],
+    ["不高于", "LTE"],
+    ["不超过", "LTE"],
+    ["至多", "LTE"],
+    ["<=", "LTE"],
+    ["大于", "GT"],
+    ["超过", "GT"],
+    ["高于", "GT"],
+    [">", "GT"],
+    ["小于", "LT"],
+    ["低于", "LT"],
+    ["少于", "LT"],
+    ["<", "LT"],
+    ["不等于", "NE"],
+    ["!=", "NE"],
+    ["等于", "EQ"],
+    ["=", "EQ"],
+  ] as const;
+  const operatorPattern = operators
+    .map(([text]) => escapeRegExp(text))
+    .join("|");
+  const requirements: MetricThresholdRequirement[] = [];
+  for (const metricTerm of frame.metricTerms) {
+    const pattern = new RegExp(
+      `${escapeRegExp(metricTerm)}\\s*(${operatorPattern})\\s*([+-]?\\d[\\d,]*(?:\\.\\d+)?)\\s*(亿|万|%|％)?`,
+      "i",
+    );
+    const match = frame.originalQuestion.match(pattern);
+    if (!match) continue;
+    const operator = operators.find(([text]) => text === match[1])?.[1];
+    const rawNumber = Number(String(match[2]).replaceAll(",", ""));
+    if (!operator || !Number.isFinite(rawNumber)) continue;
+    const unit = match[3] === "％" ? "%" : match[3] as
+      | MetricThresholdRequirement["unit"]
+      | undefined;
+    requirements.push({
+      metricTerm,
+      operator,
+      numericValue: rawNumber,
+      unit,
+      sourceText: match[0],
+    });
+  }
+  return requirements;
+}
+
+function aggregateFilterCoversRequirement(
+  filter: NonNullable<AnalysisIntent["aggregateFilters"]>[number],
+  requirement: MetricThresholdRequirement,
+  intent: AnalysisIntent,
+  ontology: OntologySnapshot,
+): boolean {
+  const entity = resolveAggregateFilterEntity(
+    filter.entityId,
+    intent,
+    ontology,
+  );
+  if (!entity) return false;
+  const normalizedTerm = normalizePropertyValue(requirement.metricTerm);
+  if (
+    !entity.terms.some(
+      (term) => normalizePropertyValue(term) === normalizedTerm,
+    )
+  ) {
+    return false;
+  }
+  if (filter.operator !== requirement.operator) return false;
+  const expected =
+    requirement.unit === "亿"
+      ? requirement.numericValue * 100_000_000
+      : requirement.unit === "万"
+        ? requirement.numericValue * 10_000
+        : requirement.unit === "%"
+          ? entity.scale === 100
+            ? requirement.numericValue
+            : requirement.numericValue / 100
+          : requirement.numericValue;
+  return Math.abs(filter.value - expected) <= Math.max(1e-9, Math.abs(expected) * 1e-9);
+}
+
+function resolveAggregateFilterEntity(
+  entityId: string,
+  intent: AnalysisIntent,
+  ontology: OntologySnapshot,
+): { terms: string[]; scale?: number } | undefined {
+  const metric = ontology.metrics.find((candidate) => candidate.id === entityId);
+  if (metric && intent.measureIds.includes(entityId)) {
+    return {
+      terms: [metric.label, metric.name, ...metric.synonyms],
+      scale: metric.scale,
+    };
+  }
+  const propertyBinding = findPropertyBinding(ontology, entityId);
+  if (propertyBinding && intent.measureIds.includes(entityId)) {
+    return {
+      terms: [
+        propertyBinding.property.label,
+        propertyBinding.property.name,
+        ...propertyBinding.property.synonyms,
+      ],
+    };
+  }
+  const calculation = [
+    ...(intent.derivedMeasures ?? []),
+    ...(intent.timeComparisons ?? []),
+    ...(intent.windowCalculations ?? []),
+  ].find((candidate) => candidate.id === entityId);
+  if (!calculation) return undefined;
+  return {
+    terms: [calculation.label],
+    scale:
+      "scale" in calculation && typeof calculation.scale === "number"
+        ? calculation.scale
+        : undefined,
+  };
+}
+
+function flattenAggregateFilterExpression(
+  expression: NonNullable<AnalysisIntent["aggregateFilterExpression"]>,
+): NonNullable<AnalysisIntent["aggregateFilters"]> {
+  if (expression.type === "CONDITION") return [expression.filter];
+  if (expression.type === "NOT") {
+    return flattenAggregateFilterExpression(expression.child);
+  }
+  return expression.children.flatMap(flattenAggregateFilterExpression);
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function inferTimeGrain(
   frame: QuestionLanguageFrame,
 ): NonNullable<AnalysisIntent["timeGrain"]>["unit"] | undefined {
@@ -2033,6 +2310,57 @@ function normalizeFilterExpression(
     };
   }
   throw new Error(`不支持的筛选树节点：${type || "空"}`);
+}
+
+function normalizeAggregateFilter(
+  raw: Record<string, unknown>,
+): NonNullable<AnalysisIntent["aggregateFilters"]>[number] {
+  const value = Number(raw.value);
+  if (!Number.isFinite(value)) {
+    throw new Error("聚合后筛选值必须是有限数字");
+  }
+  return {
+    entityId: String(raw.entity_id ?? ""),
+    operator: String(raw.operator ?? "EQ") as NonNullable<
+      AnalysisIntent["aggregateFilters"]
+    >[number]["operator"],
+    value,
+  };
+}
+
+function normalizeAggregateFilterExpression(
+  raw: Record<string, unknown>,
+): NonNullable<AnalysisIntent["aggregateFilterExpression"]> {
+  const type = String(raw.type ?? "");
+  if (type === "CONDITION") {
+    const condition = raw.condition as Record<string, unknown> | undefined;
+    if (!condition) throw new Error("聚合筛选 CONDITION 节点缺少 condition");
+    return {
+      type: "CONDITION",
+      filter: normalizeAggregateFilter(condition),
+    };
+  }
+  if (type === "NOT") {
+    const child = raw.child as Record<string, unknown> | undefined;
+    if (!child) throw new Error("聚合筛选 NOT 节点缺少 child");
+    return {
+      type: "NOT",
+      child: normalizeAggregateFilterExpression(child),
+    };
+  }
+  if (type === "GROUP") {
+    const children = Array.isArray(raw.children) ? raw.children : [];
+    return {
+      type: "GROUP",
+      operator: raw.operator === "OR" ? "OR" : "AND",
+      children: children.map((child) =>
+        normalizeAggregateFilterExpression(
+          child as Record<string, unknown>,
+        ),
+      ),
+    };
+  }
+  throw new Error(`不支持的聚合筛选树节点：${type || "空"}`);
 }
 
 function effectiveGrainLabels(object: OntologyObject): string[] {
@@ -2432,6 +2760,8 @@ function stableAnalysisPlanHash(intent: AnalysisIntent): string {
     dimensionPropertyIds: [...intent.dimensionPropertyIds].sort(),
     filters: intent.filters,
     filterExpression: intent.filterExpression,
+    aggregateFilters: intent.aggregateFilters,
+    aggregateFilterExpression: intent.aggregateFilterExpression,
     timeRange: intent.timeRange,
     timeGrain: intent.timeGrain,
     derivedMeasures: intent.derivedMeasures,

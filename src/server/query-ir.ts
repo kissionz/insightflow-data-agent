@@ -62,6 +62,9 @@ export class QueryIrCompiler {
       }
       return { ...filter, binding };
     });
+    const aggregateFilters = intent.aggregateFilterExpression
+      ? flattenAggregateFilterExpression(intent.aggregateFilterExpression)
+      : intent.aggregateFilters ?? [];
     const inferredRootId =
       intent.rootObjectId ??
       measures[0]?.objectId ??
@@ -176,6 +179,11 @@ export class QueryIrCompiler {
       measureByReference,
       dimensions,
       timeBinding,
+    );
+    validateAggregateFilters(
+      intent,
+      aggregateFilters,
+      measureByReference,
     );
     for (const calculation of intent.derivedMeasures ?? []) {
       selectParts.push(
@@ -342,7 +350,9 @@ export class QueryIrCompiler {
       orderParts.push(`${quoteIdentifier(timeGrainLabel(intent.timeGrain.unit))} ASC`);
     }
     const advancedCalculations = Boolean(
-      intent.timeComparisons?.length || intent.windowCalculations?.length,
+      intent.timeComparisons?.length ||
+        intent.windowCalculations?.length ||
+        aggregateFilters.length,
     );
     const sql = advancedCalculations
       ? compileLayeredAnalysis({
@@ -405,6 +415,8 @@ export class QueryIrCompiler {
           : filter,
       ),
       filterExpression: intent.filterExpression,
+      aggregateFilters,
+      aggregateFilterExpression: intent.aggregateFilterExpression,
       timeRange: resolvedTime,
       timeGrain:
         intent.timeGrain && timeBinding
@@ -469,7 +481,7 @@ export class QueryIrCompiler {
       })),
       ...filters.map(({ binding, businessValue, value, ...filter }) => ({
         label: "筛选条件",
-        value: `${binding.property.label} = ${businessValue ?? formatValue(value)}`,
+        value: `${binding.property.label} ${filterOperatorLabel(filter.operator)} ${businessValue ?? formatValue(value)}`,
         source:
           filter.kind === "BOUND_VALUE"
             ? `${filter.evidenceTier === "EXACT_VALUE" ? "属性值精确索引" : "属性值前缀索引"} · ${aliases.has(binding.object.id) ? "直接筛选" : "关联对象 EXISTS"} · 优先级 ${filter.objectPriority}/${filter.propertyPriority}`
@@ -477,6 +489,12 @@ export class QueryIrCompiler {
               ? `属性值索引映射为 ${formatValue(value)}`
             : "属性值绑定",
         entityId: binding.property.id,
+      })),
+      ...aggregateFilters.map((filter) => ({
+        label: "聚合后筛选",
+        value: `${aggregateFilterEntityLabel(filter.entityId, intent, measureByReference)} ${filterOperatorLabel(filter.operator)} ${formatValue(filter.value)}`,
+        source: "IR 聚合结果筛选 · 分层 SQL",
+        entityId: filter.entityId,
       })),
       ...(resolvedTime && timeBinding
         ? [{
@@ -509,7 +527,7 @@ export class QueryIrCompiler {
         (intent.derivedMeasures?.length ?? 0) +
         (intent.timeComparisons?.length ?? 0) +
         (intent.windowCalculations?.length ?? 0)
-      } 个计算 · ${filters.length + (resolvedTime ? 1 : 0)} 个条件`,
+      } 个计算 · ${filters.length + aggregateFilters.length + (resolvedTime ? 1 : 0)} 个条件`,
     };
   }
 }
@@ -535,6 +553,34 @@ function compileFilterExpression(
   }
   return `(${expression.children
     .map((child) => compileFilterExpression(child, nextCondition))
+    .join(` ${expression.operator} `)})`;
+}
+
+function flattenAggregateFilterExpression(
+  expression: NonNullable<AnalysisIntent["aggregateFilterExpression"]>,
+): NonNullable<AnalysisIntent["aggregateFilters"]> {
+  if (expression.type === "CONDITION") return [expression.filter];
+  if (expression.type === "NOT") {
+    return flattenAggregateFilterExpression(expression.child);
+  }
+  return expression.children.flatMap(flattenAggregateFilterExpression);
+}
+
+function compileAggregateFilterExpression(
+  expression: NonNullable<AnalysisIntent["aggregateFilterExpression"]>,
+  nextCondition: () => string,
+): string {
+  if (expression.type === "CONDITION") return `(${nextCondition()})`;
+  if (expression.type === "NOT") {
+    return `(NOT ${compileAggregateFilterExpression(expression.child, nextCondition)})`;
+  }
+  if (expression.children.length < 2) {
+    throw new Error(`${expression.operator} 聚合条件组至少需要两个子条件`);
+  }
+  return `(${expression.children
+    .map((child) =>
+      compileAggregateFilterExpression(child, nextCondition),
+    )
     .join(` ${expression.operator} `)})`;
 }
 
@@ -634,6 +680,52 @@ function validateCalculations(
   ) {
     throw new Error("时间粒度和计算算法只能用于聚合查询");
   }
+}
+
+function validateAggregateFilters(
+  intent: AnalysisIntent,
+  filters: NonNullable<AnalysisIntent["aggregateFilters"]>,
+  measures: Map<string, Metric>,
+): void {
+  if (!filters.length) return;
+  if (intent.resultKind !== "aggregate") {
+    throw new Error("聚合后筛选只能用于聚合查询");
+  }
+  const calculationIds = new Set([
+    ...(intent.derivedMeasures ?? []).map((item) => item.id),
+    ...(intent.timeComparisons ?? []).map((item) => item.id),
+    ...(intent.windowCalculations ?? []).map((item) => item.id),
+  ]);
+  for (const filter of filters) {
+    if (!measures.has(filter.entityId) && !calculationIds.has(filter.entityId)) {
+      throw new Error(
+        `聚合后筛选引用了未提交的指标或计算项：${filter.entityId}`,
+      );
+    }
+    if (!Number.isFinite(filter.value)) {
+      throw new Error(
+        `聚合后筛选 ${filter.entityId} 的阈值必须是有限数字`,
+      );
+    }
+  }
+}
+
+function aggregateFilterEntityLabel(
+  entityId: string,
+  intent: AnalysisIntent,
+  measures: Map<string, Metric>,
+): string {
+  const metric = measures.get(entityId);
+  if (metric) return metric.label;
+  const calculation = [
+    ...(intent.derivedMeasures ?? []),
+    ...(intent.timeComparisons ?? []),
+    ...(intent.windowCalculations ?? []),
+  ].find((candidate) => candidate.id === entityId);
+  if (!calculation) {
+    throw new Error(`聚合后筛选引用了不存在的结果字段：${entityId}`);
+  }
+  return calculation.label;
 }
 
 function requireMeasureReference(
@@ -1007,7 +1099,7 @@ function compileLayeredAnalysis(context: LayeredAnalysisContext): string {
     dimensions,
     measureByReference,
   );
-  return [
+  const baseCte = [
     "WITH `base` AS (",
     `  SELECT ${baseSelect.join(", ")}`,
     `  FROM ${from}`,
@@ -1015,10 +1107,65 @@ function compileLayeredAnalysis(context: LayeredAnalysisContext): string {
     whereParts.length ? `  WHERE ${whereParts.join("\n    AND ")}` : "",
     baseGroups.length ? `  GROUP BY ${baseGroups.join(", ")}` : "",
     ")",
+  ].filter(Boolean);
+  const analyzedQuery = [
     `SELECT ${finalSelect.join(", ")}`,
     "FROM `base` AS c",
     ...comparisonJoins,
     finalWhere.length ? `WHERE ${finalWhere.join("\n  AND ")}` : "",
+  ].filter(Boolean);
+  const aggregateFilters = intent.aggregateFilterExpression
+    ? flattenAggregateFilterExpression(intent.aggregateFilterExpression)
+    : intent.aggregateFilters ?? [];
+  if (!aggregateFilters.length) {
+    return [
+      ...baseCte,
+      ...analyzedQuery,
+      finalOrder.length ? `ORDER BY ${finalOrder.join(", ")}` : "",
+      `LIMIT ${limit}`,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+  const compiledAggregateParts = aggregateFilters.map((filter) => {
+    parameters.push(filter.value);
+    return compileAggregateFilter(
+      `a.${quoteIdentifier(
+        aggregateFilterEntityLabel(
+          filter.entityId,
+          intent,
+          measureByReference,
+        ),
+      )}`,
+      filter.operator,
+    );
+  });
+  let conditionIndex = 0;
+  const aggregateWhere = intent.aggregateFilterExpression
+    ? compileAggregateFilterExpression(
+        intent.aggregateFilterExpression,
+        () => {
+          const part = compiledAggregateParts[conditionIndex];
+          conditionIndex += 1;
+          if (!part) {
+            throw new Error("聚合逻辑筛选树与筛选条件数量不一致");
+          }
+          return part;
+        },
+      )
+    : compiledAggregateParts.join("\n  AND ");
+  if (conditionIndex && conditionIndex !== compiledAggregateParts.length) {
+    throw new Error("聚合逻辑筛选树未覆盖全部筛选条件");
+  }
+  return [
+    ...baseCte.slice(0, -1),
+    "),",
+    "`analyzed` AS (",
+    ...analyzedQuery.map((line) => `  ${line}`),
+    ")",
+    "SELECT *",
+    "FROM `analyzed` AS a",
+    `WHERE ${aggregateWhere}`,
     finalOrder.length ? `ORDER BY ${finalOrder.join(", ")}` : "",
     `LIMIT ${limit}`,
   ]
@@ -1660,6 +1807,37 @@ function compileFilter(
   return `${column} ${symbol} ?`;
 }
 
+function compileAggregateFilter(
+  column: string,
+  operator: NonNullable<AnalysisIntent["aggregateFilters"]>[number]["operator"],
+): string {
+  const symbols = {
+    EQ: "=",
+    NE: "<>",
+    GT: ">",
+    GTE: ">=",
+    LT: "<",
+    LTE: "<=",
+  } as const;
+  return `${column} ${symbols[operator]} ?`;
+}
+
+function filterOperatorLabel(operator: QueryFilterOperator): string {
+  return {
+    EQ: "=",
+    NE: "≠",
+    GT: ">",
+    GTE: "≥",
+    LT: "<",
+    LTE: "≤",
+    IN: "属于",
+    CONTAINS: "包含",
+    PREFIX: "前缀为",
+    IS_NULL: "为空",
+    NOT_NULL: "不为空",
+  }[operator];
+}
+
 function resolveNaturalTimeRange(
   expression: string,
   now: Date,
@@ -1861,8 +2039,8 @@ function effectiveGrainLabel(object: OntologyObject): string {
   return labels.length ? labels.join(" + ") : object.grain || "明细行";
 }
 
-function formatValue(value: string | string[] | undefined): string {
-  return Array.isArray(value) ? value.join("、") : value ?? "未提供";
+function formatValue(value: string | string[] | number | undefined): string {
+  return Array.isArray(value) ? value.join("、") : String(value ?? "未提供");
 }
 
 function escapeRegex(value: string): string {

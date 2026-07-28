@@ -158,14 +158,26 @@ export class SelectDbClient {
 
     const guarded = guardReadOnlySql(sql, maxRows);
     const startedAt = performance.now();
-    const [rows, fields] = await this.pool.query(
-      {
-        sql: guarded.sql,
-        timeout: timeoutMs,
-        rowsAsArray: false,
-      },
-      parameters,
-    );
+    const execute = async () => {
+      const pool = this.pool;
+      if (!pool) throw new Error("SelectDB 尚未连接");
+      return pool.query(
+        {
+          sql: guarded.sql,
+          timeout: timeoutMs,
+          rowsAsArray: false,
+        },
+        parameters,
+      );
+    };
+    let response;
+    try {
+      response = await execute();
+    } catch (error) {
+      if (!isRetryableConnectionError(error)) throw error;
+      response = await execute();
+    }
+    const [rows, fields] = response;
     const records = rows as RowDataPacket[];
 
     return {
@@ -206,5 +218,23 @@ function connectionFingerprint(
 function isSensitiveColumn(name: string): boolean {
   return /(^|_)(phone|mobile|email|address|id_card|identity|password|secret|token)(_|$)/i.test(
     name,
+  );
+}
+
+function isRetryableConnectionError(error: unknown): boolean {
+  const code =
+    error && typeof error === "object" && "code" in error
+      ? String(error.code)
+      : "";
+  const message = error instanceof Error ? error.message : String(error);
+  return (
+    [
+      "ETIMEDOUT",
+      "ECONNRESET",
+      "EPIPE",
+      "PROTOCOL_CONNECTION_LOST",
+      "PROTOCOL_ENQUEUE_AFTER_FATAL_ERROR",
+    ].includes(code) ||
+    /closed state|connection.*closed|socket.*closed/i.test(message)
   );
 }

@@ -256,6 +256,145 @@ describe("DataAgentHarness", () => {
     repository.close();
   });
 
+  it("rejects row-filter downgrades and executes metric thresholds after aggregation", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-harness-"));
+    roots.push(root);
+    const repository = new Repository(
+      path.join(root, ".montane/data-agent/ontology.sqlite"),
+    );
+    const ontology = ontologyWithGrossMargin();
+    repository.saveOntology(ontology);
+    repository.upsertScannedTables([
+      {
+        id: "t_orders",
+        catalog: "internal",
+        database: "retail",
+        name: "fact_orders",
+        type: "TABLE",
+        status: "MODELED",
+        columns: [],
+        fingerprint: "fact_orders:aggregate-filter",
+        scannedAt: "2026-07-28T00:00:00.000Z",
+      },
+      {
+        id: "t_customers",
+        catalog: "internal",
+        database: "retail",
+        name: "dim_customers",
+        type: "TABLE",
+        status: "MODELED",
+        columns: [],
+        fingerprint: "dim_customers:aggregate-filter",
+        scannedAt: "2026-07-28T00:00:00.000Z",
+      },
+    ]);
+    repository.saveDataSource({
+      configured: true,
+      host: "selectdb.test",
+      port: 9030,
+      username: "reader",
+      database: "retail",
+      catalog: "internal",
+      tls: false,
+      passwordStored: true,
+    });
+    const queries: Array<{ sql: string; parameters?: unknown[] }> = [];
+    const captures: unknown[] = [];
+    const harness = new DataAgentHarness(
+      root,
+      repository,
+      async (sql, _maxRows, parameters) => {
+        queries.push({ sql, parameters });
+        return {
+          columns: ["会员等级", "成交金额", "毛利率"],
+          rows: [{ 会员等级: "VIP", 成交金额: 42_000_000, 毛利率: 0.8 }],
+          durationMs: 12,
+          truncated: false,
+        };
+      },
+      () => runtimeFor(new ScriptedMontaneModel()),
+    );
+    const frame = {
+      originalQuestion: "今年各会员等级销售额大于3000万，且毛利率大于75%的有哪些",
+      intentKind: "DIRECT_QUERY" as const,
+      metricTerms: ["销售额", "毛利率"],
+      timeTerms: ["今年"],
+      objectTerms: [],
+      businessValueTerms: [],
+      groupingTerms: ["会员等级"],
+      calculationTerms: ["大于3000万", "大于75%"],
+      presentation: { kind: "TABLE" as const, sortDirection: "DESC" as const },
+    };
+    const tool = (
+      harness as unknown as {
+        executeAnalysisPlanTool(
+          capture: (analysis: unknown) => void,
+          timezone: string,
+          valueBindings: Map<string, never>,
+          getFrame: () => typeof frame,
+        ): Tool;
+      }
+    ).executeAnalysisPlanTool(
+      (analysis) => captures.push(analysis),
+      "Asia/Shanghai",
+      new Map(),
+      () => frame,
+    );
+
+    const downgraded = await tool.execute({
+      root_object_id: "o_order",
+      measure_ids: ["m_gmv", "m_margin"],
+      dimension_property_ids: ["p_customer_level"],
+      filters: [
+        {
+          property_id: "p_order_amount",
+          operator: "GT",
+          value: "30000000",
+        },
+      ],
+      result_kind: "aggregate",
+      title: "错误降级计划",
+    });
+
+    expect(downgraded.ok).toBe(false);
+    expect(downgraded.content).toContain("aggregate_filters");
+    expect(downgraded.content).toContain("HAVING");
+    expect(downgraded.data).toMatchObject({
+      code: "AGGREGATE_THRESHOLD_COVERAGE_REQUIRED",
+    });
+    expect(queries).toHaveLength(0);
+    expect(captures).toHaveLength(0);
+
+    const corrected = await tool.execute({
+      root_object_id: "o_order",
+      measure_ids: ["m_gmv", "m_margin"],
+      dimension_property_ids: ["p_customer_level"],
+      filters: [],
+      aggregate_filters: [
+        { entity_id: "m_gmv", operator: "GT", value: 30_000_000 },
+        { entity_id: "m_margin", operator: "GT", value: 0.75 },
+      ],
+      time_range: {
+        expression: "今年",
+        property_id: "p_paid_at",
+      },
+      sort: [{ entity_id: "m_gmv", direction: "DESC" }],
+      result_kind: "aggregate",
+      title: "今年高销售额高毛利率会员等级",
+    });
+
+    expect(corrected.ok).toBe(true);
+    expect(queries).toHaveLength(1);
+    expect(queries[0]!.sql).toContain("FROM `analyzed` AS a");
+    expect(queries[0]!.sql).toContain("a.`成交金额` > ?");
+    expect(queries[0]!.sql).toContain("a.`毛利率` > ?");
+    expect(queries[0]!.sql).not.toContain("t0.`pay_amount` > ?");
+    expect(queries[0]!.parameters?.slice(-2)).toEqual([30_000_000, 0.75]);
+    expect(captures).toHaveLength(1);
+    await harness.close();
+    repository.close();
+  });
+
   it("deterministically restores monthly grain when Montane omits time_grain", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-harness-"));
     roots.push(root);
@@ -1234,6 +1373,109 @@ class ExploratoryMontaneModel implements ModelClient {
     options.onTextDelta?.(finalText);
     return { finalText, stopReason: "end_turn" };
   }
+}
+
+function ontologyWithGrossMargin() {
+  const ontology = structuredClone(testOntology);
+  const order = ontology.objects.find((object) => object.id === "o_order")!;
+  order.defaultTimePropertyId = "p_paid_at";
+  order.properties.push(
+    {
+      id: "p_paid_at",
+      name: "paid_at",
+      label: "支付日期",
+      description: "支付完成日期",
+      dataType: "DATETIME",
+      sourceColumn: "paid_at",
+      sensitive: false,
+      meaning: "TIME",
+      unique: false,
+      valueSearchable: false,
+      visibility: "ANALYTICAL",
+      synonyms: ["日期"],
+      defaultDisplay: true,
+      exportable: true,
+      bindingPriority: 50,
+    },
+    {
+      id: "p_cost_amount",
+      name: "cost_amount",
+      label: "成本金额",
+      description: "订单成本",
+      dataType: "DECIMAL",
+      sourceColumn: "cost_amount",
+      sensitive: false,
+      meaning: "NUMBER",
+      unique: false,
+      valueSearchable: false,
+      numericSpec: {
+        kind: "CURRENCY",
+        currency: "CNY",
+        defaultAggregation: "SUM",
+        aggregationBehavior: "ADDITIVE",
+      },
+      visibility: "ANALYTICAL",
+      synonyms: [],
+      defaultDisplay: true,
+      exportable: true,
+      bindingPriority: 50,
+    },
+  );
+  ontology.metrics[0]!.timePropertyId = "p_paid_at";
+  ontology.metrics.push(
+    {
+      id: "m_cost",
+      metricType: "BASE",
+      name: "cost",
+      label: "成本额",
+      description: "成本金额合计",
+      objectId: "o_order",
+      expression: "SUM(fact_orders.cost_amount)",
+      definitionMode: "VISUAL",
+      sourcePropertyId: "p_cost_amount",
+      timePropertyId: "p_paid_at",
+      aggregation: "SUM",
+      format: "currency",
+      synonyms: [],
+      status: "PUBLISHED",
+    },
+    {
+      id: "m_profit",
+      metricType: "DERIVED",
+      name: "profit",
+      label: "毛利额",
+      description: "成交金额减成本额",
+      objectId: "o_order",
+      expression: "",
+      definitionMode: "VISUAL",
+      leftMetricId: "m_gmv",
+      rightMetricId: "m_cost",
+      calculationOperator: "SUBTRACT",
+      aggregation: "CUSTOM",
+      format: "currency",
+      synonyms: [],
+      status: "PUBLISHED",
+    },
+    {
+      id: "m_margin",
+      metricType: "DERIVED",
+      name: "margin",
+      label: "毛利率",
+      description: "毛利额除以成交金额",
+      objectId: "o_order",
+      expression: "",
+      definitionMode: "VISUAL",
+      leftMetricId: "m_profit",
+      rightMetricId: "m_gmv",
+      calculationOperator: "RATIO",
+      scale: 1,
+      aggregation: "CUSTOM",
+      format: "percent",
+      synonyms: [],
+      status: "PUBLISHED",
+    },
+  );
+  return ontology;
 }
 
 async function runtimeFor(client: ModelClient): Promise<ConfiguredModelRuntime> {

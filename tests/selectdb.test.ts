@@ -62,6 +62,31 @@ describe("SelectDbClient", () => {
     await client.close();
     expect(closedPools).toBe(2);
   });
+
+  it("retries one read-only query after a transient connection read failure", async () => {
+    let queries = 0;
+    const client = new SelectDbClient(() => {
+      return {
+        async query() {
+          queries += 1;
+          if (queries === 1) {
+            throw Object.assign(new Error("read ETIMEDOUT"), {
+              code: "ETIMEDOUT",
+            });
+          }
+          return [[{ value: 42 }], [{ name: "value" }]];
+        },
+        async end() {},
+      } as unknown as Pool;
+    });
+
+    await client.configure(config(), "secret");
+    const result = await client.query("SELECT 42 AS value", 180_000, 10);
+
+    expect(queries).toBe(2);
+    expect(result.rows).toEqual([{ value: 42 }]);
+    await client.close();
+  });
 });
 
 function config(): SafeDataSourceConfig {

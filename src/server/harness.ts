@@ -2163,8 +2163,22 @@ function resolveAggregateFilterEntity(
 ): { terms: string[]; scale?: number } | undefined {
   const metric = ontology.metrics.find((candidate) => candidate.id === entityId);
   if (metric && intent.measureIds.includes(entityId)) {
+    const sourceProperty = metric.sourcePropertyId
+      ? findPropertyBinding(ontology, metric.sourcePropertyId)?.property
+      : undefined;
     return {
-      terms: [metric.label, metric.name, ...metric.synonyms],
+      terms: [
+        metric.label,
+        metric.name,
+        ...metric.synonyms,
+        ...(sourceProperty
+          ? [
+              sourceProperty.label,
+              sourceProperty.name,
+              ...sourceProperty.synonyms,
+            ]
+          : []),
+      ],
       scale: metric.scale,
     };
   }

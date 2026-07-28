@@ -263,6 +263,14 @@ describe("DataAgentHarness", () => {
       path.join(root, ".montane/data-agent/ontology.sqlite"),
     );
     const ontology = ontologyWithGrossMargin();
+    const salesMetric = ontology.metrics.find((metric) => metric.id === "m_gmv")!;
+    salesMetric.label = "销售额";
+    salesMetric.synonyms = [];
+    const salesProperty = ontology.objects[0]!.properties.find(
+      (property) => property.id === "p_order_amount",
+    )!;
+    salesProperty.label = "销售金额";
+    salesProperty.synonyms = [];
     repository.saveOntology(ontology);
     repository.upsertScannedTables([
       {
@@ -306,8 +314,8 @@ describe("DataAgentHarness", () => {
       async (sql, _maxRows, parameters) => {
         queries.push({ sql, parameters });
         return {
-          columns: ["会员等级", "成交金额", "毛利率"],
-          rows: [{ 会员等级: "VIP", 成交金额: 42_000_000, 毛利率: 0.8 }],
+          columns: ["会员等级", "销售额", "毛利率"],
+          rows: [{ 会员等级: "VIP", 销售额: 42_000_000, 毛利率: 0.8 }],
           durationMs: 12,
           truncated: false,
         };
@@ -315,9 +323,9 @@ describe("DataAgentHarness", () => {
       () => runtimeFor(new ScriptedMontaneModel()),
     );
     const frame = {
-      originalQuestion: "今年各会员等级销售额大于3000万，且毛利率大于75%的有哪些",
+      originalQuestion: "今年各会员等级销售金额大于3000万，且毛利率大于75%的有哪些",
       intentKind: "DIRECT_QUERY" as const,
-      metricTerms: ["销售额", "毛利率"],
+      metricTerms: ["销售金额", "毛利率"],
       timeTerms: ["今年"],
       objectTerms: [],
       businessValueTerms: [],
@@ -386,7 +394,7 @@ describe("DataAgentHarness", () => {
     expect(corrected.ok).toBe(true);
     expect(queries).toHaveLength(1);
     expect(queries[0]!.sql).toContain("FROM `analyzed` AS a");
-    expect(queries[0]!.sql).toContain("a.`成交金额` > ?");
+    expect(queries[0]!.sql).toContain("a.`销售额` > ?");
     expect(queries[0]!.sql).toContain("a.`毛利率` > ?");
     expect(queries[0]!.sql).not.toContain("t0.`pay_amount` > ?");
     expect(queries[0]!.parameters?.slice(-2)).toEqual([30_000_000, 0.75]);

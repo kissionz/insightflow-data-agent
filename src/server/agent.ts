@@ -5,6 +5,7 @@ import type {
   ToolStatus,
 } from "montane-code";
 import type {
+  AnalysisAcceptanceContract,
   AnalysisRun,
   AnalysisRunStep,
   TraceStep,
@@ -138,14 +139,25 @@ export class DataAgent {
       );
       const output = await this.harness.run(conversation, turn, reporter);
       if (turn.analysisRun) {
+        if (output.acceptanceContract) {
+          turn.analysisRun.acceptance = output.acceptanceContract;
+        }
         turn.analysisRun.status =
-          output.responseKind === "analysis" ? "completed" : "failed";
+          output.responseKind === "analysis"
+            ? "completed"
+            : output.acceptanceContract?.status === "PARTIAL_BUDGET"
+              ? "partial_budget"
+              : output.responseKind === "partial_analysis"
+                ? "partial_no_progress"
+                : "failed";
       }
       completeUnusedTrace(turn, output.responseKind);
       turn.status =
         output.responseKind === "configuration_required" ||
         output.responseKind === "clarification"
           ? "needs_clarification"
+          : output.responseKind === "partial_analysis"
+            ? "partial"
           : "completed";
       turn.answer = output.answer;
       turn.responseKind = output.responseKind;
@@ -274,6 +286,7 @@ class HarnessTurnReporter implements AgentReporter {
               calculationTerms?: string[];
               presentation?: { kind?: string };
             };
+            acceptanceContract?: AnalysisAcceptanceContract;
           }
         | undefined;
       const frame = data?.frame;
@@ -291,6 +304,12 @@ class HarnessTurnReporter implements AgentReporter {
         ["分组", frame?.groupingTerms],
         ["计算方式", frame?.calculationTerms],
         ["展现形式", frame?.presentation?.kind ? [frame.presentation.kind] : []],
+        [
+          "验收标准",
+          data?.acceptanceContract?.criteria
+            .filter((criterion) => criterion.required)
+            .map((criterion) => criterion.label),
+        ],
       ] as const;
       this.update("understanding", "completed", {
         summary: "问题语言框架已确认，开始进行本体和值证据绑定",
@@ -302,15 +321,13 @@ class HarnessTurnReporter implements AgentReporter {
             source: "Montane 结构化理解",
           })),
       });
-      if (
-        frame?.intentKind === "EXPLORATORY_ANALYSIS" ||
-        frame?.intentKind === "DIAGNOSTIC_ANALYSIS"
-      ) {
+      if (frame?.intentKind && data?.acceptanceContract) {
         this.analysisRun = {
-          mode: frame.intentKind,
-          objective: frame.originalQuestion ?? "开放式业务分析",
+          mode: frame.intentKind as AnalysisRun["mode"],
+          objective: frame.originalQuestion ?? "数据分析",
           status: "planning",
-          maxSteps: 4,
+          maxSteps: data.acceptanceContract.maxSuccessfulQueries,
+          acceptance: data.acceptanceContract,
           availableMetrics: [],
           availableDimensions: [],
           steps: [],
@@ -349,6 +366,7 @@ class HarnessTurnReporter implements AgentReporter {
               }>;
             }>;
             limits?: { maxSuccessfulQueries?: number };
+            acceptanceContract?: AnalysisAcceptanceContract;
           }
         | undefined;
       const space = data?.spaces?.[0];
@@ -382,6 +400,8 @@ class HarnessTurnReporter implements AgentReporter {
           status: "running",
           maxSteps:
             data?.limits?.maxSuccessfulQueries ?? this.analysisRun.maxSteps,
+          acceptance:
+            data?.acceptanceContract ?? this.analysisRun.acceptance,
           rootObjectId: space?.object?.id,
           rootObjectLabel: space?.object?.label,
           availableMetrics: selectedSpace?.metrics ?? [],
@@ -411,9 +431,11 @@ class HarnessTurnReporter implements AgentReporter {
             source: "分析空间",
           },
           {
-            label: "查询预算",
-            value: `${data?.limits?.maxSuccessfulQueries ?? 4} 步`,
-            source: "受控分析循环",
+            label: "验收进度",
+            value: `${data?.acceptanceContract?.criteria.filter((criterion) =>
+              ["SATISFIED", "NOT_APPLICABLE"].includes(criterion.status)
+            ).length ?? 0}/${data?.acceptanceContract?.criteria.length ?? 0}`,
+            source: "验收契约",
           },
         ],
       });
@@ -899,6 +921,9 @@ class HarnessTurnReporter implements AgentReporter {
       role: ["DIAGNOSTIC", "SUPPORTING"].includes(String(raw?.role))
         ? String(raw?.role) as AnalysisRunStep["role"]
         : "OVERVIEW",
+      acceptanceCriterionIds: Array.isArray(raw?.acceptance_criterion_ids)
+        ? raw.acceptance_criterion_ids.map(String)
+        : undefined,
       status: "running",
       summary: "IR 正在校验并执行",
       startedAt: new Date().toISOString(),
@@ -926,6 +951,10 @@ class HarnessTurnReporter implements AgentReporter {
       rowCount?: number;
       truncated?: boolean;
       observation?: Record<string, unknown>;
+      analysisStep?: {
+        acceptanceCriterionIds?: string[];
+      };
+      acceptanceContract?: AnalysisAcceptanceContract;
     };
     const executedSpace = data.ir?.rootObjectId
       ? this.analysisSpaces.get(data.ir.rootObjectId)
@@ -939,6 +968,8 @@ class HarnessTurnReporter implements AgentReporter {
         executedSpace?.metrics ?? this.analysisRun.availableMetrics,
       availableDimensions:
         executedSpace?.dimensions ?? this.analysisRun.availableDimensions,
+      acceptance:
+        data.acceptanceContract ?? this.analysisRun.acceptance,
       steps: this.analysisRun.steps.map((step) =>
         step.callId === call.id
           ? {
@@ -955,6 +986,9 @@ class HarnessTurnReporter implements AgentReporter {
               rows: data.rows,
               rowCount: data.rowCount,
               truncated: data.truncated,
+              acceptanceCriterionIds:
+                data.analysisStep?.acceptanceCriterionIds ??
+                step.acceptanceCriterionIds,
               error: status === "failed" ? result?.content : undefined,
               completedAt: new Date().toISOString(),
             }
@@ -985,7 +1019,11 @@ function completeUnusedTrace(
       ? "本轮为一般对话，无需执行数据分析步骤"
       : responseKind === "configuration_required"
         ? "真实分析运行条件未就绪，本步骤未执行"
-        : "需要补充分析条件，本步骤未执行";
+        : responseKind === "analysis"
+          ? "验收契约已经满足，本步骤无需继续执行"
+          : responseKind === "partial_analysis"
+            ? "本轮已停止，仍有验收缺口未覆盖"
+            : "需要补充分析条件，本步骤未执行";
 
   turn.trace = turn.trace.map((step) => {
     if (step.status === "completed" || step.status === "failed") return step;

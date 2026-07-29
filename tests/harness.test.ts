@@ -1096,9 +1096,9 @@ describe("DataAgentHarness", () => {
 
     expect(model.seenTools).toContain("DiscoverAnalysisSpace");
     expect(rejectedPlanCodes).toEqual([
-      "DUPLICATE_ANALYSIS_PLAN",
-      "DUPLICATE_ANALYSIS_PLAN",
-      "DUPLICATE_ANALYSIS_PLAN",
+      "ACCEPTANCE_CONTRACT_SATISFIED",
+      "ACCEPTANCE_CONTRACT_SATISFIED",
+      "ACCEPTANCE_CONTRACT_SATISFIED",
     ]);
     expect(model.turnCount).toBe(9);
     expect(queries).toHaveLength(2);
@@ -1111,6 +1111,243 @@ describe("DataAgentHarness", () => {
       "utf8",
     );
     expect(events).not.toContain('"type":"summary"');
+    await harness.close();
+    repository.close();
+  });
+
+  it("allows a direct question to run a corrective query until its acceptance contract is satisfied", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-harness-"));
+    roots.push(root);
+    const repository = new Repository(
+      path.join(root, ".montane/data-agent/ontology.sqlite"),
+    );
+    repository.saveOntology(testOntology);
+    repository.upsertScannedTables([{
+      id: "t_orders",
+      catalog: "internal",
+      database: "retail",
+      name: "fact_orders",
+      type: "TABLE",
+      status: "MODELED",
+      columns: [],
+      fingerprint: "fact_orders:acceptance-direct",
+      scannedAt: "2026-07-29T00:00:00.000Z",
+    }]);
+    repository.saveDataSource({
+      ...repository.getDataSource(),
+      configured: true,
+      host: "selectdb.test",
+      port: 9030,
+      username: "reader",
+      database: "retail",
+      catalog: "internal",
+      tls: false,
+      passwordStored: true,
+    });
+    const conversation = createConversation();
+    repository.saveConversation(conversation);
+    const model = new CorrectiveDirectMontaneModel();
+    const queries: string[] = [];
+    const failures: string[] = [];
+    const harness = new DataAgentHarness(
+      root,
+      repository,
+      async (sql) => {
+        queries.push(sql);
+        return queries.length === 1
+          ? {
+              columns: ["会员等级", "成交金额"],
+              rows: [{ 会员等级: "VIP", 成交金额: 128000 }],
+              durationMs: 8,
+              truncated: true,
+            }
+          : {
+              columns: ["成交金额"],
+              rows: [{ 成交金额: 128000 }],
+              durationMs: 9,
+              truncated: false,
+            };
+      },
+      () => runtimeFor(model),
+    );
+
+    const output = await harness.run(
+      conversation,
+      {
+        id: "turn_direct_correction",
+        conversationId: conversation.id,
+        question: "订单成交金额是多少",
+        status: "planning",
+        createdAt: new Date().toISOString(),
+        ontologyVersion: testOntology.version,
+        trace: [],
+      },
+      {
+        onTextDelta() {},
+        onTextEnd() {},
+        onToolStatus(_call, status, result) {
+          if (status === "failed") failures.push(result?.content ?? "");
+        },
+      },
+    );
+
+    expect(queries, failures.join("\n")).toHaveLength(2);
+    expect(output.responseKind).toBe("analysis");
+    expect(output.acceptanceContract?.status).toBe("SATISFIED");
+    expect(output.result?.truncated).toBe(false);
+    expect(output.result?.rows).toEqual([{ 成交金额: 128000 }]);
+    await harness.close();
+    repository.close();
+  });
+
+  it("marks an exploratory answer partial when required evidence gaps remain", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-harness-"));
+    roots.push(root);
+    const repository = new Repository(
+      path.join(root, ".montane/data-agent/ontology.sqlite"),
+    );
+    const ontology = ontologyWithGrossMargin();
+    repository.saveOntology(ontology);
+    repository.upsertScannedTables([{
+      id: "t_orders",
+      catalog: "internal",
+      database: "retail",
+      name: "fact_orders",
+      type: "TABLE",
+      status: "MODELED",
+      columns: [],
+      fingerprint: "fact_orders:acceptance-exploration",
+      scannedAt: "2026-07-29T00:00:00.000Z",
+    }]);
+    repository.saveDataSource({
+      ...repository.getDataSource(),
+      configured: true,
+      host: "selectdb.test",
+      port: 9030,
+      username: "reader",
+      database: "retail",
+      catalog: "internal",
+      tls: false,
+      passwordStored: true,
+    });
+    const conversation = createConversation();
+    repository.saveConversation(conversation);
+    const failures: string[] = [];
+    const harness = new DataAgentHarness(
+      root,
+      repository,
+      async () => ({
+        columns: ["成交金额", "成本额"],
+        rows: [{ 成交金额: 128000, 成本额: 56000 }],
+        durationMs: 8,
+        truncated: false,
+      }),
+      () => runtimeFor(new IncompleteExplorationMontaneModel()),
+    );
+
+    const output = await harness.run(
+      conversation,
+      {
+        id: "turn_partial_exploration",
+        conversationId: conversation.id,
+        question: "分析订单销售表现",
+        status: "planning",
+        createdAt: new Date().toISOString(),
+        ontologyVersion: ontology.version,
+        trace: [],
+      },
+      {
+        onTextDelta() {},
+        onTextEnd() {},
+        onToolStatus(_call, status, result) {
+          if (status === "failed") failures.push(result?.content ?? "");
+        },
+      },
+    );
+
+    expect(output.responseKind, failures.join("\n")).toBe("partial_analysis");
+    expect(output.acceptanceContract?.status).toBe("PARTIAL_NO_PROGRESS");
+    expect(output.answer).toContain("部分完成");
+    expect(output.answer).toContain("时间变化已覆盖");
+    expect(output.answer).toContain("主要结构已覆盖");
+    await harness.close();
+    repository.close();
+  });
+
+  it("treats query-budget exhaustion as partial instead of successful completion", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-harness-"));
+    roots.push(root);
+    const repository = new Repository(
+      path.join(root, ".montane/data-agent/ontology.sqlite"),
+    );
+    const ontology = ontologyWithGrossMargin();
+    repository.saveOntology(ontology);
+    repository.upsertScannedTables([{
+      id: "t_orders",
+      catalog: "internal",
+      database: "retail",
+      name: "fact_orders",
+      type: "TABLE",
+      status: "MODELED",
+      columns: [],
+      fingerprint: "fact_orders:acceptance-budget",
+      scannedAt: "2026-07-29T00:00:00.000Z",
+    }]);
+    repository.saveDataSource({
+      ...repository.getDataSource(),
+      configured: true,
+      host: "selectdb.test",
+      port: 9030,
+      username: "reader",
+      database: "retail",
+      catalog: "internal",
+      tls: false,
+      passwordStored: true,
+    });
+    const conversation = createConversation();
+    repository.saveConversation(conversation);
+    const queries: string[] = [];
+    const harness = new DataAgentHarness(
+      root,
+      repository,
+      async (sql) => {
+        queries.push(sql);
+        return {
+          columns: queries.length === 1
+            ? ["成交金额"]
+            : ["时间", "成交金额"],
+          rows: queries.length === 1
+            ? [{ 成交金额: 128000 }]
+            : [{ 时间: "2026-01-01", 成交金额: 128000 }],
+          durationMs: 8,
+          truncated: false,
+        };
+      },
+      () => runtimeFor(new BudgetLimitedDiagnosticMontaneModel()),
+    );
+
+    const output = await harness.run(
+      conversation,
+      {
+        id: "turn_budget_diagnostic",
+        conversationId: conversation.id,
+        question: "为什么订单成交金额下降",
+        status: "planning",
+        createdAt: new Date().toISOString(),
+        ontologyVersion: ontology.version,
+        trace: [],
+      },
+      {
+        onTextDelta() {},
+        onTextEnd() {},
+        onToolStatus() {},
+      },
+    );
+
+    expect(queries).toHaveLength(4);
+    expect(output.responseKind).toBe("partial_analysis");
+    expect(output.acceptanceContract?.status).toBe("PARTIAL_BUDGET");
+    expect(output.answer).toContain("已达到 4 条成功查询预算");
     await harness.close();
     repository.close();
   });
@@ -1138,6 +1375,325 @@ class ScriptedMontaneModel implements ModelClient {
       : "请先配置 SelectDB，再执行真实数据分析。";
     options.onTextDelta?.(finalText);
     return { finalText, stopReason: "end_turn" };
+  }
+}
+
+class CorrectiveDirectMontaneModel implements ModelClient {
+  readonly capabilities = {
+    contextWindow: 32_000,
+    maxOutputTokens: 2_000,
+    supportsStreaming: true,
+    supportsToolUse: true,
+    supportsImages: false,
+  };
+  private step = 0;
+
+  async complete(options: {
+    messages: AgentMessage[];
+    tools: Array<Record<string, unknown>>;
+    onTextDelta?: (delta: string) => void;
+  }): Promise<AgentResponse> {
+    this.step += 1;
+    if (this.step === 1) {
+      return {
+        toolCalls: [{
+          id: "call_corrective_frame",
+          name: "SubmitQuestionFrame",
+          args: {
+            original_question: "订单成交金额是多少",
+            intent_kind: "DIRECT_QUERY",
+            metric_terms: ["成交金额"],
+            time_terms: [],
+            object_terms: ["订单"],
+            business_value_terms: [],
+            grouping_terms: [],
+            calculation_terms: ["求和"],
+            presentation: { kind: "SINGLE_VALUE" },
+          },
+        }],
+        stopReason: "tool_use",
+      };
+    }
+    if (this.step === 2) {
+      return {
+        toolCalls: [{
+          id: "call_corrective_ontology",
+          name: "OntologySearch",
+          args: { query: "订单成交金额是多少" },
+        }],
+        stopReason: "tool_use",
+      };
+    }
+    if (this.step === 3) {
+      return {
+        toolCalls: [{
+          id: "call_corrective_first",
+          name: "ExecuteAnalysisPlan",
+          args: {
+            root_object_id: "o_order",
+            measure_ids: ["m_gmv"],
+            dimension_property_ids: [],
+            filters: [],
+            limit: 10,
+            result_kind: "aggregate",
+            title: "订单成交金额首次查询",
+            analysis_step: {
+              id: "step_direct_first",
+              objective: "取得订单成交金额",
+              rationale: "先执行最小必要查询",
+              role: "OVERVIEW",
+              acceptance_criterion_ids: [
+                "requested_result",
+                "scope_bound",
+                "database_evidence",
+                "result_complete",
+              ],
+            },
+          },
+        }],
+        stopReason: "tool_use",
+      };
+    }
+    if (this.step === 4) {
+      return {
+        toolCalls: [{
+          id: "call_corrective_second",
+          name: "ExecuteAnalysisPlan",
+          args: {
+            root_object_id: "o_order",
+            measure_ids: ["m_gmv"],
+            dimension_property_ids: [],
+            filters: [],
+            limit: 20,
+            result_kind: "aggregate",
+            title: "订单成交金额纠正查询",
+            analysis_step: {
+              id: "step_direct_corrective",
+              objective: "消除首次结果截断造成的完整性缺口",
+              rationale: "上一轮 observation 显示 truncated=true",
+              role: "SUPPORTING",
+              acceptance_criterion_ids: ["result_complete"],
+            },
+          },
+        }],
+        stopReason: "tool_use",
+      };
+    }
+    const finalText = "订单成交金额为 128,000 元。";
+    options.onTextDelta?.(finalText);
+    return { finalText, stopReason: "end_turn" };
+  }
+}
+
+class IncompleteExplorationMontaneModel implements ModelClient {
+  readonly capabilities = {
+    contextWindow: 32_000,
+    maxOutputTokens: 2_000,
+    supportsStreaming: true,
+    supportsToolUse: true,
+    supportsImages: false,
+  };
+  private step = 0;
+
+  async complete(options: {
+    messages: AgentMessage[];
+    tools: Array<Record<string, unknown>>;
+    onTextDelta?: (delta: string) => void;
+  }): Promise<AgentResponse> {
+    this.step += 1;
+    if (this.step === 1) {
+      return {
+        toolCalls: [{
+          id: "call_partial_frame",
+          name: "SubmitQuestionFrame",
+          args: {
+            original_question: "分析订单销售表现",
+            intent_kind: "EXPLORATORY_ANALYSIS",
+            metric_terms: [],
+            time_terms: [],
+            object_terms: ["订单"],
+            business_value_terms: [],
+            grouping_terms: [],
+            calculation_terms: [],
+            presentation: { kind: "AUTO" },
+          },
+        }],
+        stopReason: "tool_use",
+      };
+    }
+    if (this.step === 2) {
+      return {
+        toolCalls: [{
+          id: "call_partial_ontology",
+          name: "OntologySearch",
+          args: { query: "分析订单销售表现" },
+        }],
+        stopReason: "tool_use",
+      };
+    }
+    if (this.step === 3) {
+      return {
+        toolCalls: [{
+          id: "call_partial_space",
+          name: "DiscoverAnalysisSpace",
+          args: {
+            objective: "分析订单销售表现",
+            object_ids: ["o_order"],
+          },
+        }],
+        stopReason: "tool_use",
+      };
+    }
+    if (this.step === 4) {
+      return {
+        toolCalls: [{
+          id: "call_partial_overview",
+          name: "ExecuteAnalysisPlan",
+          args: {
+            root_object_id: "o_order",
+            measure_ids: ["m_gmv", "m_cost"],
+            dimension_property_ids: [],
+            filters: [],
+            result_kind: "aggregate",
+            title: "订单销售总览",
+            analysis_step: {
+              id: "step_partial_overview",
+              objective: "取得订单销售核心指标",
+              rationale: "先覆盖整体表现",
+              role: "OVERVIEW",
+              acceptance_criterion_ids: [
+                "overview_covered",
+                "scope_bound",
+                "database_evidence",
+                "result_complete",
+              ],
+            },
+          },
+        }],
+        stopReason: "tool_use",
+      };
+    }
+    const finalText = "订单成交金额为 128,000 元，成本额为 56,000 元。";
+    options.onTextDelta?.(finalText);
+    return { finalText, stopReason: "end_turn" };
+  }
+}
+
+class BudgetLimitedDiagnosticMontaneModel implements ModelClient {
+  readonly capabilities = {
+    contextWindow: 32_000,
+    maxOutputTokens: 2_000,
+    supportsStreaming: true,
+    supportsToolUse: true,
+    supportsImages: false,
+  };
+  private step = 0;
+
+  async complete(options: {
+    messages: AgentMessage[];
+    tools: Array<Record<string, unknown>>;
+    onTextDelta?: (delta: string) => void;
+  }): Promise<AgentResponse> {
+    this.step += 1;
+    if (this.step === 1) {
+      return this.tool("budget_frame", "SubmitQuestionFrame", {
+        original_question: "为什么订单成交金额下降",
+        intent_kind: "DIAGNOSTIC_ANALYSIS",
+        metric_terms: ["成交金额"],
+        time_terms: [],
+        object_terms: ["订单"],
+        business_value_terms: [],
+        grouping_terms: [],
+        calculation_terms: ["下降", "原因"],
+        presentation: { kind: "AUTO" },
+      });
+    }
+    if (this.step === 2) {
+      return this.tool("budget_ontology", "OntologySearch", {
+        query: "为什么订单成交金额下降",
+      });
+    }
+    if (this.step === 3) {
+      return this.tool("budget_space", "DiscoverAnalysisSpace", {
+        objective: "为什么订单成交金额下降",
+        object_ids: ["o_order"],
+      });
+    }
+    if (this.step === 4) {
+      return this.tool("budget_phenomenon", "ExecuteAnalysisPlan", {
+        root_object_id: "o_order",
+        measure_ids: ["m_gmv"],
+        dimension_property_ids: [],
+        filters: [],
+        result_kind: "aggregate",
+        title: "成交金额现象确认",
+        analysis_step: {
+          id: "step_budget_phenomenon",
+          objective: "量化待解释的成交金额现象",
+          rationale: "先确认现象",
+          role: "OVERVIEW",
+          acceptance_criterion_ids: ["phenomenon_quantified"],
+        },
+      });
+    }
+    if ([5, 6, 7].includes(this.step)) {
+      const units = ["YEAR", "QUARTER", "MONTH"] as const;
+      const unit = units[this.step - 5]!;
+      return this.tool(
+        `budget_baseline_${unit.toLowerCase()}`,
+        "ExecuteAnalysisPlan",
+        {
+          root_object_id: "o_order",
+          measure_ids: ["m_gmv"],
+          dimension_property_ids: [],
+          filters: [],
+          time_grain: {
+            unit,
+            property_id: "p_paid_at",
+          },
+          result_kind: "aggregate",
+          title: `${unit}成交金额基准`,
+          analysis_step: {
+            id: `step_budget_${unit.toLowerCase()}`,
+            objective: "补足比较基准",
+            rationale: "上一轮只有一个时间点，继续尝试受控时间粒度",
+            role: "SUPPORTING",
+            acceptance_criterion_ids: ["baseline_checked"],
+          },
+        },
+      );
+    }
+    if (this.step === 8) {
+      return this.tool("budget_driver_after_limit", "ExecuteAnalysisPlan", {
+        root_object_id: "o_order",
+        measure_ids: ["m_gmv"],
+        dimension_property_ids: ["p_customer_level"],
+        filters: [],
+        result_kind: "aggregate",
+        title: "会员等级驱动",
+        analysis_step: {
+          id: "step_budget_driver",
+          objective: "检查会员等级驱动",
+          rationale: "基准证据仍不足，继续检查结构",
+          role: "DIAGNOSTIC",
+          acceptance_criterion_ids: ["drivers_checked"],
+        },
+      });
+    }
+    const finalText = "已取得部分数据库证据，但诊断尚未完成。";
+    options.onTextDelta?.(finalText);
+    return { finalText, stopReason: "end_turn" };
+  }
+
+  private tool(
+    id: string,
+    name: string,
+    args: Record<string, unknown>,
+  ): AgentResponse {
+    return {
+      toolCalls: [{ id: `call_${id}`, name, args }],
+      stopReason: "tool_use",
+    };
   }
 }
 

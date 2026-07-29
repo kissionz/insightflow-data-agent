@@ -588,7 +588,8 @@ button.brand-mark {
   color: var(--danger);
 }
 
-.turn-status.needs_clarification {
+.turn-status.needs_clarification,
+.turn-status.partial {
   background: color-mix(in oklab, var(--warning), white 89%);
   color: #995b00;
 }
@@ -804,6 +805,80 @@ button.brand-mark {
 .analysis-run-state.failed {
   background: color-mix(in oklab, var(--danger), white 91%);
   color: var(--danger) !important;
+}
+
+.analysis-run-state.partial_budget,
+.analysis-run-state.partial_no_progress {
+  background: color-mix(in oklab, var(--warning), white 89%);
+  color: #995b00 !important;
+}
+
+.acceptance-checklist {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 1px;
+  border-bottom: 1px solid var(--border);
+  background: var(--border);
+}
+
+.acceptance-item {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: 5px;
+  min-height: 46px;
+  background: white;
+  padding: 7px 9px;
+}
+
+.acceptance-item > span {
+  display: grid;
+  width: 16px;
+  height: 16px;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--surface);
+  color: var(--muted);
+}
+
+.acceptance-item.satisfied > span {
+  background: color-mix(in oklab, var(--success), white 89%);
+  color: var(--success);
+}
+
+.acceptance-item.blocked > span {
+  background: color-mix(in oklab, var(--danger), white 91%);
+  color: var(--danger);
+}
+
+.acceptance-item.not_applicable > span {
+  color: var(--muted-2);
+}
+
+.acceptance-item > div {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.acceptance-item strong {
+  color: #344054;
+  font-size: 9px;
+}
+
+.acceptance-item small {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 8px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+}
+
+.acceptance-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--warning);
 }
 
 .analysis-space-summary {
@@ -1096,6 +1171,10 @@ button.brand-mark {
   font-size: 10px;
 }
 
+.completed-chip.partial {
+  color: #995b00;
+}
+
 .chart-view {
   width: 100%;
   height: 250px;
@@ -1113,6 +1192,7 @@ button.brand-mark {
   color: #344054;
   font-size: 13px;
   line-height: 1.8;
+  white-space: pre-line;
 }
 
 .text-answer {

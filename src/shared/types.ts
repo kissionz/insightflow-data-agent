@@ -11,6 +11,7 @@ export type TurnStatus =
   | "planning"
   | "querying"
   | "completed"
+  | "partial"
   | "needs_clarification"
   | "failed"
   | "cancelled";
@@ -86,6 +87,7 @@ export interface AnalysisRunStep {
   objective: string;
   rationale?: string;
   role: "OVERVIEW" | "DIAGNOSTIC" | "SUPPORTING";
+  acceptanceCriterionIds?: string[];
   status: "running" | "completed" | "failed";
   summary: string;
   ir?: QueryIR;
@@ -100,11 +102,57 @@ export interface AnalysisRunStep {
   completedAt?: string;
 }
 
+export type AcceptanceCriterionKind =
+  | "SCOPE_BOUND"
+  | "REQUESTED_RESULT"
+  | "OVERVIEW"
+  | "COMPARISON"
+  | "STRUCTURE"
+  | "PHENOMENON"
+  | "BASELINE"
+  | "DRIVERS"
+  | "DATABASE_EVIDENCE"
+  | "RESULT_COMPLETENESS";
+
+export interface AcceptanceCriterion {
+  id: string;
+  kind: AcceptanceCriterionKind;
+  label: string;
+  description: string;
+  required: boolean;
+  status: "PENDING" | "SATISFIED" | "NOT_APPLICABLE" | "BLOCKED";
+  evidenceStepIds: string[];
+  summary?: string;
+}
+
+export interface AnalysisAcceptanceContract {
+  profile: QuestionLanguageFrame["intentKind"];
+  status:
+    | "OPEN"
+    | "SATISFIED"
+    | "PARTIAL_BUDGET"
+    | "PARTIAL_NO_PROGRESS"
+    | "NEEDS_CLARIFICATION"
+    | "FAILED";
+  criteria: AcceptanceCriterion[];
+  successfulQueries: number;
+  maxSuccessfulQueries: number;
+  remainingQueries: number;
+  stopReason?: string;
+}
+
 export interface AnalysisRun {
-  mode: "EXPLORATORY_ANALYSIS" | "DIAGNOSTIC_ANALYSIS";
+  mode: QuestionLanguageFrame["intentKind"];
   objective: string;
-  status: "planning" | "running" | "completed" | "failed";
+  status:
+    | "planning"
+    | "running"
+    | "completed"
+    | "partial_budget"
+    | "partial_no_progress"
+    | "failed";
   maxSteps: number;
+  acceptance: AnalysisAcceptanceContract;
   rootObjectId?: string;
   rootObjectLabel?: string;
   availableMetrics: Array<{ id: string; label: string }>;
@@ -419,7 +467,12 @@ export interface Turn {
   promptVersion?: number;
   trace: TraceStep[];
   analysisRun?: AnalysisRun;
-  responseKind?: "analysis" | "conversation" | "configuration_required" | "clarification";
+  responseKind?:
+    | "analysis"
+    | "partial_analysis"
+    | "conversation"
+    | "configuration_required"
+    | "clarification";
   result?: ResultArtifact;
 }
 

@@ -422,6 +422,8 @@ function TurnCard({ turn }: { turn: Turn }) {
               ? "done"
               : turn.status === "failed"
                 ? "failed"
+                : turn.status === "partial"
+                  ? "waiting"
                 : turn.status === "needs_clarification"
                   ? "waiting"
                   : ""
@@ -429,7 +431,8 @@ function TurnCard({ turn }: { turn: Turn }) {
         >
           {turn.status === "completed" ? (
             <Check size={14} weight="bold" />
-          ) : turn.status === "needs_clarification" ? (
+          ) : turn.status === "needs_clarification" ||
+            turn.status === "partial" ? (
             <Info size={15} />
           ) : (
             <Brain size={15} />
@@ -546,20 +549,52 @@ function AnalysisRunTrace({ run }: { run: AnalysisRun }) {
       <div className="analysis-run-heading">
         <div>
           <strong>
-            {run.mode === "DIAGNOSTIC_ANALYSIS" ? "原因诊断路径" : "开放分析路径"}
+            {run.mode === "DIAGNOSTIC_ANALYSIS"
+              ? "原因诊断验收"
+              : run.mode === "EXPLORATORY_ANALYSIS"
+                ? "开放分析验收"
+                : "明确问数验收"}
           </strong>
           <span>
-            {run.rootObjectLabel ?? "正在选择事实对象"} · {completed}/{run.maxSteps} 条查询
+            {run.rootObjectLabel ?? "正在选择事实对象"} · 已执行 {completed} 条 · 预算 {run.maxSteps} 条
             {sqlSteps.length ? ` · ${sqlSteps.length} 条 SQL` : ""}
           </span>
         </div>
         <span className={`analysis-run-state ${run.status}`}>
           {run.status === "completed"
             ? "已完成"
+            : run.status === "partial_budget"
+              ? "预算停止"
+              : run.status === "partial_no_progress"
+                ? "部分完成"
             : run.status === "failed"
               ? "已停止"
               : "分析中"}
         </span>
+      </div>
+      <div className="acceptance-checklist" aria-label="验收标准">
+        {run.acceptance.criteria.map((criterion) => (
+          <div
+            className={`acceptance-item ${criterion.status.toLowerCase()}`}
+            key={criterion.id}
+          >
+            <span>
+              {criterion.status === "SATISFIED" ? (
+                <Check size={11} weight="bold" />
+              ) : criterion.status === "NOT_APPLICABLE" ? (
+                "–"
+              ) : criterion.status === "BLOCKED" ? (
+                <X size={11} weight="bold" />
+              ) : (
+                <span className="acceptance-dot" />
+              )}
+            </span>
+            <div>
+              <strong>{criterion.label}</strong>
+              <small>{criterion.summary ?? criterion.description}</small>
+            </div>
+          </div>
+        ))}
       </div>
       {run.availableMetrics.length ? (
         <p className="analysis-space-summary">
@@ -602,6 +637,19 @@ function AnalysisRunTrace({ run }: { run: AnalysisRun }) {
               {step.rationale ? (
                 <p className="analysis-step-rationale">
                   选择依据：{step.rationale}
+                </p>
+              ) : null}
+              {step.acceptanceCriterionIds?.length ? (
+                <p className="analysis-step-rationale">
+                  验收项：
+                  {step.acceptanceCriterionIds
+                    .map(
+                      (id) =>
+                        run.acceptance.criteria.find(
+                          (criterion) => criterion.id === id,
+                        )?.label ?? id,
+                    )
+                    .join("、")}
                 </p>
               ) : null}
               <small>{step.summary}</small>
@@ -675,6 +723,7 @@ function AnalysisSqlTrace({ run }: { run: AnalysisRun }) {
 
 function ResultCard({ turn }: { turn: Turn }) {
   const result = turn.result!;
+  const partial = turn.status === "partial";
   const chartOption: InsightChartOption = {
     tooltip: { trigger: "axis", confine: true },
     grid: { left: 44, right: 16, top: 38, bottom: 30 },
@@ -711,10 +760,10 @@ function ResultCard({ turn }: { turn: Turn }) {
         </div>
         <div>
           <span className="message-label">InsightFlow</span>
-          <strong>分析完成</strong>
+          <strong>{partial ? "分析部分完成" : "分析完成"}</strong>
         </div>
-        <span className="completed-chip">
-          <CheckCircle size={15} weight="fill" />
+        <span className={`completed-chip ${partial ? "partial" : ""}`}>
+          {partial ? <Info size={15} /> : <CheckCircle size={15} weight="fill" />}
           {turn.analysisRun?.steps.length
             ? `${turn.analysisRun.steps.filter((step) => step.status === "completed").length} 步真实查询`
             : "真实查询"}
@@ -3989,6 +4038,8 @@ function StatusBadge({ status }: { status: Turn["status"] }) {
   const label =
     status === "completed"
       ? "已完成"
+      : status === "partial"
+        ? "部分完成"
       : status === "failed"
         ? "失败"
         : status === "needs_clarification"
@@ -4381,7 +4432,13 @@ function upsertTurn(conversation: Conversation, turn: Turn): Conversation {
 }
 
 function isTerminal(status: Turn["status"]): boolean {
-  return ["completed", "failed", "cancelled", "needs_clarification"].includes(status);
+  return [
+    "completed",
+    "partial",
+    "failed",
+    "cancelled",
+    "needs_clarification",
+  ].includes(status);
 }
 
 function asMessage(reason: unknown): string {

@@ -13,6 +13,8 @@ import {
   type ToolOutcome,
 } from "montane-code";
 import type {
+  AcceptanceCriterion,
+  AnalysisAcceptanceContract,
   AnalysisIntent,
   AnalysisRunStep,
   Conversation,
@@ -31,6 +33,7 @@ import type { QueryResult } from "./selectdb.js";
 import { guardReadOnlySql } from "./sql-guard.js";
 
 const DATA_AGENT_MAX_MODEL_TURNS = 14;
+const DATA_AGENT_MAX_SUCCESSFUL_QUERIES = 4;
 
 const DATA_AGENT_SYSTEM_PROMPT = `
 你是 InsightFlow Data Agent，运行在 Montane Harness 中。
@@ -40,7 +43,7 @@ const DATA_AGENT_SYSTEM_PROMPT = `
 2. 打招呼或询问能力时直接简短回答，不调用数据工具，不生成图表或业务结论。
 3. 数据分析请求必须先单独调用一次 SubmitQuestionFrame，把原问题按分析类型、时间、指标、对象、完整业务值、分组、计算方式和展现方式结构化；不得把具体商品名、组织名等业务值放进 object_terms，不得并行调用后续工具，也不得在同一轮重复提交或改写问题框架。
 4. 随后只调用一次 OntologySearch。业务值短语不参与属性名称词形检索；OntologySearch 的词形匹配只是候选证据，不能证明用户词一定是属性名称。若明确指标没有候选，应澄清或提示发布草稿，不得改写同义词重复搜索。
-4.1 当 intent_kind 为 EXPLORATORY_ANALYSIS 或 DIAGNOSTIC_ANALYSIS 时，在 OntologySearch 后调用一次 DiscoverAnalysisSpace，查看候选事实对象下已发布的指标、受控数字属性、时间和诊断维度。不得把“销售表现”等主题词伪造成正式指标。
+4.1 intent_kind 只定义本轮验收标准，不限制工具和查询轮数。未指定单一指标、需要补充分析空间或现有证据无法关闭验收缺口时，可以在 OntologySearch 后调用一次 DiscoverAnalysisSpace，查看候选事实对象下已发布的指标、受控数字属性、时间和诊断维度。不得把“销售表现”等主题词伪造成正式指标。
 5. question_frame.business_value_terms 中的每个完整短语都必须且只能调用 PropertyValueSearch。不得把指标名、计算词或自己扩展的近义词提交为属性值。具体值的真实字段归属以全局已发布值索引为准。工具返回 resolved 时，后续筛选只能把 selectedMatch.valueBindingId 提交为 value_binding_id，不得重新选择 property_id 或改写值；返回 ambiguous 时必须让用户澄清。
 6. 你不能生成 SQL。完成语义理解后，必须调用 ExecuteAnalysisPlan，提交本体返回的对象、度量和维度属性 ID；业务值筛选只提交 value_binding_id。measure_ids 只能使用 metrics 中返回的 ID，其中既可能是正式指标，也可能是带默认聚合规则的数字属性。
 6.1 “各SPU销售额大于3000万”“毛利率大于75%”等按分组汇总后的指标阈值必须使用 aggregate_filters 或 aggregate_filter_expression，并引用指标/计算 ID。禁止把指标阈值改成来源属性 filters；前者是聚合后筛选，后者是明细行筛选。
@@ -52,8 +55,10 @@ const DATA_AGENT_SYSTEM_PROMPT = `
 8.4 “每个类目最高的SPU”“各区域前3名”等每组排名必须使用 group_selections，不能只提交分区 RANK 后再做全局 LIMIT。每组第一名使用 TOP_N/count=1；partition_by_property_ids 是上级分组维度。
 8.5 “近三年每年都”“任意月份”“至少4个月”等跨期间集合条件必须使用 period_conditions。每一期都满足使用 EVERY，任意一期使用 ANY，至少N期使用 AT_LEAST_N；不能先用 aggregate_filters 删除失败期间，也不能让最终回答根据截断行人工归并。“近N年”默认解释为最近 N 个完整自然年。
 9. ExecuteAnalysisPlan 是唯一查询入口，它会通过规则引擎生成 IR、校验关系、粒度、可加性、筛选逻辑和窗口计算，编译参数化 Doris SQL 并执行查询。
-9.1 直接问数通常只执行一次。探索或诊断分析可以根据真实结果最多执行四步；每一步必须提供 analysis_step，说明本步目标、依据和结果角色。先用一条查询同时获取多个核心指标，再根据结果决定是否按一个高价值维度继续诊断。不得重复相同计划，不得跨事实对象，已有证据足够时立即停止。
-9.2 每次 ExecuteAnalysisPlan 返回 observation。继续查询前必须基于该 observation 说明新查询要验证的具体问题；不得为了“多分析一步”而机械穷举所有维度。
+9.1 SubmitQuestionFrame 返回 acceptanceContract。所有分析类型共用同一个受控查询循环和四条成功查询预算；意图不能把明确问数限制为一条查询，也不能强制探索分析执行多条查询。
+9.2 每次 ExecuteAnalysisPlan 都要提供 analysis_step，并在 acceptance_criterion_ids 中引用一个或多个仍为 PENDING 的验收项。首步说明为何选择这些指标；后续步骤必须引用上一 observation 的真实发现，并说明要关闭的证据缺口。
+9.3 每次 ExecuteAnalysisPlan 返回 observation 和更新后的 acceptanceContract。只有全部必需验收项为 SATISFIED 或 NOT_APPLICABLE 才能宣称完成；预算耗尽、没有进展或主动停止但仍有缺口时，必须明确为部分完成。
+9.4 不得重复相同计划，不得跨事实对象。下一条查询若不能关闭任何待验收项，立即停止；不得为了“多分析一步”而机械穷举维度。
 10. 不得猜测或创造对象 ID、指标 ID、属性 ID、数据库值、绑定 ID 或关系。计算项的本地 ID 可以使用 calc_ 前缀，但其输入必须引用工具返回的真实 ID。
 11. 最终使用中文给出简洁、可验证的结论，只能引用 ExecuteAnalysisPlan 返回的数据。
 12. 信息不足、语义存在多个候选或工具拒绝计划时，向用户说明需要补充的具体条件。
@@ -66,9 +71,11 @@ interface HarnessRunResult {
   result?: ResultArtifact;
   responseKind:
     | "analysis"
+    | "partial_analysis"
     | "conversation"
     | "configuration_required"
     | "clarification";
+  acceptanceContract?: AnalysisAcceptanceContract;
   sessionId: string;
 }
 
@@ -79,12 +86,15 @@ interface CapturedAnalysis {
   compiled: CompiledQuery;
   stepId?: string;
   role: AnalysisRunStep["role"];
+  acceptanceCriterionIds: string[];
 }
 
 interface AnalysisExecutionState {
   captures: CapturedAnalysis[];
   seenPlanHashes: Set<string>;
   rootObjectId?: string;
+  acceptanceContract?: AnalysisAcceptanceContract;
+  queryBudgetReached: boolean;
 }
 
 interface ResolvedValueBinding {
@@ -137,6 +147,7 @@ export class DataAgentHarness {
     const analysisState: AnalysisExecutionState = {
       captures: [],
       seenPlanHashes: new Set(),
+      queryBudgetReached: false,
     };
     let questionFrame: QuestionLanguageFrame | undefined;
     const valueBindings = new Map<string, ResolvedValueBinding>();
@@ -146,8 +157,10 @@ export class DataAgentHarness {
     tools.register(
       this.questionFrameTool(turn.question, (frame) => {
         questionFrame ??= frame;
+        analysisState.acceptanceContract ??=
+          createAcceptanceContract(questionFrame);
         return questionFrame;
-      }),
+      }, () => analysisState.acceptanceContract),
     );
     tools.register(
       this.ontologySearchTool(() => questionFrame, ontologySearchCache),
@@ -156,6 +169,7 @@ export class DataAgentHarness {
       this.discoverAnalysisSpaceTool(
         () => questionFrame,
         analysisSpaceCache,
+        analysisState,
       ),
     );
     tools.register(
@@ -216,10 +230,14 @@ export class DataAgentHarness {
       },
     );
 
-    let answer = localizeHarnessStop(await loop.run(turn.question));
-    const completed = analysisState.captures.find(
-      (analysis) => analysis.role === "OVERVIEW",
-    ) ?? analysisState.captures[0];
+    const rawAnswer = await loop.run(turn.question);
+    let answer = localizeHarnessStop(rawAnswer);
+    const completed =
+      questionFrame?.intentKind === "DIRECT_QUERY"
+        ? analysisState.captures.at(-1)
+        : analysisState.captures.find(
+            (analysis) => analysis.role === "OVERVIEW",
+          ) ?? analysisState.captures[0];
     if (
       completed?.compiled.ir.resultContract.exhaustiveRequested &&
       completed.artifact.verification &&
@@ -231,9 +249,23 @@ export class DataAgentHarness {
         "请缩小业务范围，或提高受控查询结果上限后重试。",
       ].join("\n");
     }
+    const acceptanceContract = finalizeAcceptanceContract(
+      analysisState,
+      rawAnswer,
+      Boolean(completed),
+    );
+    if (
+      completed &&
+      acceptanceContract &&
+      acceptanceContract.status !== "SATISFIED"
+    ) {
+      answer = formatPartialAnalysisAnswer(answer, acceptanceContract);
+    }
     const asksForData = isLikelyDataQuestion(turn.question);
     const responseKind: HarnessRunResult["responseKind"] = completed
-      ? "analysis"
+      ? acceptanceContract?.status === "SATISFIED"
+        ? "analysis"
+        : "partial_analysis"
       : asksForData && !source.configured
         ? "configuration_required"
         : asksForData
@@ -249,6 +281,7 @@ export class DataAgentHarness {
           }
         : undefined,
       responseKind,
+      acceptanceContract,
       sessionId: managed.id,
     };
   }
@@ -319,6 +352,8 @@ export class DataAgentHarness {
   private questionFrameTool(
     expectedQuestion: string,
     capture: (frame: QuestionLanguageFrame) => QuestionLanguageFrame,
+    getAcceptanceContract: () => AnalysisAcceptanceContract | undefined =
+      () => undefined,
   ): Tool {
     return {
       name: "SubmitQuestionFrame",
@@ -444,17 +479,17 @@ export class DataAgentHarness {
           };
         }
         const acceptedFrame = capture(frame);
+        const acceptanceContract = getAcceptanceContract();
         return {
           ok: true,
           content: JSON.stringify({
             accepted: true,
             frame: acceptedFrame,
+            acceptanceContract,
             next:
-              acceptedFrame.intentKind === "DIRECT_QUERY"
-                ? "调用一次 OntologySearch；对每个 businessValueTerm 调用一次 PropertyValueSearch"
-                : "调用一次 OntologySearch，再调用一次 DiscoverAnalysisSpace；对每个 businessValueTerm 调用一次 PropertyValueSearch",
+              "调用一次 OntologySearch；对每个 businessValueTerm 调用一次 PropertyValueSearch。需要补足指标、时间或诊断维度时再调用一次 DiscoverAnalysisSpace。",
           }),
-          data: { frame: acceptedFrame },
+          data: { frame: acceptedFrame, acceptanceContract },
         };
       },
     };
@@ -771,11 +806,12 @@ export class DataAgentHarness {
   private discoverAnalysisSpaceTool(
     getQuestionFrame: () => QuestionLanguageFrame | undefined,
     cache: Map<string, ToolOutcome> = new Map(),
+    state?: AnalysisExecutionState,
   ): Tool {
     return {
       name: "DiscoverAnalysisSpace",
       description:
-        "为探索或诊断问题返回单一事实对象内可用的已发布指标、受控数字属性、时间字段和诊断维度。它只发现分析空间，不执行查询。",
+        "在当前验收缺口需要更多候选时，返回单一事实对象内可用的已发布指标、受控数字属性、时间字段和诊断维度。它只发现分析空间，不执行查询。",
       effect: "readonly",
       inputSchema: {
         type: "object",
@@ -800,13 +836,6 @@ export class DataAgentHarness {
           return {
             ok: false,
             content: "分析空间发现失败：请先单独提交问题语言框架",
-          };
-        }
-        if (frame.intentKind === "DIRECT_QUERY") {
-          return {
-            ok: false,
-            content:
-              "当前是明确指标问数，不需要发现分析空间。请使用 OntologySearch 返回的指标执行一次查询。",
           };
         }
         const ontology = this.repository.getPublishedOntology();
@@ -890,6 +919,12 @@ export class DataAgentHarness {
         const spaces = rankedObjects.map((object) =>
           buildAnalysisSpace(ontology, object),
         );
+        if (state?.acceptanceContract) {
+          refineAcceptanceContractForAnalysisSpace(
+            state.acceptanceContract,
+            spaces[0],
+          );
+        }
         const payload = {
           ontologyVersion: ontology.version,
           intentKind: frame.intentKind,
@@ -897,14 +932,15 @@ export class DataAgentHarness {
           spaces,
           limits: {
             factObjectsPerRun: 1,
-            maxSuccessfulQueries: 4,
+            maxSuccessfulQueries: DATA_AGENT_MAX_SUCCESSFUL_QUERIES,
             maxReturnedDimensionsPerObject: 32,
           },
+          acceptanceContract: state?.acceptanceContract,
           instructions: [
             "选择一个事实对象完成本轮分析，不得跨事实对象混算",
             "第一步优先在一条查询中同时获取多个核心指标",
             "后续查询必须由上一查询 observation 中的真实变化触发",
-            "每次 ExecuteAnalysisPlan 都要提交 analysis_step；证据足够时停止并总结",
+            "每次 ExecuteAnalysisPlan 都要引用仍为 PENDING 的 acceptanceCriterionIds；全部必需项满足时停止并总结",
           ],
         };
         const outcome: ToolOutcome = {
@@ -1200,6 +1236,7 @@ export class DataAgentHarness {
     state: AnalysisExecutionState = {
       captures: [],
       seenPlanHashes: new Set(),
+      queryBudgetReached: false,
     },
   ): Tool {
     return {
@@ -1569,7 +1606,7 @@ export class DataAgentHarness {
             type: "object",
             additionalProperties: false,
             description:
-              "探索或诊断分析必填，用于记录本步目标、继续查询依据和结果角色",
+              "每次查询都应提供，用于记录本步目标、继续查询依据、结果角色和要关闭的验收缺口",
             properties: {
               id: {
                 type: "string",
@@ -1588,8 +1625,20 @@ export class DataAgentHarness {
                 type: "string",
                 enum: ["OVERVIEW", "DIAGNOSTIC", "SUPPORTING"],
               },
+              acceptance_criterion_ids: {
+                type: "array",
+                minItems: 1,
+                items: { type: "string" },
+                description:
+                  "SubmitQuestionFrame 或上一轮 ExecuteAnalysisPlan 返回的、当前仍为 PENDING 的验收项 ID",
+              },
             },
-            required: ["id", "objective", "rationale", "role"],
+            required: [
+              "id",
+              "objective",
+              "rationale",
+              "role",
+            ],
           },
           title: {
             type: "string",
@@ -1624,34 +1673,34 @@ export class DataAgentHarness {
             content: "IR规则校验失败：尚未提交问题语言框架",
           };
         }
-        const exploratory = frame.intentKind !== "DIRECT_QUERY";
         const rawAnalysisStep = args.analysis_step as
           | Record<string, unknown>
           | undefined;
-        if (exploratory && !rawAnalysisStep) {
+        const maxSuccessfulQueries = DATA_AGENT_MAX_SUCCESSFUL_QUERIES;
+        if (state.acceptanceContract?.status === "SATISFIED") {
           return {
             ok: false,
             content:
-              "IR规则校验失败：探索或诊断分析必须提供 analysis_step，说明本步目标、依据和结果角色",
+              "验收契约已经满足，不得继续查询。请基于现有数据库证据生成最终结论。",
             data: {
               stage: "planning",
-              retryInstruction:
-                "补充 analysis_step 后重试；首步优先同时查询多个核心指标。",
+              code: "ACCEPTANCE_CONTRACT_SATISFIED",
+              acceptanceContract: state.acceptanceContract,
             },
           };
         }
-        const maxSuccessfulQueries = exploratory ? 4 : 1;
         if (state.captures.length >= maxSuccessfulQueries) {
+          state.queryBudgetReached = true;
           return {
             ok: false,
-            content: exploratory
-              ? `分析步骤预算已用完：最多执行 ${maxSuccessfulQueries} 条成功查询。请基于现有 observation 生成结论。`
-              : "直接问数已经获得真实结果，不得继续执行查询。请基于现有结果回答。",
+            content:
+              `查询预算已用完：最多执行 ${maxSuccessfulQueries} 条成功查询。仍有验收缺口时只能输出部分完成，不得宣称分析完成。`,
             data: {
               stage: "planning",
               code: "ANALYSIS_STEP_BUDGET_REACHED",
               successfulQueries: state.captures.length,
               maxSuccessfulQueries,
+              acceptanceContract: state.acceptanceContract,
             },
           };
         }
@@ -1742,8 +1791,33 @@ export class DataAgentHarness {
             },
           };
         }
+        const analysisStep = normalizeAnalysisStep(
+          rawAnalysisStep,
+          intent.title,
+        );
+        let acceptanceCriterionIds: string[];
+        try {
+          acceptanceCriterionIds = resolveAcceptanceTargets(
+            state.acceptanceContract,
+            intent,
+            analysisStep,
+          );
+        } catch (error) {
+          const detail =
+            error instanceof Error ? error.message : "查询未关联验收缺口";
+          return {
+            ok: false,
+            content: `验收契约校验失败：${detail}`,
+            data: {
+              stage: "planning",
+              code: "ACCEPTANCE_GAP_REQUIRED",
+              acceptanceContract: state.acceptanceContract,
+              retryInstruction:
+                "从 acceptanceContract.criteria 中选择仍为 PENDING 且本查询能够提供证据的验收项。",
+            },
+          };
+        }
         if (
-          exploratory &&
           state.rootObjectId &&
           compiled.ir.rootObjectId !== state.rootObjectId
         ) {
@@ -1786,7 +1860,10 @@ export class DataAgentHarness {
             data: {
               stage: "execution",
               ...evidence,
-              analysisStep: normalizeAnalysisStep(rawAnalysisStep, intent.title),
+              analysisStep: {
+                ...analysisStep,
+                acceptanceCriterionIds,
+              },
             },
           };
         }
@@ -1805,20 +1882,25 @@ export class DataAgentHarness {
             compiled.ir.resultContract.expectedPeriodCount,
           claimPolicy: "DATABASE_EVIDENCE_ONLY",
         };
+        satisfyAcceptanceCriteria(
+          state.acceptanceContract,
+          acceptanceCriterionIds,
+          analysisStep.id,
+          intent,
+          artifact,
+        );
         capture({
           artifact,
           sql: compiled.sql,
           parameters: compiled.parameters,
           compiled,
-          stepId: rawAnalysisStep?.id
-            ? String(rawAnalysisStep.id)
-            : undefined,
-          role: normalizeAnalysisStep(rawAnalysisStep, intent.title).role,
+          stepId: analysisStep.id,
+          role: analysisStep.role,
+          acceptanceCriterionIds,
         });
         state.rootObjectId ??= compiled.ir.rootObjectId;
         state.seenPlanHashes.add(planHash);
         const observation = summarizeAnalysisObservation(query, artifact);
-        const analysisStep = normalizeAnalysisStep(rawAnalysisStep, intent.title);
         return {
           ok: true,
           content: JSON.stringify({
@@ -1830,8 +1912,12 @@ export class DataAgentHarness {
             rows: artifact.rows.slice(0, 20),
             truncated: artifact.truncated,
             verification: artifact.verification,
-            analysisStep,
+            analysisStep: {
+              ...analysisStep,
+              acceptanceCriterionIds,
+            },
             observation,
+            acceptanceContract: state.acceptanceContract,
             analysisProgress: {
               successfulQueries: state.captures.length,
               maxSuccessfulQueries,
@@ -1839,9 +1925,11 @@ export class DataAgentHarness {
                 maxSuccessfulQueries - state.captures.length,
             },
             nextInstruction:
-              exploratory && state.captures.length < maxSuccessfulQueries
-                ? "只有当 observation 暴露了需要验证的具体变化时才继续下一步；否则立即基于现有证据总结。"
-                : "请基于现有真实结果生成最终结论。",
+              acceptanceContractSatisfied(state.acceptanceContract)
+                ? "全部必需验收项已经满足，请立即基于现有真实结果生成最终结论。"
+                : state.captures.length < maxSuccessfulQueries
+                  ? "只有当下一条查询能够关闭 acceptanceContract 中仍为 PENDING 的验收项时才继续；否则输出部分完成及缺口。"
+                  : "查询预算已用完；仍有缺口时必须输出部分完成。",
           }),
           data: {
             mode: artifact.mode,
@@ -1851,8 +1939,12 @@ export class DataAgentHarness {
             rows: artifact.rows.slice(0, 20),
             truncated: artifact.truncated,
             verification: artifact.verification,
-            analysisStep,
+            analysisStep: {
+              ...analysisStep,
+              acceptanceCriterionIds,
+            },
             observation,
+            acceptanceContract: state.acceptanceContract,
             analysisProgress: {
               successfulQueries: state.captures.length,
               maxSuccessfulQueries,
@@ -3078,6 +3170,370 @@ function isLikelyDataQuestion(question: string): boolean {
   );
 }
 
+function createAcceptanceCriterion(
+  id: string,
+  kind: AcceptanceCriterion["kind"],
+  label: string,
+  description: string,
+): AcceptanceCriterion {
+  return {
+    id,
+    kind,
+    label,
+    description,
+    required: true,
+    status: "PENDING",
+    evidenceStepIds: [],
+  };
+}
+
+function createAcceptanceContract(
+  frame: QuestionLanguageFrame,
+): AnalysisAcceptanceContract {
+  const common = [
+    createAcceptanceCriterion(
+      "scope_bound",
+      "SCOPE_BOUND",
+      "问题范围已绑定",
+      "指标、时间、对象、业务值、分组和计算口径通过规则校验",
+    ),
+    createAcceptanceCriterion(
+      "database_evidence",
+      "DATABASE_EVIDENCE",
+      "数据库证据已取得",
+      "至少一条受控 IR 已成功执行并返回 SelectDB 结果",
+    ),
+    createAcceptanceCriterion(
+      "result_complete",
+      "RESULT_COMPLETENESS",
+      "结果完整性已确认",
+      "用于结论的结果未发生影响业务判断的截断",
+    ),
+  ];
+  const profileCriteria: AcceptanceCriterion[] =
+    frame.intentKind === "DIRECT_QUERY"
+      ? [
+          createAcceptanceCriterion(
+            "requested_result",
+            "REQUESTED_RESULT",
+            "指定结果已回答",
+            "用户要求的指标、明细、分组或计算结果已由数据库返回",
+          ),
+        ]
+      : frame.intentKind === "DIAGNOSTIC_ANALYSIS"
+        ? [
+            createAcceptanceCriterion(
+              "phenomenon_quantified",
+              "PHENOMENON",
+              "待解释现象已量化",
+              "先用数据库结果确认用户所说的变化或异常确实存在",
+            ),
+            createAcceptanceCriterion(
+              "baseline_checked",
+              "BASELINE",
+              "比较基准已检查",
+              "通过时间比较或时间序列确认现象相对什么基准发生",
+            ),
+            createAcceptanceCriterion(
+              "drivers_checked",
+              "DRIVERS",
+              "主要驱动已检查",
+              "至少沿一个适用诊断维度取得真实分组证据",
+            ),
+          ]
+        : [
+            createAcceptanceCriterion(
+              "overview_covered",
+              "OVERVIEW",
+              "整体表现已覆盖",
+              "已取得一个或多个核心指标的整体结果",
+            ),
+            createAcceptanceCriterion(
+              "comparison_covered",
+              "COMPARISON",
+              "时间变化已覆盖",
+              "在存在可用时间字段时，已取得趋势或同期/前期比较证据",
+            ),
+            createAcceptanceCriterion(
+              "structure_covered",
+              "STRUCTURE",
+              "主要结构已覆盖",
+              "在存在可用诊断维度时，已取得至少一个高价值结构分组结果",
+            ),
+          ];
+  return {
+    profile: frame.intentKind,
+    status: "OPEN",
+    criteria: [...profileCriteria, ...common],
+    successfulQueries: 0,
+    maxSuccessfulQueries: DATA_AGENT_MAX_SUCCESSFUL_QUERIES,
+    remainingQueries: DATA_AGENT_MAX_SUCCESSFUL_QUERIES,
+  };
+}
+
+function refineAcceptanceContractForAnalysisSpace(
+  contract: AnalysisAcceptanceContract,
+  rawSpace: Record<string, unknown> | undefined,
+): void {
+  if (!rawSpace) return;
+  const timeProperties = Array.isArray(rawSpace.timeProperties)
+    ? rawSpace.timeProperties
+    : [];
+  const dimensions = Array.isArray(rawSpace.dimensions)
+    ? rawSpace.dimensions
+    : [];
+  for (const criterion of contract.criteria) {
+    const unavailable =
+      (["COMPARISON", "BASELINE"].includes(criterion.kind) &&
+        !timeProperties.length) ||
+      (["STRUCTURE", "DRIVERS"].includes(criterion.kind) &&
+        !dimensions.length);
+    if (unavailable && criterion.status === "PENDING") {
+      criterion.status = "NOT_APPLICABLE";
+      criterion.summary =
+        criterion.kind === "COMPARISON" || criterion.kind === "BASELINE"
+          ? "当前事实对象没有可用时间字段"
+          : "当前事实对象没有可用诊断维度";
+    }
+  }
+  updateAcceptanceContractStatus(contract);
+}
+
+function resolveAcceptanceTargets(
+  contract: AnalysisAcceptanceContract | undefined,
+  intent: AnalysisIntent,
+  step: ReturnType<typeof normalizeAnalysisStep>,
+): string[] {
+  if (!contract) return [];
+  const pending = contract.criteria.filter(
+    (criterion) =>
+      criterion.status === "PENDING" || criterion.status === "BLOCKED",
+  );
+  const requestedIds = step.acceptanceCriterionIds;
+  const requested = requestedIds.length
+    ? requestedIds.map((id) => {
+        const criterion = contract.criteria.find((item) => item.id === id);
+        if (!criterion) throw new Error(`不存在验收项 ${id}`);
+        if (
+          criterion.status !== "PENDING" &&
+          criterion.status !== "BLOCKED"
+        ) {
+          throw new Error(`验收项 ${criterion.label} 已不是待验证状态`);
+        }
+        return criterion;
+      })
+    : pending;
+  const automatic = pending.filter((criterion) =>
+    ["SCOPE_BOUND", "DATABASE_EVIDENCE", "RESULT_COMPLETENESS"].includes(
+      criterion.kind,
+    ),
+  );
+  const candidates = [
+    ...new Map(
+      [...requested, ...automatic].map((criterion) => [
+        criterion.id,
+        criterion,
+      ]),
+    ).values(),
+  ];
+  const targets = candidates.filter((criterion) =>
+    canIntentAddressCriterion(criterion.kind, intent, step.role),
+  );
+  if (requestedIds.length && targets.length !== candidates.length) {
+    const unsupported = candidates
+      .filter(
+        (criterion) =>
+          !canIntentAddressCriterion(criterion.kind, intent, step.role),
+      )
+      .map((criterion) => criterion.label);
+    throw new Error(
+      `当前查询结构不能验证：${unsupported.join("、")}；请补充对应时间计算、分组维度或指标`,
+    );
+  }
+  if (!targets.length) {
+    throw new Error(
+      "当前查询不能关闭任何待验收项，请改为能够补充现有证据缺口的计划",
+    );
+  }
+  return [...new Set(targets.map((criterion) => criterion.id))];
+}
+
+function canIntentAddressCriterion(
+  kind: AcceptanceCriterion["kind"],
+  intent: AnalysisIntent,
+  role: AnalysisRunStep["role"],
+): boolean {
+  if (
+    ["SCOPE_BOUND", "DATABASE_EVIDENCE", "RESULT_COMPLETENESS"].includes(kind)
+  ) {
+    return true;
+  }
+  if (kind === "REQUESTED_RESULT" || kind === "PHENOMENON") {
+    return intent.measureIds.length > 0 || intent.resultKind === "detail";
+  }
+  if (kind === "OVERVIEW") {
+    return role === "OVERVIEW" && intent.measureIds.length > 0;
+  }
+  if (kind === "COMPARISON" || kind === "BASELINE") {
+    return Boolean(intent.timeComparisons?.length || intent.timeGrain);
+  }
+  if (kind === "STRUCTURE") {
+    return intent.dimensionPropertyIds.length > 0;
+  }
+  return (
+    kind === "DRIVERS" &&
+    role !== "OVERVIEW" &&
+    intent.dimensionPropertyIds.length > 0
+  );
+}
+
+function satisfyAcceptanceCriteria(
+  contract: AnalysisAcceptanceContract | undefined,
+  criterionIds: string[],
+  stepId: string,
+  intent: AnalysisIntent,
+  artifact: ResultArtifact,
+): void {
+  if (!contract) return;
+  const completeness = contract.criteria.find(
+    (criterion) => criterion.kind === "RESULT_COMPLETENESS",
+  );
+  if (completeness) {
+    completeness.evidenceStepIds = [
+      ...new Set([...completeness.evidenceStepIds, stepId]),
+    ];
+    if (artifact.truncated) {
+      completeness.status = "BLOCKED";
+      completeness.summary =
+        "至少一条用于本轮结论的查询结果被截断，需要缩小范围或执行纠正查询";
+    }
+  }
+  for (const id of criterionIds) {
+    const criterion = contract.criteria.find((item) => item.id === id);
+    if (
+      !criterion ||
+      !["PENDING", "BLOCKED"].includes(criterion.status)
+    ) {
+      continue;
+    }
+    if (
+      !canIntentAddressCriterion(
+        criterion.kind,
+        intent,
+        criterion.kind === "DRIVERS" ? "DIAGNOSTIC" : "OVERVIEW",
+      )
+    ) {
+      continue;
+    }
+    criterion.evidenceStepIds = [
+      ...new Set([...criterion.evidenceStepIds, stepId]),
+    ];
+    if (criterion.kind === "RESULT_COMPLETENESS" && artifact.truncated) {
+      continue;
+    }
+    if (
+      ["COMPARISON", "BASELINE"].includes(criterion.kind) &&
+      !intent.timeComparisons?.length &&
+      artifact.rowCount < 2
+    ) {
+      criterion.status = "BLOCKED";
+      criterion.summary =
+        "当前结果不足两个时间点，不能验证变化或比较基准";
+      continue;
+    }
+    if (
+      ["STRUCTURE", "DRIVERS"].includes(criterion.kind) &&
+      artifact.rowCount === 0
+    ) {
+      criterion.status = "BLOCKED";
+      criterion.summary = "当前分组查询没有返回可用于结构或驱动判断的数据";
+      continue;
+    }
+    criterion.status = "SATISFIED";
+    criterion.summary =
+      artifact.rowCount > 0
+        ? `由查询步骤 ${stepId} 的 ${artifact.rowCount} 行数据库结果验证`
+        : `由查询步骤 ${stepId} 的空结果验证当前范围内无匹配数据`;
+  }
+  contract.successfulQueries += 1;
+  contract.remainingQueries = Math.max(
+    0,
+    contract.maxSuccessfulQueries - contract.successfulQueries,
+  );
+  updateAcceptanceContractStatus(contract);
+}
+
+function updateAcceptanceContractStatus(
+  contract: AnalysisAcceptanceContract,
+): void {
+  const complete = acceptanceContractSatisfied(contract);
+  contract.status = complete ? "SATISFIED" : "OPEN";
+}
+
+function acceptanceContractSatisfied(
+  contract: AnalysisAcceptanceContract | undefined,
+): boolean {
+  return Boolean(
+    contract?.criteria
+      .filter((criterion) => criterion.required)
+      .every((criterion) =>
+        ["SATISFIED", "NOT_APPLICABLE"].includes(criterion.status),
+      ),
+  );
+}
+
+function finalizeAcceptanceContract(
+  state: AnalysisExecutionState,
+  rawAnswer: string,
+  hasResult: boolean,
+): AnalysisAcceptanceContract | undefined {
+  const contract = state.acceptanceContract;
+  if (!contract) return undefined;
+  contract.successfulQueries = state.captures.length;
+  contract.remainingQueries = Math.max(
+    0,
+    contract.maxSuccessfulQueries - contract.successfulQueries,
+  );
+  updateAcceptanceContractStatus(contract);
+  if (contract.status === "SATISFIED") return contract;
+  if (!hasResult) {
+    contract.status = "NEEDS_CLARIFICATION";
+    contract.stopReason = "没有取得可用于验收的数据库结果";
+    return contract;
+  }
+  const runtimeBudgetReached =
+    /Stopped: (?:token|turn|tool-call) budget reached\./i.test(rawAnswer);
+  if (state.queryBudgetReached || runtimeBudgetReached) {
+    contract.status = "PARTIAL_BUDGET";
+    contract.stopReason = state.queryBudgetReached
+      ? `已达到 ${contract.maxSuccessfulQueries} 条成功查询预算`
+      : "已达到 Montane 本轮运行预算";
+  } else {
+    contract.status = "PARTIAL_NO_PROGRESS";
+    contract.stopReason = "执行已停止，但仍有必需验收项没有证据";
+  }
+  return contract;
+}
+
+function formatPartialAnalysisAnswer(
+  answer: string,
+  contract: AnalysisAcceptanceContract,
+): string {
+  const missing = contract.criteria
+    .filter(
+      (criterion) =>
+        criterion.required &&
+        !["SATISFIED", "NOT_APPLICABLE"].includes(criterion.status),
+    )
+    .map((criterion) => criterion.label);
+  return [
+    answer,
+    "",
+    `完成状态：部分完成（${contract.stopReason ?? "仍有证据缺口"}）。`,
+    missing.length ? `尚未验收：${missing.join("、")}。` : "",
+  ].filter(Boolean).join("\n");
+}
+
 function normalizeAnalysisStep(
   raw: Record<string, unknown> | undefined,
   fallbackTitle: string,
@@ -3086,6 +3542,7 @@ function normalizeAnalysisStep(
   objective: string;
   rationale: string;
   role: AnalysisRunStep["role"];
+  acceptanceCriterionIds: string[];
 } {
   const role = ["DIAGNOSTIC", "SUPPORTING"].includes(String(raw?.role))
     ? String(raw?.role) as AnalysisRunStep["role"]
@@ -3097,6 +3554,14 @@ function normalizeAnalysisStep(
       raw?.rationale ?? "根据用户问题执行受控语义查询",
     ),
     role,
+    acceptanceCriterionIds: Array.isArray(raw?.acceptance_criterion_ids)
+      ? [...new Set(
+          raw.acceptance_criterion_ids
+            .map(String)
+            .map((item) => item.trim())
+            .filter(Boolean),
+        )]
+      : [],
   };
 }
 
@@ -3114,6 +3579,8 @@ function stableAnalysisPlanHash(intent: AnalysisIntent): string {
     derivedMeasures: intent.derivedMeasures,
     timeComparisons: intent.timeComparisons,
     windowCalculations: intent.windowCalculations,
+    groupSelections: intent.groupSelections,
+    periodConditions: intent.periodConditions,
     sort: intent.sort,
     limit: intent.limit,
     resultKind: intent.resultKind,

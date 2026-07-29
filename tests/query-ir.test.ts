@@ -283,7 +283,7 @@ describe("QueryIrCompiler", () => {
     );
     expect(compiled.sql).toContain("ORDER BY `月份` ASC");
     expect(compiled.ir).toMatchObject({
-      version: 2,
+      version: 3,
       grain: "月份",
       timeGrain: { unit: "MONTH", propertyId: "p_paid_at" },
     });
@@ -836,6 +836,197 @@ describe("QueryIrCompiler", () => {
         [ordersTable()],
       ),
     ).toThrow("至少需要一个分区属性");
+  });
+
+  it("compiles every-period conditions across the last complete years", () => {
+    const ontology = ontologyWithTime();
+    const compiler = new QueryIrCompiler(() => new Date("2026-07-29T02:00:00.000Z"));
+    const compiled = compiler.compile(
+      {
+        rootObjectId: "o_order",
+        measureIds: ["m_gmv"],
+        dimensionPropertyIds: ["p_store_id"],
+        filters: [],
+        timeRange: { expression: "近三年" },
+        timeGrain: { unit: "YEAR" },
+        periodConditions: [
+          {
+            id: "period_every_year",
+            label: "每年成交金额达标",
+            measureId: "m_gmv",
+            operator: "GT",
+            value: 100,
+            quantifier: "EVERY",
+            groupByPropertyIds: ["p_store_id"],
+            missingPeriodPolicy: "FAIL",
+          },
+        ],
+        sort: [{ entityId: "p_store_id", direction: "ASC" }],
+        limit: 10,
+        resultKind: "aggregate",
+        title: "近三年每年成交金额达标的门店",
+      },
+      ontology,
+      [ordersTable()],
+      "Asia/Shanghai",
+    );
+
+    expect(compiled.ir.version).toBe(3);
+    expect(compiled.ir.timeRange).toMatchObject({
+      start: "2023-01-01 00:00:00",
+      endExclusive: "2026-01-01 00:00:00",
+      mode: "COMPLETE_PERIODS",
+      periodCount: 3,
+      periodUnit: "YEAR",
+    });
+    expect(compiled.sql).toContain("`period_regrouped` AS (");
+    expect(compiled.sql).toContain(
+      "COUNT(DISTINCT p.`年份`) AS `覆盖期间数`",
+    );
+    expect(compiled.sql).toContain(
+      "SUM(CASE WHEN p.`成交金额` > ? THEN 1 ELSE 0 END) AS `每年成交金额达标满足期间数`",
+    );
+    expect(compiled.sql).toContain("r.`覆盖期间数` = 3");
+    expect(compiled.sql).toContain("r.`每年成交金额达标满足期间数` = 3");
+    expect(compiled.sql).toContain("LIMIT 200");
+    expect(compiled.parameters).toEqual([
+      "2023-01-01 00:00:00",
+      "2026-01-01 00:00:00",
+      100,
+    ]);
+    expect(compiled.ir.resultContract).toEqual({
+      calculationSource: "DORIS_SQL",
+      businessLogicBeforeLimit: true,
+      completeness: "COMPLETE_IF_NOT_TRUNCATED",
+      expectedPeriodCount: 3,
+      exhaustiveRequested: true,
+    });
+  });
+
+  it.each([
+    {
+      quantifier: "ANY" as const,
+      minimumMatches: undefined,
+      expectedSql: "r.`期间达标满足期间数` >= 1",
+    },
+    {
+      quantifier: "AT_LEAST_N" as const,
+      minimumMatches: 4,
+      expectedSql: "r.`期间达标满足期间数` >= 4",
+    },
+  ])("compiles $quantifier period quantifiers", ({
+    quantifier,
+    minimumMatches,
+    expectedSql,
+  }) => {
+    const ontology = ontologyWithTime();
+    const compiled = new QueryIrCompiler(() =>
+      new Date("2026-07-29T02:00:00.000Z"),
+    ).compile(
+      {
+        rootObjectId: "o_order",
+        measureIds: ["m_gmv"],
+        dimensionPropertyIds: ["p_store_id"],
+        filters: [],
+        timeRange: { expression: "近6个完整月" },
+        timeGrain: { unit: "MONTH" },
+        periodConditions: [
+          {
+            id: `period_${quantifier.toLowerCase()}`,
+            label: "期间达标",
+            measureId: "m_gmv",
+            operator: "GTE",
+            value: 10,
+            quantifier,
+            minimumMatches,
+            groupByPropertyIds: ["p_store_id"],
+            missingPeriodPolicy: "FAIL",
+          },
+        ],
+        resultKind: "aggregate",
+        title: "期间条件",
+      },
+      ontology,
+      [ordersTable()],
+      "Asia/Shanghai",
+    );
+
+    expect(compiled.sql).toContain("r.`覆盖期间数` = 6");
+    expect(compiled.sql).toContain(expectedSql);
+  });
+
+  it("selects Top N inside every group before the final result limit", () => {
+    const ontology = structuredClone(testOntology);
+    ontology.dimensionHierarchies = [
+      {
+        id: "hierarchy_store_customer",
+        name: "store_customer",
+        label: "门店客户层级",
+        levels: [
+          { objectId: "o_order", propertyId: "p_store_id" },
+          { objectId: "o_order", propertyId: "p_customer_id" },
+        ],
+        status: "PUBLISHED",
+      },
+    ];
+    const compiled = new QueryIrCompiler().compile(
+      {
+        rootObjectId: "o_order",
+        measureIds: ["m_gmv"],
+        dimensionPropertyIds: ["p_store_id", "p_customer_id"],
+        filters: [],
+        groupSelections: [
+          {
+            id: "selection_top_customer",
+            label: "门店内排名",
+            operator: "TOP_N",
+            partitionByPropertyIds: ["p_store_id"],
+            orderByEntityId: "m_gmv",
+            count: 1,
+            ties: "INCLUDE",
+          },
+        ],
+        sort: [{ entityId: "p_store_id", direction: "ASC" }],
+        limit: 15,
+        resultKind: "aggregate",
+        title: "每个门店成交最高的客户",
+      },
+      ontology,
+      [ordersTable()],
+    );
+
+    expect(compiled.sql).toContain(
+      "RANK() OVER (PARTITION BY g.`门店` ORDER BY g.`成交金额` DESC) AS `门店内排名`",
+    );
+    expect(compiled.sql).toContain("r.`门店内排名` <= 1");
+    expect(compiled.sql).toContain("LIMIT 200");
+    expect(compiled.ir.resultContract.exhaustiveRequested).toBe(true);
+
+    expect(() =>
+      new QueryIrCompiler().compile(
+        {
+          rootObjectId: "o_order",
+          measureIds: ["m_gmv"],
+          dimensionPropertyIds: ["p_store_id", "p_customer_id"],
+          filters: [],
+          groupSelections: [
+            {
+              id: "selection_wrong_direction",
+              label: "错误层级排名",
+              operator: "TOP_N",
+              partitionByPropertyIds: ["p_customer_id"],
+              orderByEntityId: "m_gmv",
+              count: 1,
+              ties: "EXCLUDE",
+            },
+          ],
+          resultKind: "aggregate",
+          title: "错误层级",
+        },
+        ontology,
+        [ordersTable()],
+      ),
+    ).toThrow("分区维度必须位于明细维度上级");
   });
 
   it("filters grouped base and composite metrics after aggregation", () => {

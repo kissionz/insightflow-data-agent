@@ -3,9 +3,11 @@ import {
   createDraftFromPublished,
   metricExpression,
   publishDraft,
+  removeDimensionHierarchyFromDraft,
   removeMetricFromDraft,
   removeObjectFromDraft,
   upsertMetricInDraft,
+  upsertDimensionHierarchyInDraft,
   validateOntology,
 } from "../src/server/ontology.js";
 import { testOntology } from "./fixtures.js";
@@ -26,14 +28,99 @@ describe("ontology lifecycle", () => {
   });
 
   it("publishes every child entity without mutating the draft", () => {
-    const draft = createDraftFromPublished(testOntology);
+    const source = structuredClone(testOntology);
+    source.dimensionHierarchies = [
+      {
+        id: "hierarchy_product",
+        name: "product",
+        label: "商品层级",
+        levels: [
+          { objectId: "o_order", propertyId: "p_store_id" },
+          { objectId: "o_order", propertyId: "p_customer_id" },
+        ],
+        status: "PUBLISHED",
+      },
+    ];
+    const draft = createDraftFromPublished(source);
     const published = publishDraft(draft);
 
     expect(published.status).toBe("PUBLISHED");
     expect(published.objects.every((object) => object.status === "PUBLISHED")).toBe(true);
     expect(published.metrics.every((metric) => metric.status === "PUBLISHED")).toBe(true);
     expect(published.relations.every((relation) => relation.status === "PUBLISHED")).toBe(true);
+    expect(
+      published.dimensionHierarchies?.every(
+        (hierarchy) => hierarchy.status === "PUBLISHED",
+      ),
+    ).toBe(true);
+    expect(
+      draft.dimensionHierarchies?.every(
+        (hierarchy) => hierarchy.status === "DRAFT",
+      ),
+    ).toBe(true);
     expect(draft.status).toBe("DRAFT");
+  });
+
+  it("validates dimension hierarchy levels and safe paths", () => {
+    const draft = createDraftFromPublished(testOntology);
+    draft.dimensionHierarchies = [
+      {
+        id: "hierarchy_invalid",
+        name: "invalid",
+        label: "错误层级",
+        levels: [
+          { objectId: "o_customer", propertyId: "p_customer_level" },
+          { objectId: "o_store", propertyId: "p_store_id" },
+        ],
+        status: "DRAFT",
+      },
+    ];
+    const result = validateOntology(
+      draft,
+      draft.objects.map((object) => ({
+        id: object.sourceTableId,
+        catalog: "internal",
+        database: "retail",
+        name: object.name,
+        type: "TABLE",
+        status: "MODELED",
+        columns: [],
+        fingerprint: "v1",
+        scannedAt: new Date().toISOString(),
+      })),
+    );
+
+    expect(
+      result.issues.some(
+        (issue) => issue.code === "DIMENSION_HIERARCHY_PATH_UNSAFE",
+      ),
+    ).toBe(true);
+  });
+
+  it("upserts and removes dimension hierarchies inside a draft", () => {
+    const draft = createDraftFromPublished(testOntology);
+    const updated = upsertDimensionHierarchyInDraft(draft, {
+      id: "hierarchy_order",
+      name: "order",
+      label: "订单分析层级",
+      levels: [
+        { objectId: "o_order", propertyId: "p_store_id" },
+        { objectId: "o_order", propertyId: "p_customer_id" },
+      ],
+      status: "PUBLISHED",
+    });
+    expect(updated.dimensionHierarchies).toContainEqual(
+      expect.objectContaining({
+        id: "hierarchy_order",
+        status: "DRAFT",
+      }),
+    );
+
+    const removed = removeDimensionHierarchyFromDraft(
+      updated,
+      "hierarchy_order",
+    );
+    expect(removed.dimensionHierarchies).toEqual([]);
   });
 
   it("blocks publishing an incomplete object", () => {

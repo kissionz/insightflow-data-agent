@@ -6,6 +6,7 @@ import { z } from "zod";
 import type {
   Conversation,
   DataSourceInput,
+  DimensionHierarchy,
   Metric,
   OntologyObject,
   OntologySnapshot,
@@ -22,11 +23,14 @@ import {
   addTablesToDraft,
   applyObjectEdit,
   createDraftFromPublished,
+  dimensionHierarchyEditSchema,
   metricEditSchema,
   objectEditSchema,
   publishDraft,
   removeMetricFromDraft,
+  removeDimensionHierarchyFromDraft,
   removeObjectFromDraft,
+  upsertDimensionHierarchyInDraft,
   upsertMetricInDraft,
   validateOntology,
 } from "./ontology.js";
@@ -395,6 +399,56 @@ app.delete<{ Params: { id: string } }>(
     } catch (error) {
       return reply.code(422).send({
         message: error instanceof Error ? error.message : "删除指标失败",
+      });
+    }
+  },
+);
+
+app.put<{ Params: { id: string }; Body: unknown }>(
+  "/api/ontology/draft/dimension-hierarchies/:id",
+  async (request, reply) => {
+    const draft = repository.getDraftOntology();
+    if (!draft) {
+      return reply.code(409).send({ message: "请先创建编辑草稿" });
+    }
+    const parsed = dimensionHierarchyEditSchema.safeParse(request.body);
+    if (!parsed.success || parsed.data.hierarchy.id !== request.params.id) {
+      return reply.code(400).send({
+        message: parsed.success
+          ? "维度层级 ID 与请求不一致"
+          : parsed.error.issues[0]?.message || "维度层级配置不完整",
+      });
+    }
+    const updated = upsertDimensionHierarchyInDraft(
+      draft,
+      parsed.data.hierarchy as DimensionHierarchy,
+    );
+    const validation = validateOntology(updated, repository.getTables());
+    repository.saveOntology(updated);
+    return { ontology: updated, validation };
+  },
+);
+
+app.delete<{ Params: { id: string } }>(
+  "/api/ontology/draft/dimension-hierarchies/:id",
+  async (request, reply) => {
+    const draft = repository.getDraftOntology();
+    if (!draft) {
+      return reply.code(409).send({ message: "请先创建编辑草稿" });
+    }
+    try {
+      const updated = removeDimensionHierarchyFromDraft(
+        draft,
+        request.params.id,
+      );
+      repository.saveOntology(updated);
+      return {
+        ontology: updated,
+        validation: validateOntology(updated, repository.getTables()),
+      };
+    } catch (error) {
+      return reply.code(422).send({
+        message: error instanceof Error ? error.message : "删除维度层级失败",
       });
     }
   },

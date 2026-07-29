@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type {
+  DimensionHierarchy,
   Metric,
   OntologyObject,
   OntologyRelation,
@@ -151,6 +152,25 @@ const relationSchema = z.object({
   status: entityStatusSchema,
 });
 
+export const dimensionHierarchyEditSchema = z.object({
+  hierarchy: z.object({
+    id: z.string().min(1),
+    name: z.string().trim().min(1).max(120),
+    label: z.string().trim().min(1).max(120),
+    description: z.string().max(2_000).optional(),
+    levels: z
+      .array(
+        z.object({
+          objectId: z.string().min(1),
+          propertyId: z.string().min(1),
+        }),
+      )
+      .min(2)
+      .max(20),
+    status: entityStatusSchema,
+  }),
+});
+
 export const objectEditSchema = z.object({
   object: objectSchema,
   metrics: z.array(metricSchema).max(500),
@@ -175,6 +195,9 @@ export function createDraftFromPublished(
       status: "DRAFT",
     })),
     metrics: draft.metrics.map((metric) => ({ ...metric, status: "DRAFT" })),
+    dimensionHierarchies: (draft.dimensionHierarchies ?? []).map(
+      (hierarchy) => ({ ...hierarchy, status: "DRAFT" }),
+    ),
   };
 }
 
@@ -371,6 +394,44 @@ export function removeMetricFromDraft(
   };
 }
 
+export function upsertDimensionHierarchyInDraft(
+  draft: OntologySnapshot,
+  hierarchy: DimensionHierarchy,
+): OntologySnapshot {
+  const normalized = {
+    ...hierarchy,
+    status: "DRAFT" as const,
+    levels: hierarchy.levels.map((level) => ({ ...level })),
+  };
+  const current = draft.dimensionHierarchies ?? [];
+  return {
+    ...draft,
+    dimensionHierarchies: current.some(
+      (candidate) => candidate.id === hierarchy.id,
+    )
+      ? current.map((candidate) =>
+          candidate.id === hierarchy.id ? normalized : candidate,
+        )
+      : [...current, normalized],
+  };
+}
+
+export function removeDimensionHierarchyFromDraft(
+  draft: OntologySnapshot,
+  hierarchyId: string,
+): OntologySnapshot {
+  const current = draft.dimensionHierarchies ?? [];
+  if (!current.some((hierarchy) => hierarchy.id === hierarchyId)) {
+    throw new Error("维度层级不存在");
+  }
+  return {
+    ...draft,
+    dimensionHierarchies: current.filter(
+      (hierarchy) => hierarchy.id !== hierarchyId,
+    ),
+  };
+}
+
 export function removeObjectFromDraft(
   draft: OntologySnapshot,
   objectId: string,
@@ -388,6 +449,10 @@ export function removeObjectFromDraft(
         (relation) =>
           relation.sourceObjectId !== objectId &&
           relation.targetObjectId !== objectId,
+      ),
+      dimensionHierarchies: (next.dimensionHierarchies ?? []).filter(
+        (hierarchy) =>
+          !hierarchy.levels.some((level) => level.objectId === objectId),
       ),
     },
   };
@@ -845,6 +910,94 @@ export function validateOntology(
       });
     }
   }
+  for (const hierarchy of snapshot.dimensionHierarchies ?? []) {
+    if (!hierarchy.name.trim() || !hierarchy.label.trim()) {
+      issues.push(
+        error(
+          "DIMENSION_HIERARCHY_NAME_REQUIRED",
+          "维度层级名称和标识不能为空",
+          undefined,
+          hierarchy.id,
+        ),
+      );
+    }
+    if (hierarchy.levels.length < 2) {
+      issues.push(
+        error(
+          "DIMENSION_HIERARCHY_LEVELS_REQUIRED",
+          `维度层级 ${hierarchy.label} 至少需要两个层级`,
+          undefined,
+          hierarchy.id,
+        ),
+      );
+      continue;
+    }
+    const levelKeys = new Set<string>();
+    for (const level of hierarchy.levels) {
+      const object = snapshot.objects.find(
+        (candidate) => candidate.id === level.objectId,
+      );
+      const property = object?.properties.find(
+        (candidate) => candidate.id === level.propertyId,
+      );
+      const key = `${level.objectId}:${level.propertyId}`;
+      if (levelKeys.has(key)) {
+        issues.push(
+          error(
+            "DIMENSION_HIERARCHY_LEVEL_DUPLICATE",
+            `维度层级 ${hierarchy.label} 重复引用了同一属性`,
+            level.objectId,
+            hierarchy.id,
+          ),
+        );
+      }
+      levelKeys.add(key);
+      if (!object || !property) {
+        issues.push(
+          error(
+            "DIMENSION_HIERARCHY_LEVEL_INVALID",
+            `维度层级 ${hierarchy.label} 引用了不存在的对象或属性`,
+            level.objectId,
+            hierarchy.id,
+          ),
+        );
+      } else if (property.visibility !== "ANALYTICAL" || property.sensitive) {
+        issues.push(
+          error(
+            "DIMENSION_HIERARCHY_LEVEL_NOT_ANALYTICAL",
+            `维度层级 ${hierarchy.label} 的属性 ${property.label} 必须可分析且非敏感`,
+            object.id,
+            hierarchy.id,
+          ),
+        );
+      }
+    }
+    for (let index = 1; index < hierarchy.levels.length; index += 1) {
+      const parent = hierarchy.levels[index - 1]!;
+      const child = hierarchy.levels[index]!;
+      if (parent.objectId === child.objectId) continue;
+      const safeRelation = snapshot.relations.some(
+        (relation) =>
+          relation.enabled &&
+          relation.fanoutRisk !== "HIGH" &&
+          relation.cardinality !== "MANY_TO_MANY" &&
+          ((relation.sourceObjectId === child.objectId &&
+            relation.targetObjectId === parent.objectId) ||
+            (relation.sourceObjectId === parent.objectId &&
+              relation.targetObjectId === child.objectId)),
+      );
+      if (!safeRelation) {
+        issues.push(
+          error(
+            "DIMENSION_HIERARCHY_PATH_UNSAFE",
+            `维度层级 ${hierarchy.label} 的相邻层级缺少安全的多对一关系`,
+            child.objectId,
+            hierarchy.id,
+          ),
+        );
+      }
+    }
+  }
   return { valid: !issues.some((issue) => issue.level === "ERROR"), issues };
 }
 
@@ -860,6 +1013,9 @@ export function publishDraft(draft: OntologySnapshot): OntologySnapshot {
       status: "PUBLISHED",
     })),
     metrics: published.metrics.map((metric) => ({ ...metric, status: "PUBLISHED" })),
+    dimensionHierarchies: (published.dimensionHierarchies ?? []).map(
+      (hierarchy) => ({ ...hierarchy, status: "PUBLISHED" }),
+    ),
   };
 }
 

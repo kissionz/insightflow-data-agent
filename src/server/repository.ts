@@ -689,6 +689,7 @@ function emptyOntology(): OntologySnapshot {
     objects: [],
     relations: [],
     metrics: [],
+    dimensionHierarchies: [],
   };
 }
 
@@ -829,6 +830,7 @@ function normalizeOntology(input: OntologySnapshot): OntologySnapshot {
       metricType: metric.metricType ?? "BASE",
       definitionMode: metric.definitionMode ?? "SQL",
     })),
+    dimensionHierarchies: snapshot.dimensionHierarchies ?? [],
   };
 }
 

@@ -49,6 +49,8 @@ const DATA_AGENT_SYSTEM_PROMPT = `
 8.1 占全体比例使用 PERCENT_OF_TOTAL，partition_by_property_ids 必须为空；按区域、渠道等组内占比使用 PERCENT_OF_PARTITION，并把一个或多个分组属性 ID 放入 partition_by_property_ids。占比固定在业务筛选之后、排序和 Top N 之前计算；不得使用同一指标除以自身模拟占比。
 8.2 OntologySearch 返回 metricType=DERIVED 的正式复合指标时，直接把该指标 ID 放入 measure_ids，不要再次用 derived_calculations 重建其公式；其依赖 DAG 由 IR 自动展开。
 8.3 “今年、本月、本季度、本周”等尚未结束的自然周期按截至当前日期处理；同比和环比由 IR 自动生成同进度基期，不得把未完整的当前周期与完整历史周期比较。
+8.4 “每个类目最高的SPU”“各区域前3名”等每组排名必须使用 group_selections，不能只提交分区 RANK 后再做全局 LIMIT。每组第一名使用 TOP_N/count=1；partition_by_property_ids 是上级分组维度。
+8.5 “近三年每年都”“任意月份”“至少4个月”等跨期间集合条件必须使用 period_conditions。每一期都满足使用 EVERY，任意一期使用 ANY，至少N期使用 AT_LEAST_N；不能先用 aggregate_filters 删除失败期间，也不能让最终回答根据截断行人工归并。“近N年”默认解释为最近 N 个完整自然年。
 9. ExecuteAnalysisPlan 是唯一查询入口，它会通过规则引擎生成 IR、校验关系、粒度、可加性、筛选逻辑和窗口计算，编译参数化 Doris SQL 并执行查询。
 9.1 直接问数通常只执行一次。探索或诊断分析可以根据真实结果最多执行四步；每一步必须提供 analysis_step，说明本步目标、依据和结果角色。先用一条查询同时获取多个核心指标，再根据结果决定是否按一个高价值维度继续诊断。不得重复相同计划，不得跨事实对象，已有证据足够时立即停止。
 9.2 每次 ExecuteAnalysisPlan 返回 observation。继续查询前必须基于该 observation 说明新查询要验证的具体问题；不得为了“多分析一步”而机械穷举所有维度。
@@ -214,10 +216,21 @@ export class DataAgentHarness {
       },
     );
 
-    const answer = localizeHarnessStop(await loop.run(turn.question));
+    let answer = localizeHarnessStop(await loop.run(turn.question));
     const completed = analysisState.captures.find(
       (analysis) => analysis.role === "OVERVIEW",
     ) ?? analysisState.captures[0];
+    if (
+      completed?.compiled.ir.resultContract.exhaustiveRequested &&
+      completed.artifact.verification &&
+      !completed.artifact.verification.exhaustive
+    ) {
+      answer = [
+        "查询已经执行，但结果达到当前返回上限，无法确认完整名单。",
+        "系统不会在截断结果上由模型人工归并“全部满足”或“每组第一”等集合结论。",
+        "请缩小业务范围，或提高受控查询结果上限后重试。",
+      ].join("\n");
+    }
     const asksForData = isLikelyDataQuestion(turn.question);
     const responseKind: HarnessRunResult["responseKind"] = completed
       ? "analysis"
@@ -705,12 +718,35 @@ export class DataAgentHarness {
             cardinality: relation.cardinality,
             fanoutRisk: relation.fanoutRisk,
           })),
+          dimensionHierarchies: (ontology.dimensionHierarchies ?? [])
+            .filter((hierarchy) =>
+              hierarchy.levels.some(
+                (level) =>
+                  relevantIds.has(level.objectId) ||
+                  relevantPropertyIds.has(level.propertyId),
+              ),
+            )
+            .map((hierarchy) => ({
+              id: hierarchy.id,
+              label: hierarchy.label,
+              levels: hierarchy.levels.map((level) => ({
+                objectId: level.objectId,
+                propertyId: level.propertyId,
+                objectLabel:
+                  ontology.objects.find((object) => object.id === level.objectId)
+                    ?.label ?? level.objectId,
+                propertyLabel:
+                  findPropertyBinding(ontology, level.propertyId)?.property
+                    .label ?? level.propertyId,
+              })),
+            })),
           unpublishedMetricLabels,
           instructions: [
             "matches 是词形候选，不代表具体业务值的字段归属",
             "具体值必须调用 PropertyValueSearch 做全局值索引验证",
             "measure_ids 只能使用 metrics[].id；measureKind=PROPERTY 表示由数字属性默认聚合生成的受控度量",
             "按维度汇总后的指标阈值必须使用 aggregate_filters/aggregate_filter_expression 并引用 metrics[].id；不得改成来源属性 filters",
+            "dimensionHierarchies 给出安全的上卷和下钻顺序；每组 Top N 的分区维度应位于明细维度上级",
             unpublishedMetricLabels.length
               ? `指标 ${unpublishedMetricLabels.join("、")} 仅存在于草稿，正式问数不可使用；请提示用户校验并发布草稿，不得重复搜索或改写近义词`
               : "不得对相同问题重复调用 OntologySearch；没有候选时应向用户澄清",
@@ -1266,6 +1302,21 @@ export class DataAgentHarness {
                 type: "string",
                 description: "可选，OntologySearch 返回的时间属性 ID",
               },
+              mode: {
+                type: "string",
+                enum: ["AUTO", "ROLLING", "LAST_N_COMPLETE_PERIODS"],
+                description:
+                  "可选时间模式；跨期间“每期都”优先使用 LAST_N_COMPLETE_PERIODS",
+              },
+              count: {
+                type: "number",
+                description: "完整自然周期数量",
+              },
+              unit: {
+                type: "string",
+                enum: ["DAY", "WEEK", "MONTH", "QUARTER", "YEAR"],
+                description: "完整自然周期单位",
+              },
             },
             required: ["expression"],
           },
@@ -1397,6 +1448,101 @@ export class DataAgentHarness {
                 "measure_id",
                 "operator",
                 "partition_by_property_ids",
+              ],
+            },
+          },
+          group_selections: {
+            type: "array",
+            description:
+              "每个分组内的 Top/Bottom N。用于“每个类目最高SPU”等问题；业务判断完成后才执行最终全局行数限制。",
+            items: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                id: { type: "string", description: "select_ 前缀的本轮选择 ID" },
+                label: { type: "string", description: "结果排名列名称" },
+                operator: {
+                  type: "string",
+                  enum: ["TOP_N", "BOTTOM_N"],
+                },
+                partition_by_property_ids: {
+                  type: "array",
+                  minItems: 1,
+                  items: { type: "string" },
+                  description: "上级分组维度属性 ID，支持复合分组",
+                },
+                order_by_entity_id: {
+                  type: "string",
+                  description:
+                    "用于组内排序的基础指标或本轮受控计算 ID；组内占比排序可直接使用同分母的基础指标",
+                },
+                count: { type: "number", description: "每组保留数量，1到100" },
+                ties: {
+                  type: "string",
+                  enum: ["INCLUDE", "EXCLUDE"],
+                  description: "是否包含边界并列项",
+                },
+              },
+              required: [
+                "id",
+                "label",
+                "operator",
+                "partition_by_property_ids",
+                "order_by_entity_id",
+                "count",
+                "ties",
+              ],
+            },
+          },
+          period_conditions: {
+            type: "array",
+            description:
+              "跨时间桶的集合条件。先按时间粒度计算指标，再按 group_by_property_ids 二次聚合并判断 EVERY/ANY/AT_LEAST_N。",
+            items: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                id: { type: "string", description: "period_ 前缀的本轮条件 ID" },
+                label: { type: "string" },
+                measure_id: { type: "string" },
+                operator: {
+                  type: "string",
+                  enum: ["EQ", "NE", "GT", "GTE", "LT", "LTE"],
+                },
+                value: { type: "number" },
+                quantifier: {
+                  type: "string",
+                  enum: ["EVERY", "ANY", "AT_LEAST_N"],
+                },
+                minimum_matches: {
+                  type: "number",
+                  description: "AT_LEAST_N 时必填",
+                },
+                group_by_property_ids: {
+                  type: "array",
+                  minItems: 1,
+                  items: { type: "string" },
+                  description: "最终保留的分组属性，例如 SPU",
+                },
+                expected_period_count: {
+                  type: "number",
+                  description: "可选；通常从完整自然周期自动推导",
+                },
+                missing_period_policy: {
+                  type: "string",
+                  enum: ["FAIL", "IGNORE"],
+                  description: "缺失任一期是否判定不满足",
+                },
+              },
+              required: [
+                "id",
+                "label",
+                "measure_id",
+                "operator",
+                "value",
+                "quantifier",
+                "group_by_property_ids",
+                "missing_period_policy",
               ],
             },
           },
@@ -1538,6 +1684,8 @@ export class DataAgentHarness {
             error instanceof Error ? error.message : "IR规则校验失败";
           const aggregateCoverageError =
             /aggregate_filters|聚合后筛选|HAVING/.test(detail);
+          const stagedCoverageError =
+            /period_conditions|group_selections|跨期间|组内选择/.test(detail);
           return {
             ok: false,
             content: `IR规则校验失败：${detail}`,
@@ -1545,10 +1693,14 @@ export class DataAgentHarness {
               stage: "planning",
               code: aggregateCoverageError
                 ? "AGGREGATE_THRESHOLD_COVERAGE_REQUIRED"
+                : stagedCoverageError
+                  ? "STAGED_ANALYSIS_COVERAGE_REQUIRED"
                 : "INTENT_NORMALIZATION_FAILED",
               retryInstruction:
                 aggregateCoverageError
                   ? "把每个分组汇总后的指标阈值原样放入 aggregate_filters 或 aggregate_filter_expression，entity_id 使用对应指标/计算 ID；不要改写为来源属性 filters。"
+                  : stagedCoverageError
+                    ? "每组 Top N 使用 group_selections；跨期间 EVERY/ANY/AT_LEAST_N 使用 period_conditions。不要用全局 LIMIT 或截断结果人工归并。"
                   : "具体业务值必须重新调用 PropertyValueSearch，并原样提交其 selected_match.value_binding_id。",
             },
           };
@@ -1643,6 +1795,16 @@ export class DataAgentHarness {
           query,
           Boolean(intent.timeGrain),
         );
+        artifact.verification = {
+          calculationSource: compiled.ir.resultContract.calculationSource,
+          exhaustive:
+            compiled.ir.resultContract.exhaustiveRequested && !query.truncated,
+          businessLogicBeforeLimit:
+            compiled.ir.resultContract.businessLogicBeforeLimit,
+          expectedPeriodCount:
+            compiled.ir.resultContract.expectedPeriodCount,
+          claimPolicy: "DATABASE_EVIDENCE_ONLY",
+        };
         capture({
           artifact,
           sql: compiled.sql,
@@ -1667,6 +1829,7 @@ export class DataAgentHarness {
             columns: artifact.columns,
             rows: artifact.rows.slice(0, 20),
             truncated: artifact.truncated,
+            verification: artifact.verification,
             analysisStep,
             observation,
             analysisProgress: {
@@ -1687,6 +1850,7 @@ export class DataAgentHarness {
             columns: artifact.columns,
             rows: artifact.rows.slice(0, 20),
             truncated: artifact.truncated,
+            verification: artifact.verification,
             analysisStep,
             observation,
             analysisProgress: {
@@ -1929,6 +2093,12 @@ function normalizeAnalysisIntent(
   const rawWindows = Array.isArray(args.window_calculations)
     ? args.window_calculations
     : [];
+  const rawGroupSelections = Array.isArray(args.group_selections)
+    ? args.group_selections
+    : [];
+  const rawPeriodConditions = Array.isArray(args.period_conditions)
+    ? args.period_conditions
+    : [];
   return {
     rootObjectId: args.root_object_id
       ? String(args.root_object_id)
@@ -1948,6 +2118,18 @@ function normalizeAnalysisIntent(
           expression: String(rawTime.expression),
           propertyId: rawTime.property_id
             ? String(rawTime.property_id)
+            : undefined,
+          mode: rawTime.mode
+            ? String(rawTime.mode) as NonNullable<
+                AnalysisIntent["timeRange"]
+              >["mode"]
+            : undefined,
+          count:
+            rawTime.count == null ? undefined : Number(rawTime.count),
+          unit: rawTime.unit
+            ? String(rawTime.unit) as NonNullable<
+                AnalysisIntent["timeRange"]
+              >["unit"]
             : undefined,
         }
       : undefined,
@@ -2031,6 +2213,58 @@ function normalizeAnalysisIntent(
               >[number]["denominatorScope"],
       };
     }),
+    groupSelections: rawGroupSelections.map((raw) => {
+      const selection = raw as Record<string, unknown>;
+      return {
+        id: String(selection.id ?? ""),
+        label: String(selection.label ?? ""),
+        operator:
+          selection.operator === "BOTTOM_N"
+            ? "BOTTOM_N" as const
+            : "TOP_N" as const,
+        partitionByPropertyIds: Array.isArray(
+          selection.partition_by_property_ids,
+        )
+          ? selection.partition_by_property_ids.map(String)
+          : [],
+        orderByEntityId: String(selection.order_by_entity_id ?? ""),
+        count: Number(selection.count ?? 1),
+        ties:
+          selection.ties === "EXCLUDE"
+            ? "EXCLUDE" as const
+            : "INCLUDE" as const,
+      };
+    }),
+    periodConditions: rawPeriodConditions.map((raw) => {
+      const condition = raw as Record<string, unknown>;
+      return {
+        id: String(condition.id ?? ""),
+        label: String(condition.label ?? ""),
+        measureId: String(condition.measure_id ?? ""),
+        operator: String(condition.operator ?? "GT") as NonNullable<
+          AnalysisIntent["periodConditions"]
+        >[number]["operator"],
+        value: Number(condition.value),
+        quantifier: String(condition.quantifier ?? "EVERY") as NonNullable<
+          AnalysisIntent["periodConditions"]
+        >[number]["quantifier"],
+        minimumMatches:
+          condition.minimum_matches == null
+            ? undefined
+            : Number(condition.minimum_matches),
+        groupByPropertyIds: Array.isArray(condition.group_by_property_ids)
+          ? condition.group_by_property_ids.map(String)
+          : [],
+        expectedPeriodCount:
+          condition.expected_period_count == null
+            ? undefined
+            : Number(condition.expected_period_count),
+        missingPeriodPolicy:
+          condition.missing_period_policy === "IGNORE"
+            ? "IGNORE" as const
+            : "FAIL" as const,
+      };
+    }),
     sort: rawSort.map((raw) => {
       const sort = raw as Record<string, unknown>;
       return {
@@ -2082,6 +2316,25 @@ function validateQuestionFrameCoverage(
   ontology: OntologySnapshot,
 ): void {
   if (intent.resultKind !== "aggregate") return;
+  const question = frame.originalQuestion;
+  const requiresPeriodCondition =
+    /每(?:一?(?:年|月|周|日|季度|期)).*?(?:都|均|全部)|任意(?:一?(?:年|月|周|日|季度|期))|至少\s*[一二三四五六七八九十两\d]+\s*个?(?:年|月|周|日|季度|期)/.test(
+      question,
+    );
+  if (requiresPeriodCondition && !(intent.periodConditions?.length)) {
+    throw new Error(
+      "问题包含“每期都/任意期/至少N期”的跨期间集合语义，必须使用 period_conditions；不能只筛选单个时间桶后由 Montane 人工归并",
+    );
+  }
+  const requiresPerGroupSelection =
+    /(?:各|每个).+?(?:中|内).+?(?:最高|最低|前\s*[一二三四五六七八九十两\d]+|后\s*[一二三四五六七八九十两\d]+)/.test(
+      question,
+    );
+  if (requiresPerGroupSelection && !(intent.groupSelections?.length)) {
+    throw new Error(
+      "问题包含“每组最高/最低/前N/后N”的组内选择语义，必须使用 group_selections；不能用分区排名配合全局 LIMIT 代替",
+    );
+  }
   const requirements = extractMetricThresholdRequirements(frame);
   if (!requirements.length) return;
   const aggregateFilters = intent.aggregateFilterExpression
@@ -2095,11 +2348,37 @@ function validateQuestionFrameCoverage(
         intent,
         ontology,
       ),
+    ) &&
+    !(intent.periodConditions ?? []).some((condition) =>
+      periodConditionCoversRequirement(
+        condition,
+        requirement,
+        intent,
+        ontology,
+      ),
     ),
   );
   if (!missing.length) return;
   throw new Error(
-    `指标阈值 ${missing.map((item) => `“${item.sourceText}”`).join("、")} 必须使用 aggregate_filters 或 aggregate_filter_expression 按分组汇总结果筛选；禁止改用来源属性 filters，否则会把 HAVING 语义错误降级为明细 WHERE`,
+    `指标阈值 ${missing.map((item) => `“${item.sourceText}”`).join("、")} 必须使用 aggregate_filters、aggregate_filter_expression 或 period_conditions 按正确阶段生成 HAVING/分层集合筛选；“每期都/任意期/至少N期”必须使用 period_conditions，禁止降级为明细 WHERE`,
+  );
+}
+
+function periodConditionCoversRequirement(
+  condition: NonNullable<AnalysisIntent["periodConditions"]>[number],
+  requirement: MetricThresholdRequirement,
+  intent: AnalysisIntent,
+  ontology: OntologySnapshot,
+): boolean {
+  return aggregateFilterCoversRequirement(
+    {
+      entityId: condition.measureId,
+      operator: condition.operator,
+      value: condition.value,
+    },
+    requirement,
+    intent,
+    ontology,
   );
 }
 
@@ -2610,6 +2889,24 @@ function buildAnalysisSpace(
     dimensions: [
       ...new Map(dimensions.map((dimension) => [dimension.id, dimension])).values(),
     ].slice(0, 32),
+    dimensionHierarchies: (ontology.dimensionHierarchies ?? [])
+      .filter((hierarchy) =>
+        hierarchy.levels.some((level) => level.objectId === root.id),
+      )
+      .map((hierarchy) => ({
+        id: hierarchy.id,
+        label: hierarchy.label,
+        levels: hierarchy.levels.map((level) => ({
+          objectId: level.objectId,
+          propertyId: level.propertyId,
+          objectLabel:
+            ontology.objects.find((object) => object.id === level.objectId)
+              ?.label ?? level.objectId,
+          propertyLabel:
+            findPropertyBinding(ontology, level.propertyId)?.property.label ??
+            level.propertyId,
+        })),
+      })),
   };
 }
 

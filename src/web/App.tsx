@@ -865,10 +865,22 @@ function ContextPanel({
         <div className={`context-result-kind ${turn?.result ? "verified" : ""}`}>
           {turn?.result ? <SealCheck size={18} weight="fill" /> : <Info size={18} />}
           <span>
-            <strong>{turn?.result ? "真实查询结果" : "未产生数据结果"}</strong>
+            <strong>
+              {turn?.result
+                ? turn.result.verification?.exhaustive
+                  ? "完整查询结果"
+                  : turn.result.truncated
+                    ? "真实结果（可能不完整）"
+                    : "真实查询结果"
+                : "未产生数据结果"}
+            </strong>
             <small>
               {turn?.result
-                ? "结论来自本轮 SelectDB 返回数据"
+                ? `${turn.result.verification?.calculationSource ?? "SelectDB"} · ${
+                    turn.result.verification?.businessLogicBeforeLimit
+                      ? "业务判断先于结果限制"
+                      : "结论来自本轮 SelectDB 返回数据"
+                  }`
                 : "一般对话或运行条件不足时不会生成图表"}
             </small>
           </span>
@@ -3935,7 +3947,7 @@ function SettingsPage({
       </section>
       <section className="panel setting-card">
         <div className="setting-icon"><Clock size={20} /></div>
-        <div><h2>IR查询执行</h2><p>IR v2 支持时间粒度、同比环比、派生与窗口计算、逻辑筛选树和聚合安全校验；最大超时180秒，聚合最多200行，明细最多50行。</p></div>
+        <div><h2>IR查询执行</h2><p>IR v3 支持时间粒度、同比环比、派生与窗口计算、每组 Top N、跨期间集合条件、逻辑筛选树和聚合安全校验；最大超时180秒，聚合最多200行，明细最多50行。</p></div>
         <span className="status-pill success">已启用</span>
       </section>
       <section className="panel setting-card">

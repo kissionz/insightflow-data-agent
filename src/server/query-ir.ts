@@ -179,6 +179,7 @@ export class QueryIrCompiler {
       measureByReference,
       dimensions,
       timeBinding,
+      ontology,
     );
     validateAggregateFilters(
       intent,
@@ -289,7 +290,7 @@ export class QueryIrCompiler {
     let resolvedTime: QueryIR["timeRange"];
     if (intent.timeRange && timeBinding) {
       const range = resolveNaturalTimeRange(
-        intent.timeRange.expression,
+        intent.timeRange,
         this.now(),
         timezone,
       );
@@ -326,10 +327,20 @@ export class QueryIrCompiler {
       };
     }
 
-    const limit = Math.min(
-      Math.max(1, Math.trunc(intent.limit ?? (intent.resultKind === "detail" ? 50 : 200))),
-      intent.resultKind === "detail" ? 50 : 200,
+    const exhaustiveSetQuery = Boolean(
+      intent.groupSelections?.length || intent.periodConditions?.length,
     );
+    const limit = exhaustiveSetQuery
+      ? 200
+      : Math.min(
+          Math.max(
+            1,
+            Math.trunc(
+              intent.limit ?? (intent.resultKind === "detail" ? 50 : 200),
+            ),
+          ),
+          intent.resultKind === "detail" ? 50 : 200,
+        );
     const sort = intent.sort ?? [];
     const orderParts = sort.map((item) => {
       const metric = metricById.get(item.entityId) ?? measureByReference.get(item.entityId);
@@ -352,6 +363,8 @@ export class QueryIrCompiler {
     const advancedCalculations = Boolean(
       intent.timeComparisons?.length ||
         intent.windowCalculations?.length ||
+        intent.groupSelections?.length ||
+        intent.periodConditions?.length ||
         aggregateFilters.length,
     );
     const sql = advancedCalculations
@@ -400,7 +413,7 @@ export class QueryIrCompiler {
       ]),
     ];
     const ir: QueryIR = {
-      version: 2,
+      version: 3,
       ontologyVersion: ontology.version,
       rootObjectId: root.id,
       measureIds: measures.map((metric) => metric.id),
@@ -440,11 +453,30 @@ export class QueryIrCompiler {
             }
           : calculation,
       ),
+      groupSelections: intent.groupSelections ?? [],
+      periodConditions: (intent.periodConditions ?? []).map((condition) => ({
+        ...condition,
+        expectedPeriodCount:
+          condition.expectedPeriodCount ?? resolvedTime?.periodCount,
+      })),
       relationIds,
       grain,
       resultKind: intent.resultKind,
       sort,
       limit,
+      resultContract: {
+        calculationSource: "DORIS_SQL",
+        businessLogicBeforeLimit: true,
+        completeness: "COMPLETE_IF_NOT_TRUNCATED",
+        expectedPeriodCount:
+          intent.periodConditions?.length
+            ? resolvedTime?.periodCount ??
+              intent.periodConditions[0]?.expectedPeriodCount
+            : undefined,
+        exhaustiveRequested: Boolean(
+          intent.groupSelections?.length || intent.periodConditions?.length,
+        ),
+      },
     };
     const bindings = [
       {
@@ -495,6 +527,18 @@ export class QueryIrCompiler {
             : `IR ${calculation.operator}`,
         entityId: calculation.id,
       })),
+      ...(intent.groupSelections ?? []).map((selection) => ({
+        label: "组内选择",
+        value: `${selection.label} · ${selection.operator === "TOP_N" ? "每组前" : "每组后"} ${selection.count}`,
+        source: `Doris 分区排名 · ${selection.ties === "INCLUDE" ? "包含并列" : "固定行数"}`,
+        entityId: selection.id,
+      })),
+      ...(intent.periodConditions ?? []).map((condition) => ({
+        label: "跨期间条件",
+        value: `${condition.label} · ${periodQuantifierLabel(condition.quantifier)}`,
+        source: `Doris 二次聚合 · 缺失期间${condition.missingPeriodPolicy === "FAIL" ? "不通过" : "忽略"}`,
+        entityId: condition.id,
+      })),
       ...filters.map(({ binding, businessValue, value, ...filter }) => ({
         label: "筛选条件",
         value: `${binding.property.label} ${filterOperatorLabel(filter.operator)} ${businessValue ?? formatValue(value)}`,
@@ -542,7 +586,9 @@ export class QueryIrCompiler {
       planSummary: `${root.label} · ${grain} · ${measures.length} 个基础指标 · ${
         (intent.derivedMeasures?.length ?? 0) +
         (intent.timeComparisons?.length ?? 0) +
-        (intent.windowCalculations?.length ?? 0)
+        (intent.windowCalculations?.length ?? 0) +
+        (intent.groupSelections?.length ?? 0) +
+        (intent.periodConditions?.length ?? 0)
       } 个计算 · ${filters.length + aggregateFilters.length + (resolvedTime ? 1 : 0)} 个条件`,
     };
   }
@@ -618,11 +664,14 @@ function validateCalculations(
   measures: Map<string, Metric>,
   dimensions: Array<{ object: OntologyObject; property: OntologyProperty }>,
   timeBinding?: { object: OntologyObject; property: OntologyProperty },
+  ontology?: OntologySnapshot,
 ): void {
   const calculations = [
     ...(intent.derivedMeasures ?? []),
     ...(intent.timeComparisons ?? []),
     ...(intent.windowCalculations ?? []),
+    ...(intent.groupSelections ?? []),
+    ...(intent.periodConditions ?? []),
   ];
   const ids = new Set<string>();
   for (const calculation of calculations) {
@@ -727,12 +776,110 @@ function validateCalculations(
       }
     }
   }
+  for (const selection of intent.groupSelections ?? []) {
+    if (!Number.isInteger(selection.count) || selection.count < 1 || selection.count > 100) {
+      throw new Error(`每组排名 ${selection.label} 的数量必须在 1 到 100 之间`);
+    }
+    if (!selection.partitionByPropertyIds.length) {
+      throw new Error(`每组排名 ${selection.label} 至少需要一个分区属性`);
+    }
+    for (const propertyId of selection.partitionByPropertyIds) {
+      if (!dimensionIds.has(propertyId)) {
+        throw new Error(
+          `每组排名 ${selection.label} 的分区属性必须同时出现在维度中：${propertyId}`,
+        );
+      }
+    }
+    for (const detail of dimensions.filter(
+      (binding) =>
+        !selection.partitionByPropertyIds.includes(binding.property.id),
+    )) {
+      for (const partitionId of selection.partitionByPropertyIds) {
+        const hierarchy = ontology?.dimensionHierarchies?.find((candidate) => {
+          const ids = candidate.levels.map((level) => level.propertyId);
+          return ids.includes(partitionId) && ids.includes(detail.property.id);
+        });
+        if (!hierarchy) continue;
+        const partitionIndex = hierarchy.levels.findIndex(
+          (level) => level.propertyId === partitionId,
+        );
+        const detailIndex = hierarchy.levels.findIndex(
+          (level) => level.propertyId === detail.property.id,
+        );
+        if (partitionIndex >= detailIndex) {
+          throw new Error(
+            `每组排名 ${selection.label} 的分区维度必须位于明细维度上级；${hierarchy.label} 的顺序为 ${hierarchy.levels
+              .map(
+                (level) =>
+                  findHierarchyPropertyLabel(ontology!, level.propertyId),
+              )
+              .join(" → ")}`,
+          );
+        }
+      }
+    }
+    requireAnalysisResultEntityLabel(
+      intent,
+      measures,
+      selection.orderByEntityId,
+      selection.label,
+    );
+  }
+  const aggregateFilters = intent.aggregateFilterExpression
+    ? flattenAggregateFilterExpression(intent.aggregateFilterExpression)
+    : intent.aggregateFilters ?? [];
+  for (const condition of intent.periodConditions ?? []) {
+    requireMeasureReference(measures, condition.measureId, condition.label);
+    if (!intent.timeGrain || !timeBinding) {
+      throw new Error(`期间条件 ${condition.label} 必须指定时间粒度`);
+    }
+    if (!condition.groupByPropertyIds.length) {
+      throw new Error(`期间条件 ${condition.label} 至少需要一个结果分组属性`);
+    }
+    for (const propertyId of condition.groupByPropertyIds) {
+      if (!dimensionIds.has(propertyId)) {
+        throw new Error(
+          `期间条件 ${condition.label} 的结果分组属性必须同时出现在维度中：${propertyId}`,
+        );
+      }
+    }
+    if (!Number.isFinite(condition.value)) {
+      throw new Error(`期间条件 ${condition.label} 的阈值必须是有限数字`);
+    }
+    if (
+      condition.expectedPeriodCount != null &&
+      (!Number.isInteger(condition.expectedPeriodCount) ||
+        condition.expectedPeriodCount < 1 ||
+        condition.expectedPeriodCount > 366)
+    ) {
+      throw new Error(`期间条件 ${condition.label} 的预期期间数无效`);
+    }
+    if (condition.quantifier === "AT_LEAST_N") {
+      if (
+        !Number.isInteger(condition.minimumMatches) ||
+        (condition.minimumMatches ?? 0) < 1 ||
+        (condition.minimumMatches ?? 0) > 366
+      ) {
+        throw new Error(`期间条件 ${condition.label} 的最低满足期间数无效`);
+      }
+    }
+    if (aggregateFilters.some((filter) => filter.entityId === condition.measureId)) {
+      throw new Error(
+        `期间条件 ${condition.label} 已负责跨期间判断，不能再用 aggregate_filters 预先删除不达标期间`,
+      );
+    }
+  }
+  if (intent.periodConditions?.length && intent.groupSelections?.length) {
+    throw new Error("当前版本不能在同一计划中同时使用期间条件和每组排名，请拆分为受控分析步骤");
+  }
   if (
     intent.resultKind === "detail" &&
     (intent.timeGrain ||
       intent.derivedMeasures?.length ||
       intent.timeComparisons?.length ||
-      intent.windowCalculations?.length)
+      intent.windowCalculations?.length ||
+      intent.groupSelections?.length ||
+      intent.periodConditions?.length)
   ) {
     throw new Error("时间粒度和计算算法只能用于聚合查询");
   }
@@ -794,6 +941,23 @@ function requireMeasureReference(
     throw new Error(`计算项 ${calculationLabel} 引用了未提交的基础指标：${id}`);
   }
   return metric;
+}
+
+function requireAnalysisResultEntityLabel(
+  intent: AnalysisIntent,
+  measures: Map<string, Metric>,
+  id: string,
+  usageLabel: string,
+): string {
+  const metric = measures.get(id);
+  if (metric) return metric.label;
+  const calculation = [
+    ...(intent.derivedMeasures ?? []),
+    ...(intent.timeComparisons ?? []),
+    ...(intent.windowCalculations ?? []),
+  ].find((candidate) => candidate.id === id);
+  if (calculation) return calculation.label;
+  throw new Error(`计算项 ${usageLabel} 引用了不可用的排序指标或计算项：${id}`);
 }
 
 function validateDerivedCalculationGraph(
@@ -1173,7 +1337,13 @@ function compileLayeredAnalysis(context: LayeredAnalysisContext): string {
   const aggregateFilters = intent.aggregateFilterExpression
     ? flattenAggregateFilterExpression(intent.aggregateFilterExpression)
     : intent.aggregateFilters ?? [];
-  if (!aggregateFilters.length) {
+  const groupSelections = intent.groupSelections ?? [];
+  const periodConditions = intent.periodConditions ?? [];
+  if (
+    !aggregateFilters.length &&
+    !groupSelections.length &&
+    !periodConditions.length
+  ) {
     return [
       ...baseCte,
       ...analyzedQuery,
@@ -1183,46 +1353,222 @@ function compileLayeredAnalysis(context: LayeredAnalysisContext): string {
       .filter(Boolean)
       .join("\n");
   }
-  const compiledAggregateParts = aggregateFilters.map((filter) => {
-    parameters.push(filter.value);
-    return compileAggregateFilter(
-      `a.${quoteIdentifier(
-        aggregateFilterEntityLabel(
-          filter.entityId,
-          intent,
-          measureByReference,
-        ),
-      )}`,
-      filter.operator,
+  let aggregateWhere = "";
+  if (aggregateFilters.length) {
+    const compiledAggregateParts = aggregateFilters.map((filter) => {
+      parameters.push(filter.value);
+      return compileAggregateFilter(
+        `a.${quoteIdentifier(
+          aggregateFilterEntityLabel(
+            filter.entityId,
+            intent,
+            measureByReference,
+          ),
+        )}`,
+        filter.operator,
+      );
+    });
+    let conditionIndex = 0;
+    aggregateWhere = intent.aggregateFilterExpression
+      ? compileAggregateFilterExpression(
+          intent.aggregateFilterExpression,
+          () => {
+            const part = compiledAggregateParts[conditionIndex];
+            conditionIndex += 1;
+            if (!part) {
+              throw new Error("聚合逻辑筛选树与筛选条件数量不一致");
+            }
+            return part;
+          },
+        )
+      : compiledAggregateParts.join("\n  AND ");
+    if (conditionIndex && conditionIndex !== compiledAggregateParts.length) {
+      throw new Error("聚合逻辑筛选树未覆盖全部筛选条件");
+    }
+  }
+  if (!groupSelections.length && !periodConditions.length) {
+    return [
+      ...baseCte.slice(0, -1),
+      "),",
+      "`analyzed` AS (",
+      ...analyzedQuery.map((line) => `  ${line}`),
+      ")",
+      "SELECT *",
+      "FROM `analyzed` AS a",
+      `WHERE ${aggregateWhere}`,
+      finalOrder.length ? `ORDER BY ${finalOrder.join(", ")}` : "",
+      `LIMIT ${limit}`,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
+
+  const ctes: string[] = [
+    baseCte.join("\n").replace(/^WITH /, ""),
+    ["`analyzed` AS (", ...analyzedQuery.map((line) => `  ${line}`), ")"].join(
+      "\n",
+    ),
+  ];
+  let currentName = "analyzed";
+  if (aggregateWhere) {
+    ctes.push(
+      [
+        "`eligible` AS (",
+        "  SELECT *",
+        `  FROM ${quoteIdentifier(currentName)} AS a`,
+        `  WHERE ${aggregateWhere}`,
+        ")",
+      ].join("\n"),
     );
-  });
-  let conditionIndex = 0;
-  const aggregateWhere = intent.aggregateFilterExpression
-    ? compileAggregateFilterExpression(
-        intent.aggregateFilterExpression,
-        () => {
-          const part = compiledAggregateParts[conditionIndex];
-          conditionIndex += 1;
-          if (!part) {
-            throw new Error("聚合逻辑筛选树与筛选条件数量不一致");
-          }
-          return part;
-        },
+    currentName = "eligible";
+  }
+
+  if (groupSelections.length) {
+    const rankExpressions = groupSelections.map((selection) => {
+      const orderLabel = requireAnalysisResultEntityLabel(
+        intent,
+        measureByReference,
+        selection.orderByEntityId,
+        selection.label,
+      );
+      const partitions = selection.partitionByPropertyIds.map((propertyId) => {
+        const binding = dimensions.find(
+          (candidate) => candidate.property.id === propertyId,
+        );
+        if (!binding) {
+          throw new Error(`每组排名 ${selection.label} 引用了不存在的分区属性`);
+        }
+        return `g.${quoteIdentifier(binding.property.label)}`;
+      });
+      const direction = selection.operator === "TOP_N" ? "DESC" : "ASC";
+      const rankFunction = selection.ties === "INCLUDE" ? "RANK" : "ROW_NUMBER";
+      return `${rankFunction}() OVER (PARTITION BY ${partitions.join(", ")} ORDER BY g.${quoteIdentifier(orderLabel)} ${direction}) AS ${quoteIdentifier(selection.label)}`;
+    });
+    ctes.push(
+      [
+        "`ranked` AS (",
+        `  SELECT g.*, ${rankExpressions.join(", ")}`,
+        `  FROM ${quoteIdentifier(currentName)} AS g`,
+        ")",
+      ].join("\n"),
+    );
+    ctes.push(
+      [
+        "`selected` AS (",
+        "  SELECT *",
+        "  FROM `ranked` AS r",
+        `  WHERE ${groupSelections
+          .map(
+            (selection) =>
+              `r.${quoteIdentifier(selection.label)} <= ${selection.count}`,
+          )
+          .join("\n    AND ")}`,
+        ")",
+      ].join("\n"),
+    );
+    currentName = "selected";
+  }
+
+  let outputOrder = finalOrder;
+  if (periodConditions.length) {
+    const groupIds = periodConditions[0]!.groupByPropertyIds;
+    if (
+      periodConditions.some(
+        (condition) =>
+          condition.groupByPropertyIds.join("\u0000") !==
+          groupIds.join("\u0000"),
       )
-    : compiledAggregateParts.join("\n  AND ");
-  if (conditionIndex && conditionIndex !== compiledAggregateParts.length) {
-    throw new Error("聚合逻辑筛选树未覆盖全部筛选条件");
+    ) {
+      throw new Error("同一查询中的期间条件必须使用相同的结果分组属性");
+    }
+    const groupBindings = groupIds.map((propertyId) => {
+      const binding = dimensions.find(
+        (candidate) => candidate.property.id === propertyId,
+      );
+      if (!binding) throw new Error(`期间条件引用了不存在的分组属性：${propertyId}`);
+      return binding;
+    });
+    const periodLabel = timeGrainLabel(intent.timeGrain!.unit);
+    const regroupSelect = [
+      ...groupBindings.map(
+        (binding) =>
+          `p.${quoteIdentifier(binding.property.label)} AS ${quoteIdentifier(binding.property.label)}`,
+      ),
+      `COUNT(DISTINCT p.${quoteIdentifier(periodLabel)}) AS ${quoteIdentifier("覆盖期间数")}`,
+    ];
+    for (const condition of periodConditions) {
+      const metric = requireMeasureReference(
+        measureByReference,
+        condition.measureId,
+        condition.label,
+      );
+      parameters.push(condition.value);
+      const predicate = compileAggregateFilter(
+        `p.${quoteIdentifier(metric.label)}`,
+        condition.operator,
+      );
+      regroupSelect.push(
+        `SUM(CASE WHEN ${predicate} THEN 1 ELSE 0 END) AS ${quoteIdentifier(`${condition.label}满足期间数`)}`,
+      );
+      regroupSelect.push(
+        `MIN(p.${quoteIdentifier(metric.label)}) AS ${quoteIdentifier(`${metric.label}期间最低值`)}`,
+      );
+    }
+    ctes.push(
+      [
+        "`period_regrouped` AS (",
+        `  SELECT ${regroupSelect.join(", ")}`,
+        `  FROM ${quoteIdentifier(currentName)} AS p`,
+        `  GROUP BY ${groupBindings
+          .map((binding) => `p.${quoteIdentifier(binding.property.label)}`)
+          .join(", ")}`,
+        ")",
+      ].join("\n"),
+    );
+    const periodWhere = periodConditions.flatMap((condition) => {
+      const coverage = `r.${quoteIdentifier("覆盖期间数")}`;
+      const matches = `r.${quoteIdentifier(`${condition.label}满足期间数`)}`;
+      const expected =
+        condition.expectedPeriodCount ?? resolvedTime?.periodCount;
+      const clauses: string[] = [];
+      if (condition.missingPeriodPolicy === "FAIL") {
+        if (!expected) {
+          throw new Error(
+            `期间条件 ${condition.label} 要求缺失期间不通过，但没有可用的预期期间数`,
+          );
+        }
+        clauses.push(`${coverage} = ${expected}`);
+      }
+      if (condition.quantifier === "EVERY") {
+        clauses.push(
+          expected && condition.missingPeriodPolicy === "FAIL"
+            ? `${matches} = ${expected}`
+            : `(${coverage} > 0 AND ${matches} = ${coverage})`,
+        );
+      } else if (condition.quantifier === "ANY") {
+        clauses.push(`${matches} >= 1`);
+      } else {
+        clauses.push(`${matches} >= ${condition.minimumMatches}`);
+      }
+      return clauses;
+    });
+    ctes.push(
+      [
+        "`period_matched` AS (",
+        "  SELECT *",
+        "  FROM `period_regrouped` AS r",
+        `  WHERE ${periodWhere.join("\n    AND ")}`,
+        ")",
+      ].join("\n"),
+    );
+    currentName = "period_matched";
+    outputOrder = compilePeriodResultOrder(intent, groupBindings);
   }
   return [
-    ...baseCte.slice(0, -1),
-    "),",
-    "`analyzed` AS (",
-    ...analyzedQuery.map((line) => `  ${line}`),
-    ")",
+    `WITH ${ctes.join(",\n")}`,
     "SELECT *",
-    "FROM `analyzed` AS a",
-    `WHERE ${aggregateWhere}`,
-    finalOrder.length ? `ORDER BY ${finalOrder.join(", ")}` : "",
+    `FROM ${quoteIdentifier(currentName)} AS result`,
+    outputOrder.length ? `ORDER BY ${outputOrder.join(", ")}` : "",
     `LIMIT ${limit}`,
   ]
     .filter(Boolean)
@@ -1351,6 +1697,34 @@ function compileLayeredOrder(
     parts.push(`${quoteIdentifier(timeGrainLabel(intent.timeGrain.unit))} ASC`);
   }
   return parts;
+}
+
+function compilePeriodResultOrder(
+  intent: AnalysisIntent,
+  groupBindings: Array<{ property: OntologyProperty }>,
+): string[] {
+  const parts = (intent.sort ?? []).map((sort) => {
+    const binding = groupBindings.find(
+      (candidate) => candidate.property.id === sort.entityId,
+    );
+    if (!binding) {
+      throw new Error(
+        `跨期间结果只能按最终分组属性排序：${sort.entityId}`,
+      );
+    }
+    return `${quoteIdentifier(binding.property.label)} ${sort.direction}`;
+  });
+  return parts;
+}
+
+function periodQuantifierLabel(
+  quantifier: NonNullable<AnalysisIntent["periodConditions"]>[number]["quantifier"],
+): string {
+  return {
+    EVERY: "每一期都满足",
+    ANY: "任意一期满足",
+    AT_LEAST_N: "至少 N 期满足",
+  }[quantifier];
 }
 
 function timeComparisonInterval(
@@ -1587,6 +1961,17 @@ function requireProperty(
     throw new Error(`${usage}不能使用属性：${binding.property.label}`);
   }
   return binding;
+}
+
+function findHierarchyPropertyLabel(
+  ontology: OntologySnapshot,
+  propertyId: string,
+): string {
+  return (
+    ontology.objects
+      .flatMap((object) => object.properties)
+      .find((property) => property.id === propertyId)?.label ?? propertyId
+  );
 }
 
 function resolveTimeBinding(
@@ -1909,16 +2294,28 @@ function filterOperatorLabel(operator: QueryFilterOperator): string {
 }
 
 function resolveNaturalTimeRange(
-  expression: string,
+  input: NonNullable<AnalysisIntent["timeRange"]>,
   now: Date,
   timezone: string,
 ): {
   start: string;
   endExclusive: string;
   mode: NonNullable<QueryIR["timeRange"]>["mode"];
+  periodCount?: number;
+  periodUnit?: TimeGrain;
 } {
+  const expression = input.expression;
   const text = expression.trim();
   const { year, month, day } = zonedDateParts(now, timezone);
+  if (input.mode === "LAST_N_COMPLETE_PERIODS") {
+    const count = input.count;
+    const unit = input.unit;
+    if (!Number.isInteger(count) || (count ?? 0) < 1 || (count ?? 0) > 366) {
+      throw new Error("完整自然周期数量必须在 1 到 366 之间");
+    }
+    if (!unit) throw new Error("完整自然周期必须指定 DAY、WEEK、MONTH、QUARTER 或 YEAR");
+    return resolveCompletePeriods(count!, unit, now, timezone);
+  }
   if (/^(今年|本年)$/.test(text)) {
     return {
       start: dateText(year, 1, 1),
@@ -2035,9 +2432,118 @@ function resolveNaturalTimeRange(
       mode: "ROLLING",
     };
   }
-  throw new Error(
-    `暂不支持时间表达式“${expression}”，请使用今天、昨天、本周、上周、本月、上月、本季度、上季度、今年、去年、近N天、近N个月或明确年月`,
+  const recentYears = text.match(
+    /^(?:近|最近|过去)(\d{1,2}|[一二三四五六七八九十两]+)个?年$/,
   );
+  if (recentYears) {
+    const count = parseNaturalCount(recentYears[1]!);
+    if (count < 1 || count > 20) throw new Error("最近年数必须在 1 到 20 之间");
+    return resolveCompletePeriods(count, "YEAR", now, timezone);
+  }
+  const completePeriods = text.match(
+    /^(?:近|最近|过去)(\d{1,3}|[一二三四五六七八九十两]+)个?(完整|自然)(天|周|月|季度|年)$/,
+  );
+  if (completePeriods) {
+    const count = parseNaturalCount(completePeriods[1]!);
+    const unit = {
+      天: "DAY",
+      周: "WEEK",
+      月: "MONTH",
+      季度: "QUARTER",
+      年: "YEAR",
+    }[completePeriods[3]!] as TimeGrain;
+    return resolveCompletePeriods(count, unit, now, timezone);
+  }
+  throw new Error(
+    `暂不支持时间表达式“${expression}”，请使用今天、昨天、本周、上周、本月、上月、本季度、上季度、今年、去年、近N天、近N个月、近N年、近N个完整周期或明确年月`,
+  );
+}
+
+function parseNaturalCount(value: string): number {
+  if (/^\d+$/.test(value)) return Number(value);
+  const digits: Record<string, number> = {
+    一: 1,
+    二: 2,
+    两: 2,
+    三: 3,
+    四: 4,
+    五: 5,
+    六: 6,
+    七: 7,
+    八: 8,
+    九: 9,
+  };
+  if (value === "十") return 10;
+  const [tensText, onesText] = value.split("十");
+  if (value.includes("十")) {
+    const tens = tensText ? digits[tensText] ?? 0 : 1;
+    const ones = onesText ? digits[onesText] ?? 0 : 0;
+    return tens * 10 + ones;
+  }
+  return digits[value] ?? Number.NaN;
+}
+
+function resolveCompletePeriods(
+  count: number,
+  unit: TimeGrain,
+  now: Date,
+  timezone: string,
+): {
+  start: string;
+  endExclusive: string;
+  mode: "COMPLETE_PERIODS";
+  periodCount: number;
+  periodUnit: TimeGrain;
+} {
+  const { year, month, day } = zonedDateParts(now, timezone);
+  if (!Number.isInteger(count) || count < 1 || count > 366) {
+    throw new Error("完整自然周期数量必须在 1 到 366 之间");
+  }
+  if (unit === "YEAR") {
+    return {
+      start: dateText(year - count, 1, 1),
+      endExclusive: dateText(year, 1, 1),
+      mode: "COMPLETE_PERIODS",
+      periodCount: count,
+      periodUnit: unit,
+    };
+  }
+  if (unit === "QUARTER") {
+    const quarterMonth = Math.floor((month - 1) / 3) * 3 + 1;
+    return {
+      start: dateText(year, quarterMonth - count * 3, 1),
+      endExclusive: dateText(year, quarterMonth, 1),
+      mode: "COMPLETE_PERIODS",
+      periodCount: count,
+      periodUnit: unit,
+    };
+  }
+  if (unit === "MONTH") {
+    return {
+      start: dateText(year, month - count, 1),
+      endExclusive: dateText(year, month, 1),
+      mode: "COMPLETE_PERIODS",
+      periodCount: count,
+      periodUnit: unit,
+    };
+  }
+  const weekday = zonedWeekday(now, timezone);
+  if (unit === "WEEK") {
+    return {
+      start: dateText(year, month, day - weekday - count * 7),
+      endExclusive: dateText(year, month, day - weekday),
+      mode: "COMPLETE_PERIODS",
+      periodCount: count,
+      periodUnit: unit,
+    };
+  }
+  return {
+    start: dateText(year, month, day - count),
+    endExclusive: dateText(year, month, day),
+    mode: "COMPLETE_PERIODS",
+    periodCount: count,
+    periodUnit: unit,
+  };
 }
 
 function dateText(year: number, month: number, day: number): string {

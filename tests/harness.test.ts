@@ -399,6 +399,79 @@ describe("DataAgentHarness", () => {
     expect(queries[0]!.sql).not.toContain("t0.`pay_amount` > ?");
     expect(queries[0]!.parameters?.slice(-2)).toEqual([30_000_000, 0.75]);
     expect(captures).toHaveLength(1);
+
+    const periodFrame = {
+      originalQuestion: "近三年哪些会员等级每年毛利率都高于75%",
+      intentKind: "DIRECT_QUERY" as const,
+      metricTerms: ["毛利率"],
+      timeTerms: ["近三年"],
+      objectTerms: [],
+      businessValueTerms: [],
+      groupingTerms: ["会员等级", "年"],
+      calculationTerms: ["每年都高于75%"],
+      presentation: { kind: "TABLE" as const },
+    };
+    const periodTool = (
+      harness as unknown as {
+        executeAnalysisPlanTool(
+          capture: (analysis: unknown) => void,
+          timezone: string,
+          valueBindings: Map<string, never>,
+          getFrame: () => typeof periodFrame,
+        ): Tool;
+      }
+    ).executeAnalysisPlanTool(
+      (analysis) => captures.push(analysis),
+      "Asia/Shanghai",
+      new Map(),
+      () => periodFrame,
+    );
+    const downgradedPeriod = await periodTool.execute({
+      root_object_id: "o_order",
+      measure_ids: ["m_margin"],
+      dimension_property_ids: ["p_customer_level"],
+      filters: [],
+      aggregate_filters: [
+        { entity_id: "m_margin", operator: "GT", value: 0.75 },
+      ],
+      time_range: { expression: "近三年", property_id: "p_paid_at" },
+      time_grain: { unit: "YEAR", property_id: "p_paid_at" },
+      result_kind: "aggregate",
+      title: "错误跨期间计划",
+    });
+    expect(downgradedPeriod.ok).toBe(false);
+    expect(downgradedPeriod.data).toMatchObject({
+      code: "STAGED_ANALYSIS_COVERAGE_REQUIRED",
+    });
+
+    const correctedPeriod = await periodTool.execute({
+      root_object_id: "o_order",
+      measure_ids: ["m_margin"],
+      dimension_property_ids: ["p_customer_level"],
+      filters: [],
+      time_range: { expression: "近三年", property_id: "p_paid_at" },
+      time_grain: { unit: "YEAR", property_id: "p_paid_at" },
+      period_conditions: [
+        {
+          id: "period_margin",
+          label: "每年毛利率达标",
+          measure_id: "m_margin",
+          operator: "GT",
+          value: 0.75,
+          quantifier: "EVERY",
+          group_by_property_ids: ["p_customer_level"],
+          missing_period_policy: "FAIL",
+        },
+      ],
+      sort: [{ entity_id: "p_customer_level", direction: "ASC" }],
+      result_kind: "aggregate",
+      title: "近三年每年毛利率达标会员等级",
+    });
+    expect(correctedPeriod.ok).toBe(true);
+    expect(queries).toHaveLength(2);
+    expect(queries[1]!.sql).toContain("`period_regrouped` AS (");
+    expect(queries[1]!.sql).toContain("`覆盖期间数` = 3");
+    expect(queries[1]!.sql).toContain("`每年毛利率达标满足期间数` = 3");
     await harness.close();
     repository.close();
   });

@@ -224,6 +224,29 @@ export interface WindowCalculation {
   denominatorScope?: "AFTER_BUSINESS_FILTERS_BEFORE_TOP_N";
 }
 
+export interface GroupSelection {
+  id: string;
+  label: string;
+  operator: "TOP_N" | "BOTTOM_N";
+  partitionByPropertyIds: string[];
+  orderByEntityId: string;
+  count: number;
+  ties: "INCLUDE" | "EXCLUDE";
+}
+
+export interface PeriodGroupCondition {
+  id: string;
+  label: string;
+  measureId: string;
+  operator: AggregateFilterOperator;
+  value: number;
+  quantifier: "EVERY" | "ANY" | "AT_LEAST_N";
+  minimumMatches?: number;
+  groupByPropertyIds: string[];
+  expectedPeriodCount?: number;
+  missingPeriodPolicy: "FAIL" | "IGNORE";
+}
+
 export interface AnalysisIntent {
   rootObjectId?: string;
   measureIds: string[];
@@ -235,6 +258,9 @@ export interface AnalysisIntent {
   timeRange?: {
     expression: string;
     propertyId?: string;
+    mode?: "AUTO" | "ROLLING" | "LAST_N_COMPLETE_PERIODS";
+    count?: number;
+    unit?: TimeGrain;
   };
   timeGrain?: {
     unit: TimeGrain;
@@ -243,6 +269,8 @@ export interface AnalysisIntent {
   derivedMeasures?: DerivedMeasureCalculation[];
   timeComparisons?: TimeComparisonCalculation[];
   windowCalculations?: WindowCalculation[];
+  groupSelections?: GroupSelection[];
+  periodConditions?: PeriodGroupCondition[];
   sort?: Array<{
     entityId: string;
     direction: "ASC" | "DESC";
@@ -253,7 +281,7 @@ export interface AnalysisIntent {
 }
 
 export interface QueryIR {
-  version: 2;
+  version: 3;
   ontologyVersion: number;
   rootObjectId: string;
   measureIds: string[];
@@ -273,7 +301,9 @@ export interface QueryIR {
     expression: string;
     start: string;
     endExclusive: string;
-    mode: "TO_DATE" | "FULL_PERIOD" | "ROLLING";
+    mode: "TO_DATE" | "FULL_PERIOD" | "ROLLING" | "COMPLETE_PERIODS";
+    periodCount?: number;
+    periodUnit?: TimeGrain;
     comparisonRanges?: Array<{
       comparison: TimeComparisonCalculation["comparison"];
       start: string;
@@ -287,6 +317,8 @@ export interface QueryIR {
   derivedMeasures: DerivedMeasureCalculation[];
   timeComparisons: TimeComparisonCalculation[];
   windowCalculations: WindowCalculation[];
+  groupSelections: GroupSelection[];
+  periodConditions: PeriodGroupCondition[];
   relationIds: string[];
   grain: string;
   resultKind: "aggregate" | "detail";
@@ -295,6 +327,13 @@ export interface QueryIR {
     direction: "ASC" | "DESC";
   }>;
   limit: number;
+  resultContract: {
+    calculationSource: "DORIS_SQL";
+    businessLogicBeforeLimit: true;
+    completeness: "COMPLETE_IF_NOT_TRUNCATED";
+    expectedPeriodCount?: number;
+    exhaustiveRequested: boolean;
+  };
 }
 
 export interface AgentPromptConfig {
@@ -358,6 +397,13 @@ export interface ResultArtifact {
   rows: Array<Record<string, string | number>>;
   rowCount: number;
   truncated: boolean;
+  verification?: {
+    calculationSource: "DORIS_SQL" | "DETERMINISTIC_CALCULATOR";
+    exhaustive: boolean;
+    businessLogicBeforeLimit: boolean;
+    expectedPeriodCount?: number;
+    claimPolicy: "DATABASE_EVIDENCE_ONLY";
+  };
 }
 
 export interface Turn {
@@ -527,6 +573,18 @@ export interface OntologyRelation {
   status: OntologyEntityStatus;
 }
 
+export interface DimensionHierarchy {
+  id: string;
+  name: string;
+  label: string;
+  description?: string;
+  levels: Array<{
+    objectId: string;
+    propertyId: string;
+  }>;
+  status: OntologyEntityStatus;
+}
+
 export interface Metric {
   id: string;
   metricType?: "BASE" | "DERIVED";
@@ -566,6 +624,7 @@ export interface OntologySnapshot {
   objects: OntologyObject[];
   relations: OntologyRelation[];
   metrics: Metric[];
+  dimensionHierarchies?: DimensionHierarchy[];
 }
 
 export interface OntologyValidationIssue {

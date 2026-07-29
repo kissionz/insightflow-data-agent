@@ -672,6 +672,8 @@ class HarnessTurnReporter implements AgentReporter {
               derivedMeasures?: unknown[];
               timeComparisons?: unknown[];
               windowCalculations?: unknown[];
+              groupSelections?: unknown[];
+              periodConditions?: unknown[];
             };
             bindings?: Array<{
               label?: string;
@@ -685,6 +687,10 @@ class HarnessTurnReporter implements AgentReporter {
             rowCount?: number;
             columns?: string[];
             truncated?: boolean;
+            verification?: {
+              exhaustive?: boolean;
+              calculationSource?: string;
+            };
             rows?: Array<Record<string, string | number>>;
             analysisStep?: {
               id?: string;
@@ -732,9 +738,11 @@ class HarnessTurnReporter implements AgentReporter {
             value: String(
               (data?.ir?.derivedMeasures?.length ?? 0) +
                 (data?.ir?.timeComparisons?.length ?? 0) +
-                (data?.ir?.windowCalculations?.length ?? 0),
+                (data?.ir?.windowCalculations?.length ?? 0) +
+                (data?.ir?.groupSelections?.length ?? 0) +
+                (data?.ir?.periodConditions?.length ?? 0),
             ),
-            source: "IR v2",
+            source: "IR v3",
           },
         ],
         code: data?.ir
@@ -772,6 +780,20 @@ class HarnessTurnReporter implements AgentReporter {
             label: "截断",
             value: data?.truncated ? "是" : "否",
             source: "结果限制",
+          },
+          {
+            label: "结果完整性",
+            value: data?.verification?.exhaustive
+              ? "完整集合"
+              : data?.truncated
+                ? "结果可能不完整"
+                : "当前查询结果完整",
+            source: "IR v3 结果契约",
+          },
+          {
+            label: "计算来源",
+            value: data?.verification?.calculationSource ?? "DORIS_SQL",
+            source: "证据链",
           },
         ],
       });

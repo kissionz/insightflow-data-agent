@@ -4,6 +4,7 @@ import type {
   Conversation,
   DataAgentEvent,
   DataSourceInput,
+  DimensionHierarchy,
   Metric,
   OntologyObject,
   OntologyRelation,
@@ -105,6 +106,21 @@ export const api = {
       ontology: OntologySnapshot;
       validation: OntologyValidationResult;
     }>(`/api/ontology/draft/metrics/${metricId}`, {
+      method: "DELETE",
+    }),
+  saveDimensionHierarchy: (hierarchy: DimensionHierarchy) =>
+    request<{
+      ontology: OntologySnapshot;
+      validation: OntologyValidationResult;
+    }>(`/api/ontology/draft/dimension-hierarchies/${hierarchy.id}`, {
+      method: "PUT",
+      body: JSON.stringify({ hierarchy }),
+    }),
+  deleteDimensionHierarchy: (hierarchyId: string) =>
+    request<{
+      ontology: OntologySnapshot;
+      validation: OntologyValidationResult;
+    }>(`/api/ontology/draft/dimension-hierarchies/${hierarchyId}`, {
       method: "DELETE",
     }),
   deleteOntologyObject: (objectId: string) =>

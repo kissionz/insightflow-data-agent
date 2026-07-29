@@ -206,13 +206,22 @@ export interface WindowCalculation {
   id: string;
   label: string;
   measureId: string;
-  operator: "RANK" | "DENSE_RANK" | "RUNNING_SUM" | "MOVING_AVG";
+  operator:
+    | "RANK"
+    | "DENSE_RANK"
+    | "RUNNING_SUM"
+    | "MOVING_AVG"
+    | "PERCENT_OF_TOTAL"
+    | "PERCENT_OF_PARTITION";
   partitionByPropertyIds: string[];
-  orderBy: {
+  orderBy?: {
     entityId: string;
     direction: "ASC" | "DESC";
   };
   windowSize?: number;
+  scale?: number;
+  precision?: number;
+  denominatorScope?: "AFTER_BUSINESS_FILTERS_BEFORE_TOP_N";
 }
 
 export interface AnalysisIntent {

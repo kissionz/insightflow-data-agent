@@ -45,9 +45,10 @@ const DATA_AGENT_SYSTEM_PROMPT = `
 6. 你不能生成 SQL。完成语义理解后，必须调用 ExecuteAnalysisPlan，提交本体返回的对象、度量和维度属性 ID；业务值筛选只提交 value_binding_id。measure_ids 只能使用 metrics 中返回的 ID，其中既可能是正式指标，也可能是带默认聚合规则的数字属性。
 6.1 “各SPU销售额大于3000万”“毛利率大于75%”等按分组汇总后的指标阈值必须使用 aggregate_filters 或 aggregate_filter_expression，并引用指标/计算 ID。禁止把指标阈值改成来源属性 filters；前者是聚合后筛选，后者是明细行筛选。
 7. 用户要求按日、周、月、季度或年展示时，必须提交 time_grain，分别使用 DAY、WEEK、MONTH、QUARTER、YEAR；“月度趋势”不能把原始日期字段直接作为普通维度。
-8. 同比、环比、占比、差值、排名、累计或移动平均只能使用 ExecuteAnalysisPlan 提供的强类型计算结构；不得自行改写 SQL。同比使用 YEAR_OVER_YEAR，环比使用 PREVIOUS_PERIOD。
-8.1 OntologySearch 返回 metricType=DERIVED 的正式复合指标时，直接把该指标 ID 放入 measure_ids，不要再次用 derived_calculations 重建其公式；其依赖 DAG 由 IR 自动展开。
-8.2 “今年、本月、本季度、本周”等尚未结束的自然周期按截至当前日期处理；同比和环比由 IR 自动生成同进度基期，不得把未完整的当前周期与完整历史周期比较。
+8. 同比、环比、占比、差值、排名、累计或移动平均只能使用 ExecuteAnalysisPlan 提供的强类型计算结构；不得自行改写 SQL，也不得在最终回答中自行口算数据库没有返回的新数值。同比使用 YEAR_OVER_YEAR，环比使用 PREVIOUS_PERIOD。
+8.1 占全体比例使用 PERCENT_OF_TOTAL，partition_by_property_ids 必须为空；按区域、渠道等组内占比使用 PERCENT_OF_PARTITION，并把一个或多个分组属性 ID 放入 partition_by_property_ids。占比固定在业务筛选之后、排序和 Top N 之前计算；不得使用同一指标除以自身模拟占比。
+8.2 OntologySearch 返回 metricType=DERIVED 的正式复合指标时，直接把该指标 ID 放入 measure_ids，不要再次用 derived_calculations 重建其公式；其依赖 DAG 由 IR 自动展开。
+8.3 “今年、本月、本季度、本周”等尚未结束的自然周期按截至当前日期处理；同比和环比由 IR 自动生成同进度基期，不得把未完整的当前周期与完整历史周期比较。
 9. ExecuteAnalysisPlan 是唯一查询入口，它会通过规则引擎生成 IR、校验关系、粒度、可加性、筛选逻辑和窗口计算，编译参数化 Doris SQL 并执行查询。
 9.1 直接问数通常只执行一次。探索或诊断分析可以根据真实结果最多执行四步；每一步必须提供 analysis_step，说明本步目标、依据和结果角色。先用一条查询同时获取多个核心指标，再根据结果决定是否按一个高价值维度继续诊断。不得重复相同计划，不得跨事实对象，已有证据足够时立即停止。
 9.2 每次 ExecuteAnalysisPlan 返回 observation。继续查询前必须基于该 observation 说明新查询要验证的具体问题；不得为了“多分析一步”而机械穷举所有维度。
@@ -1344,13 +1345,20 @@ export class DataAgentHarness {
                 measure_id: { type: "string" },
                 operator: {
                   type: "string",
-                  enum: ["RANK", "DENSE_RANK", "RUNNING_SUM", "MOVING_AVG"],
+                  enum: [
+                    "RANK",
+                    "DENSE_RANK",
+                    "RUNNING_SUM",
+                    "MOVING_AVG",
+                    "PERCENT_OF_TOTAL",
+                    "PERCENT_OF_PARTITION",
+                  ],
                 },
                 partition_by_property_ids: {
                   type: "array",
                   items: { type: "string" },
                   description:
-                    "分区维度属性 ID；按当前时间桶分区可使用 __time__",
+                    "分区维度属性 ID；PERCENT_OF_TOTAL 必须为空；PERCENT_OF_PARTITION 至少一个且支持多个组合分区；按当前时间桶分区可使用 __time__",
                 },
                 order_by: {
                   type: "object",
@@ -1368,6 +1376,20 @@ export class DataAgentHarness {
                   type: "number",
                   description: "移动平均窗口大小，2到365",
                 },
+                scale: {
+                  type: "number",
+                  description: "占比缩放，默认100，返回百分数",
+                },
+                precision: {
+                  type: "number",
+                  description: "占比保留小数位，默认2，范围0到8",
+                },
+                denominator_scope: {
+                  type: "string",
+                  enum: ["AFTER_BUSINESS_FILTERS_BEFORE_TOP_N"],
+                  description:
+                    "分母口径；当前固定为应用业务筛选后、排序和Top N前的完整结果集",
+                },
               },
               required: [
                 "id",
@@ -1375,7 +1397,6 @@ export class DataAgentHarness {
                 "measure_id",
                 "operator",
                 "partition_by_property_ids",
-                "order_by",
               ],
             },
           },
@@ -1985,14 +2006,29 @@ function normalizeAnalysisIntent(
         )
           ? calculation.partition_by_property_ids.map(String)
           : [],
-        orderBy: {
-          entityId: String(order?.entity_id ?? ""),
-          direction: order?.direction === "ASC" ? "ASC" as const : "DESC" as const,
-        },
+        orderBy: order?.entity_id
+          ? {
+              entityId: String(order.entity_id),
+              direction:
+                order.direction === "ASC" ? "ASC" as const : "DESC" as const,
+            }
+          : undefined,
         windowSize:
           calculation.window_size == null
             ? undefined
             : Number(calculation.window_size),
+        scale:
+          calculation.scale == null ? undefined : Number(calculation.scale),
+        precision:
+          calculation.precision == null
+            ? undefined
+            : Number(calculation.precision),
+        denominatorScope:
+          calculation.denominator_scope == null
+            ? undefined
+            : String(calculation.denominator_scope) as NonNullable<
+                AnalysisIntent["windowCalculations"]
+              >[number]["denominatorScope"],
       };
     }),
     sort: rawSort.map((raw) => {

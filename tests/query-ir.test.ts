@@ -708,6 +708,136 @@ describe("QueryIrCompiler", () => {
     );
   });
 
+  it("computes percent of total before sorting and limiting", () => {
+    const compiler = new QueryIrCompiler();
+    const compiled = compiler.compile(
+      {
+        rootObjectId: "o_order",
+        measureIds: ["m_gmv"],
+        dimensionPropertyIds: ["p_store_id"],
+        filters: [],
+        windowCalculations: [
+          {
+            id: "calc_total_share",
+            label: "销售额占比",
+            measureId: "m_gmv",
+            operator: "PERCENT_OF_TOTAL",
+            partitionByPropertyIds: [],
+            scale: 100,
+            precision: 2,
+            denominatorScope: "AFTER_BUSINESS_FILTERS_BEFORE_TOP_N",
+          },
+        ],
+        sort: [{ entityId: "m_gmv", direction: "DESC" }],
+        limit: 5,
+        resultKind: "aggregate",
+        title: "销售额前五门店占比",
+      },
+      testOntology,
+      [ordersTable()],
+    );
+
+    expect(compiled.sql).toContain("WITH `base` AS (");
+    expect(compiled.sql).toContain(
+      "ROUND(((c.`__m0`) / NULLIF(SUM(c.`__m0`) OVER (), 0) * 100), 2) AS `销售额占比`",
+    );
+    expect(compiled.sql.indexOf("SUM(c.`__m0`) OVER ()")).toBeLessThan(
+      compiled.sql.indexOf("LIMIT 5"),
+    );
+    expect(compiled.ir.windowCalculations[0]).toMatchObject({
+      operator: "PERCENT_OF_TOTAL",
+      denominatorScope: "AFTER_BUSINESS_FILTERS_BEFORE_TOP_N",
+    });
+  });
+
+  it("computes percent within composite partitions", () => {
+    const compiler = new QueryIrCompiler();
+    const compiled = compiler.compile(
+      {
+        rootObjectId: "o_order",
+        measureIds: ["m_gmv"],
+        dimensionPropertyIds: ["p_store_id", "p_customer_level", "p_order_id"],
+        filters: [],
+        windowCalculations: [
+          {
+            id: "calc_group_share",
+            label: "门店会员等级销售占比",
+            measureId: "m_gmv",
+            operator: "PERCENT_OF_PARTITION",
+            partitionByPropertyIds: ["p_store_id", "p_customer_level"],
+            precision: 4,
+          },
+        ],
+        resultKind: "aggregate",
+        title: "门店会员等级组内销售占比",
+      },
+      testOntology,
+      [ordersTable(), customerTable()],
+    );
+
+    expect(compiled.sql).toContain(
+      "SUM(c.`__m0`) OVER (PARTITION BY c.`__d0`, c.`__d1`)",
+    );
+    expect(compiled.sql).toContain("* 100), 4)");
+    expect(compiled.ir.windowCalculations[0]).toMatchObject({
+      scale: 100,
+      precision: 4,
+      denominatorScope: "AFTER_BUSINESS_FILTERS_BEFORE_TOP_N",
+    });
+  });
+
+  it("rejects ambiguous self division and invalid share partitions", () => {
+    const compiler = new QueryIrCompiler();
+    expect(() =>
+      compiler.compile(
+        {
+          rootObjectId: "o_order",
+          measureIds: ["m_gmv"],
+          dimensionPropertyIds: ["p_store_id"],
+          filters: [],
+          derivedMeasures: [
+            {
+              id: "calc_wrong_share",
+              label: "错误占比",
+              operator: "RATIO",
+              leftMeasureId: "m_gmv",
+              rightMeasureId: "m_gmv",
+              scale: 100,
+            },
+          ],
+          resultKind: "aggregate",
+          title: "错误占比",
+        },
+        testOntology,
+        [ordersTable()],
+      ),
+    ).toThrow("不能用同一指标除以自身");
+
+    expect(() =>
+      compiler.compile(
+        {
+          rootObjectId: "o_order",
+          measureIds: ["m_gmv"],
+          dimensionPropertyIds: ["p_store_id"],
+          filters: [],
+          windowCalculations: [
+            {
+              id: "calc_missing_partition",
+              label: "组内占比",
+              measureId: "m_gmv",
+              operator: "PERCENT_OF_PARTITION",
+              partitionByPropertyIds: [],
+            },
+          ],
+          resultKind: "aggregate",
+          title: "错误组内占比",
+        },
+        testOntology,
+        [ordersTable()],
+      ),
+    ).toThrow("至少需要一个分区属性");
+  });
+
   it("filters grouped base and composite metrics after aggregation", () => {
     const ontology = ontologyWithTime();
     ontology.objects[0]!.properties.push({

@@ -690,8 +690,21 @@ Montane 提示词分为不可修改的核心执行协议和可配置的工作区
   计算或同一事实对象内的正式指标，编译器按有向无环图递归展开并拒绝循环；除零通过
   `NULLIF` 保护。同比和环比由 `YEAR_OVER_YEAR/PREVIOUS_PERIOD` 指定，
   规则引擎自动扩展底层取数时间并裁剪最终展示区间。
-- 窗口计算支持 `RANK/DENSE_RANK/RUNNING_SUM/MOVING_AVG`，分区字段必须已
-  出现在结果维度中，移动窗口限制为 2 至 365。
+- 窗口计算支持
+  `RANK/DENSE_RANK/RUNNING_SUM/MOVING_AVG/PERCENT_OF_TOTAL/
+  PERCENT_OF_PARTITION`。全局占比不接受分区字段；组内占比至少需要一个
+  分区字段，并支持“区域 + 渠道”等多个本体属性组成复合分区。分区字段必须
+  同时出现在结果维度中，移动窗口限制为 2 至 365。
+- 占比由 Doris 窗口函数确定性计算，不由 Montane 根据返回行口算。
+  `PERCENT_OF_TOTAL` 的分母是当前业务筛选后的全体结果；
+  `PERCENT_OF_PARTITION` 的分母是当前行所属复合分区内的全体结果。
+  当前唯一允许的分母口径是
+  `AFTER_BUSINESS_FILTERS_BEFORE_TOP_N`：先应用时间、权限和业务筛选，再计算
+  分母，最后才执行排序、Top N 和结果行数限制。因此只展示 Top 5 时，占比之和
+  可以小于 100%，但分母不会错误缩小为 Top 5。
+- `DIVIDE/RATIO` 若左右引用同一指标会在执行前被拒绝，并提示改用上述占比算子，
+  防止生成“自己除以自己”的全 100% 结果。正式结论中的数值必须来自
+  `ExecuteAnalysisPlan` 的数据库结果，Montane 不得自行产生新的口算数值。
 - 筛选支持最多四层 `AND/OR/NOT` 逻辑树；所有叶子仍执行属性权限、值绑定和
   参数化校验。
 - 行级属性筛选与聚合后指标筛选严格分离。`filters/filter_expression` 只生成

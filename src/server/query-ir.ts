@@ -81,7 +81,7 @@ export class QueryIrCompiler {
       intent.timeGrain ||
       intent.timeComparisons?.length ||
       intent.windowCalculations?.some(
-        (calculation) => calculation.orderBy.entityId === "__time__",
+        (calculation) => calculation.orderBy?.entityId === "__time__",
       ),
     );
     const timeBinding = needsTimeBinding
@@ -427,7 +427,19 @@ export class QueryIrCompiler {
           : undefined,
       derivedMeasures: intent.derivedMeasures ?? [],
       timeComparisons: intent.timeComparisons ?? [],
-      windowCalculations: intent.windowCalculations ?? [],
+      windowCalculations: (intent.windowCalculations ?? []).map((calculation) =>
+        calculation.operator === "PERCENT_OF_TOTAL" ||
+        calculation.operator === "PERCENT_OF_PARTITION"
+          ? {
+              ...calculation,
+              scale: calculation.scale ?? 100,
+              precision: calculation.precision ?? 2,
+              denominatorScope:
+                calculation.denominatorScope ??
+                "AFTER_BUSINESS_FILTERS_BEFORE_TOP_N",
+            }
+          : calculation,
+      ),
       relationIds,
       grain,
       resultKind: intent.resultKind,
@@ -476,7 +488,11 @@ export class QueryIrCompiler {
       ...(intent.windowCalculations ?? []).map((calculation) => ({
         label: "窗口计算",
         value: calculation.label,
-        source: `IR ${calculation.operator}`,
+        source:
+          calculation.operator === "PERCENT_OF_TOTAL" ||
+          calculation.operator === "PERCENT_OF_PARTITION"
+            ? `Doris 窗口函数 · IR ${calculation.operator} · 业务筛选后/Top N 前`
+            : `IR ${calculation.operator}`,
         entityId: calculation.id,
       })),
       ...filters.map(({ binding, businessValue, value, ...filter }) => ({
@@ -627,6 +643,14 @@ function validateCalculations(
     ) {
       throw new Error(`派生计算 ${calculation.label} 的缩放系数无效`);
     }
+    if (
+      (calculation.operator === "DIVIDE" || calculation.operator === "RATIO") &&
+      calculation.leftMeasureId === calculation.rightMeasureId
+    ) {
+      throw new Error(
+        `派生计算 ${calculation.label} 不能用同一指标除以自身；总体占比请使用 PERCENT_OF_TOTAL，组内占比请使用 PERCENT_OF_PARTITION`,
+      );
+    }
   }
   validateDerivedCalculationGraph(intent.derivedMeasures ?? [], measures);
   if (intent.timeComparisons?.length) {
@@ -640,6 +664,9 @@ function validateCalculations(
   const dimensionIds = new Set(dimensions.map((binding) => binding.property.id));
   for (const calculation of intent.windowCalculations ?? []) {
     requireMeasureReference(measures, calculation.measureId, calculation.label);
+    const isShare =
+      calculation.operator === "PERCENT_OF_TOTAL" ||
+      calculation.operator === "PERCENT_OF_PARTITION";
     for (const propertyId of calculation.partitionByPropertyIds) {
       if (
         propertyId !== "__time__" &&
@@ -653,16 +680,45 @@ function validateCalculations(
         throw new Error(`窗口计算 ${calculation.label} 按时间分区时必须指定时间粒度`);
       }
     }
-    const orderId = calculation.orderBy.entityId;
-    if (
-      orderId !== "__time__" &&
-      !dimensionIds.has(orderId) &&
-      !measures.has(orderId)
-    ) {
-      throw new Error(`窗口计算 ${calculation.label} 引用了不可用的排序字段`);
+    if (calculation.operator === "PERCENT_OF_TOTAL" && calculation.partitionByPropertyIds.length) {
+      throw new Error(`总体占比 ${calculation.label} 不能设置分区属性`);
     }
-    if (orderId === "__time__" && (!intent.timeGrain || !timeBinding)) {
-      throw new Error(`窗口计算 ${calculation.label} 按时间排序时必须指定时间粒度`);
+    if (
+      calculation.operator === "PERCENT_OF_PARTITION" &&
+      !calculation.partitionByPropertyIds.length
+    ) {
+      throw new Error(`组内占比 ${calculation.label} 至少需要一个分区属性`);
+    }
+    if (isShare) {
+      const scale = calculation.scale ?? 100;
+      if (!Number.isFinite(scale) || scale <= 0 || scale > 1_000_000) {
+        throw new Error(`占比计算 ${calculation.label} 的缩放系数无效`);
+      }
+      const precision = calculation.precision ?? 2;
+      if (!Number.isInteger(precision) || precision < 0 || precision > 8) {
+        throw new Error(`占比计算 ${calculation.label} 的小数位必须在 0 到 8 之间`);
+      }
+      if (
+        calculation.denominatorScope &&
+        calculation.denominatorScope !== "AFTER_BUSINESS_FILTERS_BEFORE_TOP_N"
+      ) {
+        throw new Error(`占比计算 ${calculation.label} 使用了不支持的分母口径`);
+      }
+    } else {
+      if (!calculation.orderBy?.entityId) {
+        throw new Error(`窗口计算 ${calculation.label} 必须指定排序字段`);
+      }
+      const orderId = calculation.orderBy.entityId;
+      if (
+        orderId !== "__time__" &&
+        !dimensionIds.has(orderId) &&
+        !measures.has(orderId)
+      ) {
+        throw new Error(`窗口计算 ${calculation.label} 引用了不可用的排序字段`);
+      }
+      if (orderId === "__time__" && (!intent.timeGrain || !timeBinding)) {
+        throw new Error(`窗口计算 ${calculation.label} 按时间排序时必须指定时间粒度`);
+      }
     }
     if (calculation.operator === "MOVING_AVG") {
       const size = calculation.windowSize ?? 3;
@@ -1228,6 +1284,20 @@ function compileWindowExpression(
       ? "c.`__time_bucket`"
       : `c.${quoteIdentifier(dimensionAliases.get(propertyId)!)}`,
   );
+  if (
+    calculation.operator === "PERCENT_OF_TOTAL" ||
+    calculation.operator === "PERCENT_OF_PARTITION"
+  ) {
+    const over = partitions.length
+      ? `PARTITION BY ${partitions.join(", ")}`
+      : "";
+    const scale = formatNumericLiteral(calculation.scale ?? 100);
+    const precision = calculation.precision ?? 2;
+    return `ROUND(((${value}) / NULLIF(SUM(${value}) OVER (${over}), 0) * ${scale}), ${precision})`;
+  }
+  if (!calculation.orderBy) {
+    throw new Error(`窗口计算 ${calculation.label} 缺少排序字段`);
+  }
   const orderEntity = calculation.orderBy.entityId;
   const orderMetric = measures.get(orderEntity);
   const orderExpression =

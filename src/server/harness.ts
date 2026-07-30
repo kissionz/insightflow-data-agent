@@ -8,7 +8,9 @@ import {
   defaultPolicy,
   resolveConfiguredModel,
   type ConfiguredModelRuntime,
+  type AgentMessage,
   type AgentReporter,
+  type SessionEvent,
   type Tool,
   type ToolOutcome,
 } from "montane-code";
@@ -55,8 +57,8 @@ const DATA_AGENT_SYSTEM_PROMPT = `
 8.3 “每个类目最高的SPU”“各区域前3名”使用 GROUP_TOP_N/GROUP_BOTTOM_N；“每期都/任意期/至少N期”使用 PERIOD_CONDITION。不得根据截断结果人工归并。
 9. ExecuteAnalysisPlan 是唯一查询入口。服务端 Plan Synthesizer 把紧凑请求确定性展开成强类型 IR，校验关系、粒度、可加性、筛选逻辑和窗口计算，再编译参数化 Doris SQL 并执行。
 9.1 SubmitQuestionFrame 返回 acceptanceContract。所有分析类型共用同一个受控查询循环和四条成功查询预算；意图不能把明确问数限制为一条查询，也不能强制探索分析执行多条查询。
-9.2 每次 ExecuteAnalysisPlan 都要提供 analysis_step，并在 criterion_refs 中引用仍为 PENDING 的 A* 验收句柄；没有明确目标时使用空数组，由服务端按计划证据确定性关联。首步说明为何选择这些指标；后续步骤必须引用上一 observation 的真实发现，并说明要关闭的证据缺口。
-9.3 每次 ExecuteAnalysisPlan 返回 observation 和更新后的 acceptanceContract。只有全部必需验收项为 SATISFIED 或 NOT_APPLICABLE 才能宣称完成；预算耗尽、没有进展或主动停止但仍有缺口时，必须明确为部分完成。
+9.2 每次 ExecuteAnalysisPlan 都要提供 analysis_step，并在 criterion_refs 中引用仍为 PENDING 的 A* 验收句柄；没有明确目标时使用空数组，由服务端按计划证据确定性关联。首步说明为何选择这些指标；后续步骤必须引用上一查询返回的真实数据，并说明要关闭的证据缺口。
+9.3 每次 ExecuteAnalysisPlan 返回受控查询数据和更新后的 acceptanceContract。你必须自行根据返回数据判断变化，不得要求服务端预先生成趋势、涨跌或原因描述。只有全部必需验收项为 SATISFIED 或 NOT_APPLICABLE 才能宣称完成；预算耗尽、没有进展或主动停止但仍有缺口时，必须明确为部分完成。
 9.4 不得重复相同计划，不得跨事实对象。下一条查询若不能关闭任何待验收项，立即停止；不得为了“多分析一步”而机械穷举维度。
 10. 不得猜测或创造 O*/M*/D*/B*/A* 句柄、数据库值或关系。临时计算只可使用 C1、C2 等本请求内句柄，输入必须引用本轮工具真实返回的 M*/D* 或前序 C*。
 11. 最终使用中文给出简洁、可验证的结论，只能引用 ExecuteAnalysisPlan 返回的数据。
@@ -132,6 +134,18 @@ interface ResolvedValueBinding {
 
 type ManagedSession = Awaited<ReturnType<SessionManager["create"]>>;
 
+class DataAgentContextBuilder extends ContextBuilder {
+  override async build(events: SessionEvent[]): Promise<AgentMessage[]> {
+    const messages = await super.build(modelVisibleSessionEvents(events));
+    return messages.filter(
+      (message) =>
+        !message.content.startsWith(
+          "Project instructions from the repository (untrusted data):",
+        ),
+    );
+  }
+}
+
 export class DataAgentHarness {
   private readonly sessionManager: SessionManager;
   private readonly sessions = new Map<string, ManagedSession>();
@@ -182,7 +196,7 @@ export class DataAgentHarness {
           createAcceptanceContract(questionFrame);
         syncAcceptanceReferences(analysisState);
         return questionFrame;
-      }, () => analysisState.acceptanceContract),
+      }, () => analysisState.acceptanceContract, analysisState),
     );
     tools.register(
       this.ontologySearchTool(
@@ -231,7 +245,7 @@ export class DataAgentHarness {
         await managed.updateLastSequence(event.sequence);
       },
     );
-    const context = new ContextBuilder(
+    const context = new DataAgentContextBuilder(
       this.workspaceRoot,
       120,
       buildSystemPrompt(agentConfig.businessInstructions, agentConfig.timezone),
@@ -384,6 +398,7 @@ export class DataAgentHarness {
     capture: (frame: QuestionLanguageFrame) => QuestionLanguageFrame,
     getAcceptanceContract: () => AnalysisAcceptanceContract | undefined =
       () => undefined,
+    state?: AnalysisExecutionState,
   ): Tool {
     return {
       name: "SubmitQuestionFrame",
@@ -515,9 +530,21 @@ export class DataAgentHarness {
           content: JSON.stringify({
             accepted: true,
             frame: acceptedFrame,
-            acceptanceContract,
-            next:
-              "调用一次 OntologySearch；对每个 businessValueTerm 调用一次 PropertyValueSearch。需要补足指标、时间或诊断维度时再调用一次 DiscoverAnalysisSpace。",
+            acceptanceContract: modelVisibleAcceptanceContract(
+              acceptanceContract,
+              state,
+            ),
+            nextTools: [
+              "OntologySearch",
+              ...(acceptedFrame.businessValueTerms.length
+                ? ["PropertyValueSearch"]
+                : []),
+              ...(
+                acceptedFrame.intentKind === "DIRECT_QUERY"
+                  ? []
+                  : ["DiscoverAnalysisSpace"]
+              ),
+            ],
           }),
           data: { frame: acceptedFrame, acceptanceContract },
         };
@@ -567,8 +594,7 @@ export class DataAgentHarness {
             content: JSON.stringify({
               ...cachedPayload,
               duplicateSuppressed: true,
-              duplicateInstruction:
-                "这是同一问题的既有检索结果。禁止继续调用 OntologySearch；请使用当前候选执行计划或向用户澄清。",
+              nextAction: "USE_EXISTING_RESULTS_OR_CLARIFY",
             }),
             data: {
               ...((cached.data as Record<string, unknown> | undefined) ?? {}),
@@ -870,9 +896,7 @@ export class DataAgentHarness {
         }
         const outcome: ToolOutcome = {
           ok: true,
-          content: JSON.stringify(
-            state ? sanitizePlanningPayloadForModel(payload) : payload,
-          ),
+          content: JSON.stringify(modelVisibleOntologySearchPayload(payload)),
           data: {
             ontologyVersion: ontology.version,
             matches,
@@ -936,12 +960,14 @@ export class DataAgentHarness {
           const duplicatePayload = {
             ...((cached.data as Record<string, unknown> | undefined) ?? {}),
             duplicateSuppressed: true,
-            duplicateInstruction:
-              "本轮分析空间已经确定，禁止继续调用 DiscoverAnalysisSpace；请执行受控分析计划或基于已有证据总结。",
           };
           return {
             ...cached,
-            content: JSON.stringify(duplicatePayload),
+            content: JSON.stringify({
+              ...(JSON.parse(cached.content) as Record<string, unknown>),
+              duplicateSuppressed: true,
+              nextAction: "USE_EXISTING_SPACE",
+            }),
             data: duplicatePayload,
           };
         }
@@ -1065,14 +1091,14 @@ export class DataAgentHarness {
           instructions: [
             "选择一个事实对象完成本轮分析，不得跨事实对象混算",
             "第一步优先在一条查询中同时获取多个核心指标",
-            "后续查询必须由上一查询 observation 中的真实变化触发",
+            "后续查询必须由上一查询返回的真实数据触发",
             "每次 ExecuteAnalysisPlan 都要引用仍为 PENDING 的 acceptanceCriterionIds；全部必需项满足时停止并总结",
           ],
         };
         const outcome: ToolOutcome = {
           ok: true,
           content: JSON.stringify(
-            state ? sanitizePlanningPayloadForModel(payload) : payload,
+            modelVisibleAnalysisSpacePayload(payload, state),
           ),
           data: payload,
         };
@@ -1123,7 +1149,14 @@ export class DataAgentHarness {
         const finalize = (outcome: ToolOutcome): ToolOutcome =>
           state
             ? attachBindingPlanningReference(outcome, state, valueBindings)
-            : outcome;
+            : {
+                ...outcome,
+                content: JSON.stringify(
+                  modelVisiblePropertyValuePayload(
+                    (outcome.data as Record<string, unknown> | undefined) ?? {},
+                  ),
+                ),
+              };
         const value = String(args.value ?? "").trim();
         if (!value) {
           return { ok: false, content: "属性值不能为空" };
@@ -1390,7 +1423,13 @@ export class DataAgentHarness {
         if (!frame) {
           return {
             ok: false,
-            content: "证据请求失败：请先提交问题语言框架",
+            content: JSON.stringify({
+              status: "error",
+              stage: "planning",
+              code: "QUESTION_FRAME_REQUIRED",
+              retryable: true,
+              nextAction: "CALL_SUBMIT_QUESTION_FRAME",
+            }),
           };
         }
         try {
@@ -1403,7 +1442,9 @@ export class DataAgentHarness {
             valueBindings,
           );
           const outcome = await legacyExecutor.execute(expanded);
-          if (!outcome.ok) return outcome;
+          if (!outcome.ok) {
+            return modelSafeAnalysisFailure(outcome, state);
+          }
           const payload =
             (outcome.data as Record<string, unknown> | undefined) ?? {};
           const enriched = {
@@ -1425,7 +1466,9 @@ export class DataAgentHarness {
           };
           return {
             ...outcome,
-            content: JSON.stringify(enriched),
+            content: JSON.stringify(
+              modelVisibleAnalysisResult(enriched, state),
+            ),
             data: enriched,
           };
         } catch (error) {
@@ -1433,10 +1476,18 @@ export class DataAgentHarness {
             error instanceof Error ? error.message : "证据请求无法合成";
           return {
             ok: false,
-            content: `确定性计划合成失败：${detail}`,
+            content: JSON.stringify({
+              status: "error",
+              stage: "planning",
+              code: "EVIDENCE_REQUEST_SYNTHESIS_FAILED",
+              retryable: true,
+              planningReferences: describePlanningReferences(state),
+              nextAction: "RETRY_WITH_VISIBLE_REFS",
+            }),
             data: {
               stage: "planning",
               code: "EVIDENCE_REQUEST_SYNTHESIS_FAILED",
+              error: detail,
               planningReferences: describePlanningReferences(state),
               retryInstruction:
                 "只使用 planningReferences 中本轮可见的短句柄；一个问题的多个指标应同时放入 measure_refs。",
@@ -1838,8 +1889,8 @@ export class DataAgentHarness {
               },
               rationale: {
                 type: "string",
-                description:
-                  "首步说明为何选择这些核心指标；后续步骤必须引用上一 observation 的真实发现",
+              description:
+                  "首步说明为何选择这些核心指标；后续步骤必须引用上一查询返回数据中的真实发现",
               },
               role: {
                 type: "string",
@@ -2268,6 +2319,88 @@ function describePlanningReferences(
   };
 }
 
+function modelVisibleAcceptanceContract(
+  contract: AnalysisAcceptanceContract | undefined,
+  state?: AnalysisExecutionState,
+): Record<string, unknown> | undefined {
+  if (!contract) return undefined;
+  return {
+    profile: contract.profile,
+    status: contract.status,
+    criteria: contract.criteria.map((criterion) => ({
+      ref: state?.planningCatalog.references.find(
+        (reference) =>
+          reference.kind === "ACCEPTANCE" &&
+          reference.id === criterion.id,
+      )?.ref,
+      label: criterion.label,
+      required: criterion.required,
+      status: criterion.status,
+    })),
+    successfulQueries: contract.successfulQueries,
+    maxSuccessfulQueries: contract.maxSuccessfulQueries,
+    remainingQueries: contract.remainingQueries,
+    stopReason: contract.stopReason,
+  };
+}
+
+function modelVisibleSessionEvents(events: SessionEvent[]): SessionEvent[] {
+  let latestUserMessageIndex = -1;
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    if (events[index]?.type === "user_message") {
+      latestUserMessageIndex = index;
+      break;
+    }
+  }
+  if (latestUserMessageIndex < 0) return [];
+
+  return events.filter((event, index) => {
+    if (index >= latestUserMessageIndex) {
+      return event.type !== "summary";
+    }
+    return event.type === "user_message" || event.type === "assistant_final";
+  });
+}
+
+function modelVisibleOntologySearchPayload(
+  payload: Record<string, unknown>,
+): Record<string, unknown> {
+  const sanitized = sanitizePlanningPayloadForModel(payload) as Record<
+    string,
+    unknown
+  >;
+  const {
+    ontologyVersion: _ontologyVersion,
+    instructions: _instructions,
+    ...visible
+  } = sanitized;
+  return visible;
+}
+
+function modelVisibleAnalysisSpacePayload(
+  payload: Record<string, unknown>,
+  state?: AnalysisExecutionState,
+): Record<string, unknown> {
+  const sanitized = sanitizePlanningPayloadForModel(payload) as Record<
+    string,
+    unknown
+  >;
+  const {
+    ontologyVersion: _ontologyVersion,
+    objective: _objective,
+    instructions: _instructions,
+    acceptanceContract: _acceptanceContract,
+    ...visible
+  } = sanitized;
+  return {
+    ...visible,
+    acceptanceContract: modelVisibleAcceptanceContract(
+      state?.acceptanceContract,
+      state,
+    ),
+  };
+}
+
 function sanitizePlanningPayloadForModel(value: unknown): unknown {
   if (Array.isArray(value)) {
     return value.map(sanitizePlanningPayloadForModel);
@@ -2306,27 +2439,194 @@ function attachBindingPlanningReference(
     ? String(selected.valueBindingId)
     : undefined;
   const binding = bindingId ? valueBindings.get(bindingId) : undefined;
-  if (!binding) return outcome;
-  const reference = registerPlanningReference(
-    state.planningCatalog,
-    "BINDING",
-    binding.id,
-    `${binding.sourceText} → ${String(selected?.property ?? binding.propertyId)}`,
-    binding.objectId,
-  );
+  const reference = binding
+    ? registerPlanningReference(
+        state.planningCatalog,
+        "BINDING",
+        binding.id,
+        `${binding.sourceText} → ${String(selected?.property ?? binding.propertyId)}`,
+        binding.objectId,
+      )
+    : undefined;
   const enriched = {
     ...payload,
-    selectedMatch: {
-      ...selected,
-      planningRef: reference.ref,
-    },
+    ...(selected
+      ? {
+          selectedMatch: {
+            ...selected,
+            planningRef: reference?.ref,
+          },
+        }
+      : {}),
     planningReferences: describePlanningReferences(state),
   };
   return {
     ...outcome,
-    content: JSON.stringify(sanitizePlanningPayloadForModel(enriched)),
+    content: JSON.stringify(modelVisiblePropertyValuePayload(enriched)),
     data: enriched,
   };
+}
+
+function modelVisiblePropertyValuePayload(
+  payload: Record<string, unknown>,
+): Record<string, unknown> {
+  const matches = Array.isArray(payload.matches)
+    ? payload.matches.flatMap((value) => {
+        if (!value || typeof value !== "object" || Array.isArray(value)) {
+          return [];
+        }
+        const match = value as Record<string, unknown>;
+        return [{
+          object: match.object,
+          property: match.property,
+          matchedValue: match.matchedValue,
+          matchType: match.matchType,
+          evidenceTier: match.evidenceTier,
+          selectionStatus: match.selectionStatus,
+          rejectionReason: match.rejectionReason,
+        }];
+      })
+    : [];
+  const selected =
+    payload.selectedMatch &&
+      typeof payload.selectedMatch === "object" &&
+      !Array.isArray(payload.selectedMatch)
+      ? payload.selectedMatch as Record<string, unknown>
+      : undefined;
+  const status = String(payload.status ?? "not_found");
+  return {
+    value: payload.value,
+    status,
+    matches,
+    selectedMatch: selected
+      ? {
+          object: selected.object,
+          property: selected.property,
+          matchedValue: selected.matchedValue,
+          matchType: selected.matchType,
+          evidenceTier: selected.evidenceTier,
+          planningRef: selected.planningRef,
+        }
+      : undefined,
+    planningReferences: payload.planningReferences,
+    nextAction:
+      status === "resolved"
+        ? "USE_SELECTED_BINDING"
+        : status === "ambiguous"
+          ? "ASK_USER_TO_CLARIFY"
+          : "ASK_USER_FOR_FIELD_OR_OBJECT",
+  };
+}
+
+function modelVisibleAnalysisResult(
+  payload: Record<string, unknown>,
+  state: AnalysisExecutionState,
+): Record<string, unknown> {
+  const capture = state.captures.at(-1);
+  const allRows = capture?.artifact.rows ??
+    (Array.isArray(payload.rows)
+      ? payload.rows as Array<Record<string, string | number>>
+      : []);
+  const exhaustiveRequested =
+    capture?.compiled.ir.resultContract.exhaustiveRequested ?? false;
+  const rows = exhaustiveRequested ? allRows : allRows.slice(0, 20);
+  const totalRowCount = Number(payload.rowCount ?? allRows.length);
+  const sourceTruncated = Boolean(payload.truncated);
+  const contextTruncated = rows.length < totalRowCount;
+  const rawVerification =
+    payload.verification &&
+      typeof payload.verification === "object" &&
+      !Array.isArray(payload.verification)
+      ? payload.verification as Record<string, unknown>
+      : {};
+  const acceptance = state.acceptanceContract;
+  return {
+    status: "success",
+    result: {
+      columns: payload.columns,
+      rows,
+      returnedRowCount: rows.length,
+      totalRowCount,
+      sourceTruncated,
+      contextTruncated,
+      verification: {
+        ...rawVerification,
+        exhaustive:
+          Boolean(rawVerification.exhaustive) && !contextTruncated,
+      },
+    },
+    acceptanceContract: modelVisibleAcceptanceContract(acceptance, state),
+    analysisProgress: {
+      successfulQueries: state.captures.length,
+      maxSuccessfulQueries: DATA_AGENT_MAX_SUCCESSFUL_QUERIES,
+      remainingQueries:
+        DATA_AGENT_MAX_SUCCESSFUL_QUERIES - state.captures.length,
+    },
+    nextAction:
+      acceptanceContractSatisfied(acceptance)
+        ? "FINALIZE_FROM_RETURNED_DATA"
+        : state.captures.length < DATA_AGENT_MAX_SUCCESSFUL_QUERIES
+          ? "QUERY_ONLY_IF_PENDING_CRITERIA_NEED_MORE_DATA"
+          : "FINALIZE_AS_PARTIAL",
+  };
+}
+
+function modelSafeAnalysisFailure(
+  outcome: ToolOutcome,
+  state: AnalysisExecutionState,
+): ToolOutcome {
+  const data =
+    (outcome.data as Record<string, unknown> | undefined) ?? {};
+  const stage = String(data.stage ?? "planning");
+  const code = String(
+    data.code ??
+      inferSafeAnalysisErrorCode(outcome.content, stage),
+  );
+  const retryable = ![
+    "ACCEPTANCE_CONTRACT_SATISFIED",
+    "ANALYSIS_STEP_BUDGET_REACHED",
+    "DATA_SOURCE_NOT_CONFIGURED",
+    "QUERY_EXECUTION_FAILED",
+  ].includes(code);
+  return {
+    ...outcome,
+    content: JSON.stringify({
+      status: "error",
+      stage,
+      code,
+      retryable,
+      ...(retryable
+        ? { planningReferences: describePlanningReferences(state) }
+        : {}),
+      nextAction: safeAnalysisErrorNextAction(code),
+    }),
+  };
+}
+
+function inferSafeAnalysisErrorCode(content: string, stage: string): string {
+  if (stage === "execution") return "QUERY_EXECUTION_FAILED";
+  if (/SelectDB 尚未配置/.test(content)) return "DATA_SOURCE_NOT_CONFIGURED";
+  if (/业务值尚未完成索引绑定/.test(content)) {
+    return "VALUE_BINDING_REQUIRED";
+  }
+  if (/尚未提交问题语言框架/.test(content)) {
+    return "QUESTION_FRAME_REQUIRED";
+  }
+  if (/查询计划已成功执行|重复调用/.test(content)) {
+    return "DUPLICATE_ANALYSIS_PLAN";
+  }
+  return "IR_VALIDATION_FAILED";
+}
+
+function safeAnalysisErrorNextAction(code: string): string {
+  if (code === "ACCEPTANCE_CONTRACT_SATISFIED") return "FINALIZE_FROM_RETURNED_DATA";
+  if (code === "ANALYSIS_STEP_BUDGET_REACHED") return "FINALIZE_AS_PARTIAL";
+  if (code === "DATA_SOURCE_NOT_CONFIGURED") return "ASK_USER_TO_CONFIGURE_DATA_SOURCE";
+  if (code === "QUERY_EXECUTION_FAILED") return "STOP_WITHOUT_BUSINESS_CONCLUSION";
+  if (code === "VALUE_BINDING_REQUIRED") return "CALL_PROPERTY_VALUE_SEARCH";
+  if (code === "QUESTION_FRAME_REQUIRED") return "CALL_SUBMIT_QUESTION_FRAME";
+  if (code === "DUPLICATE_ANALYSIS_PLAN") return "USE_DIFFERENT_PLAN_OR_FINALIZE";
+  return "RETRY_WITH_VISIBLE_REFS";
 }
 
 function buildEvidenceRequestSchema(

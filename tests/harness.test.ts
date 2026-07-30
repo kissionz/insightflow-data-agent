@@ -252,6 +252,78 @@ describe("DataAgentHarness", () => {
     expect(queries[0].parameters?.[0]).toBe("线上渠道");
     expect(output.responseKind).toBe("analysis");
     expect(output.result?.rows).toEqual([{ 成交金额: 128000 }]);
+
+    const ontologyPayload = model.seenToolPayloads.get("OntologySearch");
+    expect(JSON.stringify(ontologyPayload)).not.toContain("joinExpression");
+    expect(JSON.stringify(ontologyPayload)).not.toContain("objectId");
+    expect(JSON.stringify(ontologyPayload)).not.toContain("sourceColumn");
+
+    const valuePayload = model.seenToolPayloads.get("PropertyValueSearch") as {
+      matches?: Array<Record<string, unknown>>;
+      selectedMatch?: Record<string, unknown>;
+    };
+    expect(valuePayload.matches?.[0]).not.toHaveProperty("column");
+    expect(valuePayload.matches?.[0]).not.toHaveProperty("objectId");
+    expect(valuePayload.matches?.[0]).not.toHaveProperty("propertyId");
+    expect(valuePayload.selectedMatch).toHaveProperty("planningRef", "B1");
+
+    const resultPayload = model.seenToolPayloads.get("ExecuteAnalysisPlan") as {
+      result?: {
+        rows?: Array<Record<string, string | number>>;
+        totalRowCount?: number;
+        contextTruncated?: boolean;
+      };
+      acceptanceContract?: { status?: string };
+      nextAction?: string;
+    };
+    expect(resultPayload.result).toEqual(
+      expect.objectContaining({
+        rows: [{ 成交金额: 128000 }],
+        totalRowCount: 1,
+        contextTruncated: false,
+      }),
+    );
+    expect(resultPayload.acceptanceContract?.status).toBe("SATISFIED");
+    expect(resultPayload.nextAction).toBe("FINALIZE_FROM_RETURNED_DATA");
+    expect(resultPayload).not.toHaveProperty("sql");
+    expect(resultPayload).not.toHaveProperty("parameters");
+    expect(resultPayload).not.toHaveProperty("ir");
+    expect(resultPayload).not.toHaveProperty("observation");
+    expect(resultPayload).not.toHaveProperty("bindings");
+    expect(resultPayload).not.toHaveProperty("evidenceRequest");
+    expect(resultPayload).not.toHaveProperty("synthesis");
+
+    const followUp = await harness.run(
+      repository.getConversation(conversation.id)!,
+      {
+        id: "turn_ir_follow_up",
+        conversationId: conversation.id,
+        parentTurnId: turn.id,
+        question: "那去年呢",
+        status: "planning",
+        createdAt: new Date().toISOString(),
+        ontologyVersion: ontology.version,
+        trace: [],
+      },
+      {
+        onTextDelta() {},
+        onTextEnd() {},
+        onToolStatus() {},
+      },
+    );
+    expect(followUp.answer).toBeTruthy();
+    expect(model.lastMessages.some((message) => message.toolResult)).toBe(false);
+    expect(model.lastMessages.some((message) => message.toolCalls?.length)).toBe(false);
+    expect(model.lastMessages).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ role: "user", content: "今年线上渠道销售额" }),
+        expect.objectContaining({
+          role: "assistant",
+          content: "今年线上渠道销售额为 128,000 元。",
+        }),
+        expect.objectContaining({ role: "user", content: "那去年呢" }),
+      ]),
+    );
     await harness.close();
     repository.close();
   });
@@ -644,7 +716,10 @@ describe("DataAgentHarness", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0].sql).toContain("`member_level`");
     expect(calls[0].parameters).toEqual(["VIP"]);
-    expect(second.content).toContain('"source":"local-cache"');
+    expect(second.content).toContain('"matchedValue":"VIP"');
+    expect(second.content).not.toContain('"source"');
+    expect(second.content).not.toContain('"column"');
+    expect(second.content).not.toContain('"propertyId"');
     await harness.close();
     repository.close();
   });
@@ -693,12 +768,16 @@ describe("DataAgentHarness", () => {
     const repeated = await tool.execute({ query: "今年销售金额" });
 
     expect(first.ok).toBe(true);
-    expect(first.content).toContain('"id":"p_order_amount"');
+    expect(first.content).not.toContain('"id"');
+    expect(first.content).not.toContain("joinExpression");
     expect(first.content).toContain('"measureKind":"PROPERTY"');
     expect(first.content).toContain('"aggregation":"SUM"');
     expect(repeated.data).toMatchObject({ duplicateSuppressed: true });
     expect(repeated.content).toContain('"duplicateSuppressed":true');
-    expect(repeated.content).toContain("禁止继续调用 OntologySearch");
+    expect(JSON.parse(repeated.content)).toMatchObject({
+      duplicateSuppressed: true,
+      nextAction: "USE_EXISTING_RESULTS_OR_CLARIFY",
+    });
     await harness.close();
     repository.close();
   });
@@ -818,8 +897,15 @@ describe("DataAgentHarness", () => {
     expect(outcome.content).toContain('"property":"渠道性质"');
     expect(outcome.content).toContain('"selectionStatus":"selected"');
     expect(outcome.content).toContain('"selectionStatus":"rejected"');
-    expect(outcome.content).toContain('"valueBindingId":"value_binding_');
-    expect(outcome.content).toContain("纠正了词形候选范围");
+    expect(outcome.content).not.toContain("valueBindingId");
+    expect(outcome.content).not.toContain("纠正了词形候选范围");
+    expect(
+      (
+        (outcome.data as {
+          selectedMatch?: { valueBindingId?: string };
+        }).selectedMatch?.valueBindingId
+      ),
+    ).toMatch(/^value_binding_/);
     await harness.close();
     repository.close();
   });
@@ -1040,6 +1126,7 @@ describe("DataAgentHarness", () => {
     const model = new ExploratoryMontaneModel();
     const queries: string[] = [];
     const rejectedPlanCodes: string[] = [];
+    const rejectedPlanContents: string[] = [];
     const harness = new DataAgentHarness(
       root,
       repository,
@@ -1089,6 +1176,7 @@ describe("DataAgentHarness", () => {
                 (result?.data as { code?: string } | undefined)?.code ?? "",
               ),
             );
+            rejectedPlanContents.push(result?.content ?? "");
           }
         },
       },
@@ -1100,6 +1188,18 @@ describe("DataAgentHarness", () => {
       "ACCEPTANCE_CONTRACT_SATISFIED",
       "ACCEPTANCE_CONTRACT_SATISFIED",
     ]);
+    expect(rejectedPlanContents.map((content) => JSON.parse(content))).toEqual(
+      Array.from({ length: 3 }, () =>
+        expect.objectContaining({
+          status: "error",
+          code: "ACCEPTANCE_CONTRACT_SATISFIED",
+          retryable: false,
+          nextAction: "FINALIZE_FROM_RETURNED_DATA",
+        })
+      ),
+    );
+    expect(rejectedPlanContents.join("\n")).not.toContain("rootObjectId");
+    expect(rejectedPlanContents.join("\n")).not.toContain("measureIds");
     expect(model.turnCount).toBe(9);
     expect(queries).toHaveLength(2);
     expect(queries[1]).toContain("member_level");
@@ -1796,6 +1896,8 @@ class PlanningMontaneModel implements ModelClient {
   };
   private step = 0;
   seenTools: string[] = [];
+  seenToolPayloads = new Map<string, Record<string, unknown>>();
+  lastMessages: AgentMessage[] = [];
 
   async complete(options: {
     messages: AgentMessage[];
@@ -1804,6 +1906,18 @@ class PlanningMontaneModel implements ModelClient {
   }): Promise<AgentResponse> {
     this.step += 1;
     this.seenTools = options.tools.map((tool) => String(tool.name));
+    this.lastMessages = structuredClone(options.messages);
+    for (const message of options.messages) {
+      if (!message.toolResult) continue;
+      try {
+        this.seenToolPayloads.set(
+          message.toolResult.name,
+          JSON.parse(message.toolResult.content) as Record<string, unknown>,
+        );
+      } catch {
+        // Only structured model-visible tool results are relevant to this test.
+      }
+    }
     if (this.step === 1) {
       return {
         toolCalls: [{

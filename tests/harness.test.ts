@@ -1351,7 +1351,164 @@ describe("DataAgentHarness", () => {
     await harness.close();
     repository.close();
   });
+
+  it("synthesizes one governed plan for multiple metrics, a value binding, and同比", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-harness-"));
+    roots.push(root);
+    const repository = new Repository(
+      path.join(root, ".montane/data-agent/ontology.sqlite"),
+    );
+    const ontology = ontologyWithGrossMargin();
+    const order = ontology.objects.find((object) => object.id === "o_order")!;
+    order.properties.push({
+      id: "p_brand",
+      name: "brand",
+      label: "品牌",
+      description: "商品品牌",
+      dataType: "VARCHAR",
+      sourceColumn: "brand",
+      sensitive: false,
+      meaning: "CATEGORY",
+      unique: false,
+      valueSearchable: true,
+      visibility: "ANALYTICAL",
+      synonyms: [],
+      defaultDisplay: true,
+      exportable: true,
+      bindingPriority: 80,
+    });
+    repository.saveOntology(ontology);
+    repository.upsertScannedTables([{
+      id: "t_orders",
+      catalog: "internal",
+      database: "retail",
+      name: "fact_orders",
+      type: "TABLE",
+      status: "MODELED",
+      columns: [],
+      fingerprint: "fact_orders:multi-metric-yoy",
+      scannedAt: "2026-07-30T00:00:00.000Z",
+    }]);
+    repository.saveDataSource({
+      configured: true,
+      host: "selectdb.test",
+      port: 9030,
+      username: "reader",
+      database: "retail",
+      catalog: "internal",
+      tls: false,
+      passwordStored: true,
+    });
+    repository.replaceIndexedPropertyValues(
+      ontology.version,
+      order.id,
+      "p_brand",
+      [{ displayValue: "薇诺娜", frequency: 100 }],
+    );
+    const conversation = createConversation();
+    repository.saveConversation(conversation);
+    const model = new MultiMetricYoyMontaneModel();
+    const queries: string[] = [];
+    const syntheses: Array<Record<string, unknown>> = [];
+    const harness = new DataAgentHarness(
+      root,
+      repository,
+      async (sql) => {
+        queries.push(sql);
+        return {
+          columns: ["年份", "成交金额", "成本额", "成交金额同比", "成本额同比"],
+          rows: [{
+            年份: "2026-01-01",
+            成交金额: 128000,
+            成本额: 56000,
+            成交金额同比: 0.2,
+            成本额同比: 0.1,
+          }],
+          durationMs: 8,
+          truncated: false,
+        };
+      },
+      () => runtimeFor(model),
+    );
+
+    const output = await harness.run(
+      conversation,
+      {
+        id: "turn_multi_metric_yoy",
+        conversationId: conversation.id,
+        question: "今年薇诺娜销售额、成本额和同比",
+        status: "planning",
+        createdAt: new Date().toISOString(),
+        ontologyVersion: ontology.version,
+        trace: [],
+      },
+      {
+        onTextDelta() {},
+        onTextEnd() {},
+        onToolStatus(call, status, result) {
+          if (
+            call.name === "ExecuteAnalysisPlan" &&
+            status === "succeeded" &&
+            result?.data
+          ) {
+            syntheses.push(
+              (result.data as { synthesis: Record<string, unknown> }).synthesis,
+            );
+          }
+        },
+      },
+    );
+
+    expect(output.responseKind).toBe("analysis");
+    expect(queries).toHaveLength(1);
+    expect(queries[0]).toContain("AS `成交金额同比`");
+    expect(queries[0]).toContain("AS `成本额同比`");
+    expect(queries[0]).toContain("t0.`brand` = ?");
+    expect(syntheses).toContainEqual(
+      expect.objectContaining({ selectedMeasureCount: 2 }),
+    );
+    expect(model.planSchema).toContain('"measure_refs"');
+    expect(model.planSchema).toContain('"strict":true');
+    expect(model.planSchema).not.toContain('"root_object_id"');
+    expect(model.planSchema.length).toBeLessThan(12_000);
+    await harness.close();
+    repository.close();
+  });
 });
+
+function evidenceRequest(options: {
+  measureRefs?: string[];
+  dimensionRefs?: string[];
+  bindingRefs?: string[];
+  timeGrain?: "AUTO" | "DAY" | "WEEK" | "MONTH" | "QUARTER" | "YEAR";
+  sortRef?: string;
+  sortDirection?: "AUTO" | "ASC" | "DESC";
+  limit?: number;
+  title: string;
+  objective?: string;
+  rationale?: string;
+  role?: "OVERVIEW" | "DIAGNOSTIC" | "SUPPORTING";
+}): Record<string, unknown> {
+  return {
+    root_ref: "AUTO",
+    measure_refs: options.measureRefs ?? ["M1"],
+    dimension_refs: options.dimensionRefs ?? [],
+    binding_refs: options.bindingRefs ?? [],
+    time_grain: options.timeGrain ?? "AUTO",
+    operations: [],
+    sort_ref: options.sortRef ?? "AUTO",
+    sort_direction: options.sortDirection ?? "AUTO",
+    limit: options.limit ?? 0,
+    result_kind: "AGGREGATE",
+    title: options.title,
+    analysis_step: {
+      objective: options.objective ?? options.title,
+      rationale: options.rationale ?? "测试紧凑证据请求",
+      role: options.role ?? "OVERVIEW",
+      criterion_refs: [],
+    },
+  };
+}
 
 class ScriptedMontaneModel implements ModelClient {
   readonly capabilities = {
@@ -1429,27 +1586,12 @@ class CorrectiveDirectMontaneModel implements ModelClient {
         toolCalls: [{
           id: "call_corrective_first",
           name: "ExecuteAnalysisPlan",
-          args: {
-            root_object_id: "o_order",
-            measure_ids: ["m_gmv"],
-            dimension_property_ids: [],
-            filters: [],
+          args: evidenceRequest({
             limit: 10,
-            result_kind: "aggregate",
             title: "订单成交金额首次查询",
-            analysis_step: {
-              id: "step_direct_first",
-              objective: "取得订单成交金额",
-              rationale: "先执行最小必要查询",
-              role: "OVERVIEW",
-              acceptance_criterion_ids: [
-                "requested_result",
-                "scope_bound",
-                "database_evidence",
-                "result_complete",
-              ],
-            },
-          },
+            objective: "取得订单成交金额",
+            rationale: "先执行最小必要查询",
+          }),
         }],
         stopReason: "tool_use",
       };
@@ -1459,22 +1601,13 @@ class CorrectiveDirectMontaneModel implements ModelClient {
         toolCalls: [{
           id: "call_corrective_second",
           name: "ExecuteAnalysisPlan",
-          args: {
-            root_object_id: "o_order",
-            measure_ids: ["m_gmv"],
-            dimension_property_ids: [],
-            filters: [],
+          args: evidenceRequest({
             limit: 20,
-            result_kind: "aggregate",
             title: "订单成交金额纠正查询",
-            analysis_step: {
-              id: "step_direct_corrective",
-              objective: "消除首次结果截断造成的完整性缺口",
-              rationale: "上一轮 observation 显示 truncated=true",
-              role: "SUPPORTING",
-              acceptance_criterion_ids: ["result_complete"],
-            },
-          },
+            objective: "消除首次结果截断造成的完整性缺口",
+            rationale: "上一轮 observation 显示 truncated=true",
+            role: "SUPPORTING",
+          }),
         }],
         stopReason: "tool_use",
       };
@@ -1549,26 +1682,12 @@ class IncompleteExplorationMontaneModel implements ModelClient {
         toolCalls: [{
           id: "call_partial_overview",
           name: "ExecuteAnalysisPlan",
-          args: {
-            root_object_id: "o_order",
-            measure_ids: ["m_gmv", "m_cost"],
-            dimension_property_ids: [],
-            filters: [],
-            result_kind: "aggregate",
+          args: evidenceRequest({
+            measureRefs: ["M1", "M2"],
             title: "订单销售总览",
-            analysis_step: {
-              id: "step_partial_overview",
-              objective: "取得订单销售核心指标",
-              rationale: "先覆盖整体表现",
-              role: "OVERVIEW",
-              acceptance_criterion_ids: [
-                "overview_covered",
-                "scope_bound",
-                "database_evidence",
-                "result_complete",
-              ],
-            },
-          },
+            objective: "取得订单销售核心指标",
+            rationale: "先覆盖整体表现",
+          }),
         }],
         stopReason: "tool_use",
       };
@@ -1620,21 +1739,11 @@ class BudgetLimitedDiagnosticMontaneModel implements ModelClient {
       });
     }
     if (this.step === 4) {
-      return this.tool("budget_phenomenon", "ExecuteAnalysisPlan", {
-        root_object_id: "o_order",
-        measure_ids: ["m_gmv"],
-        dimension_property_ids: [],
-        filters: [],
-        result_kind: "aggregate",
+      return this.tool("budget_phenomenon", "ExecuteAnalysisPlan", evidenceRequest({
         title: "成交金额现象确认",
-        analysis_step: {
-          id: "step_budget_phenomenon",
-          objective: "量化待解释的成交金额现象",
-          rationale: "先确认现象",
-          role: "OVERVIEW",
-          acceptance_criterion_ids: ["phenomenon_quantified"],
-        },
-      });
+        objective: "量化待解释的成交金额现象",
+        rationale: "先确认现象",
+      }));
     }
     if ([5, 6, 7].includes(this.step)) {
       const units = ["YEAR", "QUARTER", "MONTH"] as const;
@@ -1642,43 +1751,23 @@ class BudgetLimitedDiagnosticMontaneModel implements ModelClient {
       return this.tool(
         `budget_baseline_${unit.toLowerCase()}`,
         "ExecuteAnalysisPlan",
-        {
-          root_object_id: "o_order",
-          measure_ids: ["m_gmv"],
-          dimension_property_ids: [],
-          filters: [],
-          time_grain: {
-            unit,
-            property_id: "p_paid_at",
-          },
-          result_kind: "aggregate",
+        evidenceRequest({
+          timeGrain: unit,
           title: `${unit}成交金额基准`,
-          analysis_step: {
-            id: `step_budget_${unit.toLowerCase()}`,
-            objective: "补足比较基准",
-            rationale: "上一轮只有一个时间点，继续尝试受控时间粒度",
-            role: "SUPPORTING",
-            acceptance_criterion_ids: ["baseline_checked"],
-          },
-        },
+          objective: "补足比较基准",
+          rationale: "上一轮只有一个时间点，继续尝试受控时间粒度",
+          role: "SUPPORTING",
+        }),
       );
     }
     if (this.step === 8) {
-      return this.tool("budget_driver_after_limit", "ExecuteAnalysisPlan", {
-        root_object_id: "o_order",
-        measure_ids: ["m_gmv"],
-        dimension_property_ids: ["p_customer_level"],
-        filters: [],
-        result_kind: "aggregate",
+      return this.tool("budget_driver_after_limit", "ExecuteAnalysisPlan", evidenceRequest({
+        dimensionRefs: ["D2"],
         title: "会员等级驱动",
-        analysis_step: {
-          id: "step_budget_driver",
-          objective: "检查会员等级驱动",
-          rationale: "基准证据仍不足，继续检查结构",
-          role: "DIAGNOSTIC",
-          acceptance_criterion_ids: ["drivers_checked"],
-        },
-      });
+        objective: "检查会员等级驱动",
+        rationale: "基准证据仍不足，继续检查结构",
+        role: "DIAGNOSTIC",
+      }));
     }
     const finalText = "已取得部分数据库证据，但诊断尚未完成。";
     options.onTextDelta?.(finalText);
@@ -1761,35 +1850,107 @@ class PlanningMontaneModel implements ModelClient {
       };
     }
     if (this.step === 4) {
-      const serialized = JSON.stringify(options.messages);
-      const bindingId = serialized.match(
-        /"valueBindingId"\s*:\s*"([^"]+)"/,
-      )?.[1];
-      if (!bindingId) throw new Error("PropertyValueSearch 未返回绑定句柄");
       return {
         toolCalls: [{
           id: "call_plan",
           name: "ExecuteAnalysisPlan",
-          args: {
-            root_object_id: "o_order",
-            measure_ids: ["p_order_amount"],
-            dimension_property_ids: [],
-            filters: [{
-              value_binding_id: bindingId,
-              operator: "EQ",
-            }],
-            time_range: {
-              expression: "今年",
-              property_id: "p_paid_at",
-            },
-            result_kind: "aggregate",
+          args: evidenceRequest({
+            bindingRefs: ["B1"],
             title: "今年线上渠道销售额",
-          },
+          }),
         }],
         stopReason: "tool_use",
       };
     }
     const finalText = "今年线上渠道销售额为 128,000 元。";
+    options.onTextDelta?.(finalText);
+    return { finalText, stopReason: "end_turn" };
+  }
+}
+
+class MultiMetricYoyMontaneModel implements ModelClient {
+  readonly capabilities = {
+    contextWindow: 32_000,
+    maxOutputTokens: 2_000,
+    supportsStreaming: true,
+    supportsToolUse: true,
+    supportsImages: false,
+    supportsStrictToolSchema: true,
+  };
+  private step = 0;
+  planSchema = "";
+
+  async complete(options: {
+    messages: AgentMessage[];
+    tools: Array<Record<string, unknown>>;
+    onTextDelta?: (delta: string) => void;
+  }): Promise<AgentResponse> {
+    this.step += 1;
+    if (this.step === 1) {
+      return {
+        toolCalls: [{
+          id: "call_multi_frame",
+          name: "SubmitQuestionFrame",
+          args: {
+            original_question: "今年薇诺娜销售额、成本额和同比",
+            intent_kind: "DIRECT_QUERY",
+            metric_terms: ["成交金额", "成本额"],
+            time_terms: ["今年"],
+            object_terms: [],
+            business_value_terms: ["薇诺娜"],
+            grouping_terms: [],
+            calculation_terms: ["同比"],
+            presentation: { kind: "TABLE" },
+          },
+        }],
+        stopReason: "tool_use",
+      };
+    }
+    if (this.step === 2) {
+      return {
+        toolCalls: [{
+          id: "call_multi_ontology",
+          name: "OntologySearch",
+          args: { query: "今年薇诺娜销售额、成本额和同比" },
+        }],
+        stopReason: "tool_use",
+      };
+    }
+    if (this.step === 3) {
+      return {
+        toolCalls: [{
+          id: "call_multi_value",
+          name: "PropertyValueSearch",
+          args: {
+            value: "薇诺娜",
+            property_ids: ["p_brand"],
+            object_ids: ["o_order"],
+            match_mode: "exact",
+          },
+        }],
+        stopReason: "tool_use",
+      };
+    }
+    if (this.step === 4) {
+      const schema = options.tools.find(
+        (tool) => tool.name === "ExecuteAnalysisPlan",
+      );
+      this.planSchema = JSON.stringify(schema);
+      return {
+        toolCalls: [{
+          id: "call_multi_plan",
+          name: "ExecuteAnalysisPlan",
+          args: evidenceRequest({
+            measureRefs: ["M1", "M2"],
+            bindingRefs: ["B1"],
+            title: "今年薇诺娜销售额、成本额和同比",
+          }),
+        }],
+        stopReason: "tool_use",
+      };
+    }
+    const finalText =
+      "今年薇诺娜成交金额为128,000元、成本额为56,000元，同比均已由数据库计算。";
     options.onTextDelta?.(finalText);
     return { finalText, stopReason: "end_turn" };
   }
@@ -1846,18 +2007,9 @@ class MonthlyPlanningMontaneModel implements ModelClient {
         toolCalls: [{
           id: "call_month_plan",
           name: "ExecuteAnalysisPlan",
-          args: {
-            root_object_id: "o_order",
-            measure_ids: ["m_gmv"],
-            dimension_property_ids: ["p_paid_at"],
-            filters: [],
-            time_range: {
-              expression: "今年",
-              property_id: "p_paid_at",
-            },
-            result_kind: "aggregate",
+          args: evidenceRequest({
             title: "今年月度销售额",
-          },
+          }),
         }],
         stopReason: "tool_use",
       };
@@ -1938,20 +2090,11 @@ class ExploratoryMontaneModel implements ModelClient {
         toolCalls: [{
           id: "call_explore_overview",
           name: "ExecuteAnalysisPlan",
-          args: {
-            root_object_id: "o_order",
-            measure_ids: ["m_gmv"],
-            dimension_property_ids: [],
-            filters: [],
-            result_kind: "aggregate",
+          args: evidenceRequest({
             title: "订单销售总览",
-            analysis_step: {
-              id: "step_overview",
-              objective: "确认整体成交金额",
-              rationale: "先取得核心销售指标，判断是否需要继续拆解",
-              role: "OVERVIEW",
-            },
-          },
+            objective: "确认整体成交金额",
+            rationale: "先取得核心销售指标，判断是否需要继续拆解",
+          }),
         }],
         stopReason: "tool_use",
       };
@@ -1961,22 +2104,16 @@ class ExploratoryMontaneModel implements ModelClient {
         toolCalls: [{
           id: "call_explore_diagnostic",
           name: "ExecuteAnalysisPlan",
-          args: {
-            root_object_id: "o_order",
-            measure_ids: ["m_gmv"],
-            dimension_property_ids: ["p_customer_level"],
-            filters: [],
-            sort: [{ entity_id: "m_gmv", direction: "DESC" }],
+          args: evidenceRequest({
+            dimensionRefs: ["D2"],
+            sortRef: "M1",
+            sortDirection: "DESC",
             limit: 10,
-            result_kind: "aggregate",
             title: "会员等级贡献",
-            analysis_step: {
-              id: "step_customer_level",
-              objective: "定位不同会员等级的成交贡献",
-              rationale: "总览确认有真实成交额，继续验证客户结构贡献",
-              role: "DIAGNOSTIC",
-            },
-          },
+            objective: "定位不同会员等级的成交贡献",
+            rationale: "总览确认有真实成交额，继续验证客户结构贡献",
+            role: "DIAGNOSTIC",
+          }),
         }],
         stopReason: "tool_use",
       };
@@ -1986,22 +2123,16 @@ class ExploratoryMontaneModel implements ModelClient {
         toolCalls: [{
           id: `call_explore_duplicate_${this.step}`,
           name: "ExecuteAnalysisPlan",
-          args: {
-            root_object_id: "o_order",
-            measure_ids: ["m_gmv"],
-            dimension_property_ids: ["p_customer_level"],
-            filters: [],
-            sort: [{ entity_id: "m_gmv", direction: "DESC" }],
+          args: evidenceRequest({
+            dimensionRefs: ["D2"],
+            sortRef: "M1",
+            sortDirection: "DESC",
             limit: 10,
-            result_kind: "aggregate",
             title: "会员等级贡献",
-            analysis_step: {
-              id: `step_duplicate_${this.step}`,
-              objective: "重复确认会员等级贡献",
-              rationale: "验证重复计划保护",
-              role: "DIAGNOSTIC",
-            },
-          },
+            objective: "重复确认会员等级贡献",
+            rationale: "验证重复计划保护",
+            role: "DIAGNOSTIC",
+          }),
         }],
         stopReason: "tool_use",
       };

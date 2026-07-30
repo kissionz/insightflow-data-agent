@@ -663,10 +663,11 @@ MVP 当前将上述职责收敛为五个组合工具：
 - `PropertyValueSearch`：全局检索发布值索引，再通过缓存和小范围 SelectDB 兜底
   定位问题框架中声明的原始业务值；唯一胜出项返回 `valueBindingId`。指标名、
   计算词和模型扩展近义词会被拒绝。
-- `ExecuteAnalysisPlan`：接收结构化本体 ID 和值绑定句柄，生成强类型 IR、编译
-  参数化 Doris SQL 并执行。关联对象仅用于筛选时默认生成相关 `EXISTS` 子查询；
-  若同一对象还用于分组或明细展示，则复用主查询 JOIN。开放分析的每次调用必须
-  携带 `analysis_step`，说明本步目标、真实证据依据和结果角色。
+- `ExecuteAnalysisPlan`：对模型暴露紧凑 Evidence Request，只接收本轮可见的
+  `O*/M*/D*/B*/A*` 短句柄、可选计算操作和分析步骤；服务端 Plan Synthesizer
+  确定性补齐真实本体 ID、业务值筛选、时间窗口、验收项和安全默认值，再交给
+  强类型 IR 编译器生成参数化 Doris SQL。关联对象仅用于筛选时默认生成相关
+  `EXISTS` 子查询；若同一对象还用于分组或明细展示，则复用主查询 JOIN。
 
 五个工具均注册到 `ToolRegistry`，由 `AgentLoop` 调用并经过 `PermissionGate`。
 `AgentReporter` 将实际工具状态投影为每轮 UI 追踪，`SessionStore` 保存
@@ -676,6 +677,30 @@ Montane 提示词分为不可修改的核心执行协议和可配置的工作区
 与业务时区保存在 SQLite，保存时递增版本；每个 Turn 记录实际使用的提示词版本。
 工作区指令不得覆盖只读查询、本体边界、敏感字段和 IR Schema。
 
+### 13.1 结构化输出稳定性
+
+模型输出不再直接复刻完整 Query IR。稳定性分为六层：
+
+1. 明确问数优先由 Plan Synthesizer 根据问题框架、本体候选和值绑定生成计划；
+   模型只选择候选短句柄。
+2. 开放分析和原因诊断每一步也只提交紧凑 Evidence Request，查询轮数仍由验收
+   缺口和证据充分性决定，不由意图类型固定。
+3. 工具返回的内部 ID 映射为本轮短句柄；句柄不可跨轮猜测或复用。
+4. `ExecuteAnalysisPlan` 的 JSON Schema 随当前问题动态生成，只暴露当前可选
+   指标、维度、值绑定、验收项以及当前问题可能用到的计算操作。
+5. 官方 OpenAI 端点自动启用 strict function schema；OpenAI-compatible 端点
+   默认不假设兼容，可在 Montane 模型能力中显式配置
+   `supportsStrictToolSchema=true` 后开启。
+6. Provider 返回非法函数参数 JSON 时，Montane 只记录解析位置和字符长度，
+   不记录可能包含业务值的原始参数，并只自动重试一次。再次失败则安全停止，
+   不执行 SQL，不进行可能改变语义的自动 JSON 修复。
+
+紧凑请求中的所有顶层字段均为必填；无值使用空数组、`AUTO`、`0` 或空字符串。
+这使 strict schema 可执行，同时避免大量可选嵌套字段造成漏逗号、漏括号和字段
+组合不一致。临时复合指标使用 `C1/C2...` 在单个请求内形成小型计算 DAG，
+服务端再映射为受控 `calc_*` ID，因此 `(销售额-成本额)/销售额` 等多步公式不会
+因中间结果丢失而退化。
+
 执行原则：
 
 - LLM 负责意图理解、候选选择、澄清和结果解释。
@@ -683,11 +708,13 @@ Montane 提示词分为不可修改的核心执行协议和可配置的工作区
 - LLM 不能直接调用 Bash 连接数据库。
 - Montane 不持有自由 SQL 工具，查询只能通过 `ExecuteAnalysisPlan`。
 - Agent 不得绕过已发布 Ontology 猜测字段关系。
-- `measure_ids` 只接受 `OntologySearch.metrics[]` 或
-  `DiscoverAnalysisSpace.spaces[].metrics[]` 返回的 ID。正式 Metric ID
-  按治理口径执行；`measureKind=PROPERTY` 的数字属性 ID 按默认聚合规则生成
-  受控度量；普通属性 ID 仍会被拒绝。若数字属性唯一对应一个正式治理指标，
-  规则引擎优先映射到正式指标并显示纠正来源。
+- 模型不再接触 `measure_ids` 等内部长 ID。`OntologySearch` 和
+  `DiscoverAnalysisSpace` 把当前候选映射为短句柄；`measure_refs` 支持一次
+  提交最多 8 个指标。一个问题同时询问销售额、成本额、毛利率等多个指标时，
+  必须在同一 Evidence Request 中完整提交，Plan Synthesizer 再映射为同一
+  `AnalysisIntent.measureIds`，避免不必要的多轮 SQL 和指标丢失。
+- 正式 Metric 短句柄按治理口径执行；带默认聚合规则的数字属性也可获得 M*
+  短句柄并按受控规则执行。普通属性只能作为 D* 维度，不能伪装成指标。
 - Query IR v3 将时间粒度与普通维度分离，支持 `DAY/WEEK/MONTH/QUARTER/YEAR`，
   月度问题必须编译为 `DATE_TRUNC(..., 'month')`，不能直接按原始日期分组。
 - “今年、本月、本季度、本周”等未完成自然周期按截至当天的 `TO_DATE` 窗口执行。
@@ -739,6 +766,8 @@ Montane 提示词分为不可修改的核心执行协议和可配置的工作区
 - 聚合安全规则禁止多个事实对象直接混算，阻止会放大事实行的一对多/多对多路径，
   禁止比例或不可加数字求和，并禁止半可加指标跨时间直接求和。
 - SQL 和查询参数必须写入对应轮次追踪。
+- Evidence Request、Plan Synthesizer 展开的指标/维度/值绑定数量、最终 IR、
+  SQL 和参数必须同时进入本轮追踪，便于区分“模型选错候选”和“规则展开错误”。
 - 明确指标问数、开放分析和原因诊断共用同一查询循环与四条成功查询预算；
   意图只决定验收契约，不决定固定查询轮数。明确问数在截断、证据不完整或纠错时
   可以继续查询，开放分析在一条查询已经满足验收时可以立即结束。
@@ -1175,6 +1204,12 @@ GET    /api/events
 - 语义不完整或发生指标条件降级的计划不得执行数据库，也不得占用成功查询预算。
 - Data Agent 有效模型轮次上限必须与配置的 14 轮预算一致，单轮状态不能因通用
   摘要压缩而丢失。
+- 同一问题包含多个指标、业务值和同比/环比时，必须通过一个紧凑
+  `measure_refs` 请求生成同一条受控 SQL；每个指标的比较列都必须保留。
+- `ExecuteAnalysisPlan` 的动态 Schema 不得暴露内部 `root_object_id`、
+  `measure_ids` 或完整 IR 树；当前候选之外的短句柄必须在查询前被拒绝。
+- 非法函数参数 JSON 最多自动重试一次；连续失败不得执行 SQL，日志不得保存
+  原始函数参数正文。支持 strict tool schema 的端点必须收到 `strict=true`。
 - 正文与控件达到 WCAG AA。
 - 现有 CLI 行为和测试不得回归。
 
@@ -1211,7 +1246,7 @@ GET    /api/events
 ### 阶段 4：Data Agent
 
 - Semantic Retriever
-- Montane 动态 Query Planner
+- Montane 紧凑 Evidence Request + 服务端确定性 Plan Synthesizer
 - 单事实对象 Governed Analysis Space
 - 基于 observation 的有界多步分析循环
 - 强类型 Query IR 与确定性 SelectDB SQL 编译

@@ -48,16 +48,16 @@ const DATA_AGENT_SYSTEM_PROMPT = `
 4. 随后只调用一次 OntologySearch。业务值短语不参与属性名称词形检索；OntologySearch 的词形匹配只是候选证据，不能证明用户词一定是属性名称。若明确指标没有候选，应澄清或提示发布草稿，不得改写同义词重复搜索。
 4.1 intent_kind 只定义本轮验收标准，不限制工具和查询轮数。未指定单一指标、需要补充分析空间或现有证据无法关闭验收缺口时，可以在 OntologySearch 后调用一次 DiscoverAnalysisSpace，查看候选事实对象下已发布的指标、受控数字属性、时间和诊断维度。不得把“销售表现”等主题词伪造成正式指标。
 5. question_frame.business_value_terms 中的每个完整短语都必须且只能调用 PropertyValueSearch。不得把指标名、计算词或自己扩展的近义词提交为属性值。具体值的真实字段归属以全局已发布值索引为准。工具返回 resolved 时，后续只能把 selectedMatch.planningRef 的 B* 句柄放入 binding_refs，不得重新选择字段或改写值；返回 ambiguous 时必须让用户澄清。
-6. 你不能生成 SQL，也不能提交本体内部长 ID。完成语义理解后调用 ExecuteAnalysisPlan，只使用最近工具结果 planningReferences 中的 O*/M*/D*/B*/A* 短句柄。用户一次询问多个指标时，必须把全部指标同时放入同一个 measure_refs 数组，不得拆成互不必要的多轮查询。
-6.1 ExecuteAnalysisPlan 是紧凑 Evidence Request：root_ref 通常为 AUTO；measure_refs 为本步全部指标；dimension_refs 为分组维度；binding_refs 使用 B*，空数组表示自动应用全部已解析业务值；time_grain 不确定时用 AUTO；常规时间、同比、环比、指标阈值和验收项由服务端确定性补齐。
-7. ExecuteAnalysisPlan 的所有顶层字段和 analysis_step 字段都必须提交。没有额外值时使用空数组、AUTO、0 或空字符串，禁止省略字段。title 可为空字符串。
+6. 你不能生成 SQL，也不能提交本体内部长 ID。完成语义理解后调用 ExecuteAnalysisPlan，只使用最近工具结果 planningReferences 中的 M*/D* 短句柄。measure_refs 是唯一必填项；用户一次询问多个指标时，必须把全部指标同时放入同一个 measure_refs 数组，不得拆成互不必要的多轮查询。
+6.1 ExecuteAnalysisPlan 是最小 Evidence Request：仅在确实需要分组、指定时间粒度、排序、限制行数或执行工具 schema 当前明确开放的高级计算时，提交对应可选字段。根对象、全部已解析业务值、常规时间、同比、环比、占比、指标阈值、标题、结果类型、分析步骤和验收项由服务端确定性补齐。
+7. 不得提交空数组、AUTO、0、空字符串、解释性 rationale 或工具 schema 未提供的字段；能省略的默认项必须省略。
 8. 只有临时复合计算、主动诊断算法、组内占比、排名、累计、移动平均、组内 Top N 或跨期间集合条件需要 operations。operation 使用短句柄作为 input_refs/partition_refs，并用 C1、C2 等引用本请求内前序计算；正式复合指标直接选择对应 M*，不要重复构建公式。
 8.1 同比使用 YEAR_OVER_YEAR，环比使用 PREVIOUS_PERIOD；占全体比例使用 PERCENT_OF_TOTAL，组内占比使用 PERCENT_OF_PARTITION；占比固定在业务筛选之后、排序和 Top N 之前计算，禁止用同一指标除以自身模拟占比。
 8.2 “今年、本月、本季度、本周”等未结束自然周期按截至当前日期处理；同比和环比由 IR 生成同进度基期。
 8.3 “每个类目最高的SPU”“各区域前3名”使用 GROUP_TOP_N/GROUP_BOTTOM_N；“每期都/任意期/至少N期”使用 PERIOD_CONDITION。不得根据截断结果人工归并。
 9. ExecuteAnalysisPlan 是唯一查询入口。服务端 Plan Synthesizer 把紧凑请求确定性展开成强类型 IR，校验关系、粒度、可加性、筛选逻辑和窗口计算，再编译参数化 Doris SQL 并执行。
 9.1 SubmitQuestionFrame 返回 acceptanceContract。所有分析类型共用同一个受控查询循环和四条成功查询预算；意图不能把明确问数限制为一条查询，也不能强制探索分析执行多条查询。
-9.2 每次 ExecuteAnalysisPlan 都要提供 analysis_step，并在 criterion_refs 中引用仍为 PENDING 的 A* 验收句柄；没有明确目标时使用空数组，由服务端按计划证据确定性关联。首步说明为何选择这些指标；后续步骤必须引用上一查询返回的真实数据，并说明要关闭的证据缺口。
+9.2 服务端根据请求结构、已有查询和待验收项自动生成 analysis_step，并自动关联本次查询能够关闭的验收缺口。模型不构造步骤说明或验收句柄；后续查询必须由上一查询返回的真实数据驱动，并选择能够补充现有证据的不同指标、维度、粒度或高级计算。
 9.3 每次 ExecuteAnalysisPlan 返回受控查询数据和更新后的 acceptanceContract。你必须自行根据返回数据判断变化，不得要求服务端预先生成趋势、涨跌或原因描述。只有全部必需验收项为 SATISFIED 或 NOT_APPLICABLE 才能宣称完成；预算耗尽、没有进展或主动停止但仍有缺口时，必须明确为部分完成。
 9.4 不得重复相同计划，不得跨事实对象。下一条查询若不能关闭任何待验收项，立即停止；不得为了“多分析一步”而机械穷举维度。
 10. 不得猜测或创造 O*/M*/D*/B*/A* 句柄、数据库值或关系。临时计算只可使用 C1、C2 等本请求内句柄，输入必须引用本轮工具真实返回的 M*/D* 或前序 C*。
@@ -530,10 +530,8 @@ export class DataAgentHarness {
           content: JSON.stringify({
             accepted: true,
             frame: acceptedFrame,
-            acceptanceContract: modelVisibleAcceptanceContract(
-              acceptanceContract,
-              state,
-            ),
+            acceptanceContract:
+              modelVisibleAcceptanceContract(acceptanceContract),
             nextTools: [
               "OntologySearch",
               ...(acceptedFrame.businessValueTerms.length
@@ -2300,39 +2298,30 @@ function describePlanningReferences(
       label: reference.label,
       ...(reference.objectId
         ? {
-            objectRef: state.planningCatalog.references.find(
+            object: state.planningCatalog.references.find(
               (candidate) =>
                 candidate.kind === "OBJECT" &&
                 candidate.id === reference.objectId,
-            )?.ref,
+            )?.label,
           }
         : {}),
     }));
   return {
-    objects: describe("OBJECT"),
     measures: describe("MEASURE"),
     dimensions: describe("DIMENSION"),
-    valueBindings: describe("BINDING"),
-    acceptanceCriteria: describe("ACCEPTANCE"),
     instruction:
-      "后续 ExecuteAnalysisPlan 只提交 ref。一个问题中的多个指标必须在同一个 measure_refs 数组中提交。",
+      "ExecuteAnalysisPlan 只需提交 measure_refs；需要分组时再提交 dimension_refs。",
   };
 }
 
 function modelVisibleAcceptanceContract(
   contract: AnalysisAcceptanceContract | undefined,
-  state?: AnalysisExecutionState,
 ): Record<string, unknown> | undefined {
   if (!contract) return undefined;
   return {
     profile: contract.profile,
     status: contract.status,
     criteria: contract.criteria.map((criterion) => ({
-      ref: state?.planningCatalog.references.find(
-        (reference) =>
-          reference.kind === "ACCEPTANCE" &&
-          reference.id === criterion.id,
-      )?.ref,
       label: criterion.label,
       required: criterion.required,
       status: criterion.status,
@@ -2394,10 +2383,8 @@ function modelVisibleAnalysisSpacePayload(
   } = sanitized;
   return {
     ...visible,
-    acceptanceContract: modelVisibleAcceptanceContract(
-      state?.acceptanceContract,
-      state,
-    ),
+    acceptanceContract:
+      modelVisibleAcceptanceContract(state?.acceptanceContract),
   };
 }
 
@@ -2505,13 +2492,12 @@ function modelVisiblePropertyValuePayload(
           matchedValue: selected.matchedValue,
           matchType: selected.matchType,
           evidenceTier: selected.evidenceTier,
-          planningRef: selected.planningRef,
         }
       : undefined,
     planningReferences: payload.planningReferences,
     nextAction:
       status === "resolved"
-        ? "USE_SELECTED_BINDING"
+        ? "CONTINUE_WITH_RESOLVED_BINDING"
         : status === "ambiguous"
           ? "ASK_USER_TO_CLARIFY"
           : "ASK_USER_FOR_FIELD_OR_OBJECT",
@@ -2555,7 +2541,7 @@ function modelVisibleAnalysisResult(
           Boolean(rawVerification.exhaustive) && !contextTruncated,
       },
     },
-    acceptanceContract: modelVisibleAcceptanceContract(acceptance, state),
+    acceptanceContract: modelVisibleAcceptanceContract(acceptance),
     analysisProgress: {
       successfulQueries: state.captures.length,
       maxSuccessfulQueries: DATA_AGENT_MAX_SUCCESSFUL_QUERIES,
@@ -2639,24 +2625,78 @@ function buildEvidenceRequestSchema(
     values.length ? values : ["UNAVAILABLE"];
   const measureRefs = refs("MEASURE");
   const dimensionRefs = refs("DIMENSION");
-  const bindingRefs = refs("BINDING");
-  const objectRefs = refs("OBJECT");
-  const acceptanceRefs = refs("ACCEPTANCE");
   const operationKinds = availableOperationKinds(frame);
-  const entityRefs = enumOrUnavailable([
-    ...measureRefs,
-    ...dimensionRefs,
-    "AUTO",
-  ]);
+  const entityRefs = enumOrUnavailable([...measureRefs, ...dimensionRefs]);
+  const operationSchema = operationKinds.length
+    ? {
+        operations: {
+          type: "array",
+          minItems: 1,
+          maxItems: 12,
+          description:
+            "仅在当前 schema 开放了用户明确要求、且无法由服务端规则补齐的高级计算时提交",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            properties: {
+              kind: {
+                type: "string",
+                enum: operationKinds,
+              },
+              result_ref: {
+                type: "string",
+                pattern: "^C[1-9][0-9]*$",
+              },
+              label: { type: "string" },
+              input_refs: {
+                type: "array",
+                minItems: 1,
+                maxItems: 4,
+                items: { type: "string", pattern: "^(M|C)[1-9][0-9]*$" },
+              },
+              partition_refs: {
+                type: "array",
+                minItems: 1,
+                maxItems: 8,
+                items: {
+                  type: "string",
+                  enum: enumOrUnavailable([...dimensionRefs, "__TIME__"]),
+                },
+              },
+              operator: {
+                type: "string",
+                enum: [
+                  "ADD",
+                  "SUBTRACT",
+                  "MULTIPLY",
+                  "DIVIDE",
+                  "RATIO",
+                  "EQ",
+                  "NE",
+                  "GT",
+                  "GTE",
+                  "LT",
+                  "LTE",
+                ],
+              },
+              quantifier: {
+                type: "string",
+                enum: ["EVERY", "ANY", "AT_LEAST_N"],
+              },
+              value: { type: "number" },
+              count: { type: "integer", minimum: 1, maximum: 365 },
+              direction: { type: "string", enum: ["ASC", "DESC"] },
+              scale: { type: "number" },
+            },
+            required: ["kind", "input_refs"],
+          },
+        },
+      }
+    : {};
   return {
     type: "object",
     additionalProperties: false,
     properties: {
-      root_ref: {
-        type: "string",
-        enum: ["AUTO", ...objectRefs],
-        description: "通常使用 AUTO；仅在候选事实对象仍有多个时指定 O*",
-      },
       measure_refs: {
         type: "array",
         minItems: 1,
@@ -2672,185 +2712,37 @@ function buildEvidenceRequestSchema(
         uniqueItems: true,
         items: { type: "string", enum: enumOrUnavailable(dimensionRefs) },
       },
-      binding_refs: {
-        type: "array",
-        maxItems: 12,
-        uniqueItems: true,
-        items: { type: "string", enum: enumOrUnavailable(bindingRefs) },
-        description:
-          "已解析业务值的 B* 句柄；空数组时服务端自动应用本问题全部已解析业务值",
-      },
       time_grain: {
         type: "string",
-        enum: ["AUTO", "DAY", "WEEK", "MONTH", "QUARTER", "YEAR"],
-      },
-      operations: {
-        type: "array",
-        maxItems: 12,
         description:
-          "仅在需要额外计算或分阶段算法时填写；常规时间、同比、环比、阈值由服务端从问题框架自动补齐",
-        items: {
-          type: "object",
-          additionalProperties: false,
-          properties: {
-            kind: {
-              type: "string",
-              enum: operationKinds,
-            },
-            result_ref: {
-              type: "string",
-              pattern: "^C[1-9][0-9]*$",
-              description: "本请求内计算结果短句柄，可被后续 operation 引用",
-            },
-            label: { type: "string" },
-            input_refs: {
-              type: "array",
-              minItems: 1,
-              maxItems: 4,
-              items: { type: "string", pattern: "^(M|C)[1-9][0-9]*$" },
-            },
-            partition_refs: {
-              type: "array",
-              maxItems: 8,
-              items: {
-                type: "string",
-                enum: enumOrUnavailable([...dimensionRefs, "__TIME__"]),
-              },
-            },
-            operator: {
-              type: "string",
-              enum: [
-                "AUTO",
-                "ADD",
-                "SUBTRACT",
-                "MULTIPLY",
-                "DIVIDE",
-                "RATIO",
-                "EQ",
-                "NE",
-                "GT",
-                "GTE",
-                "LT",
-                "LTE",
-                "TOP_N",
-                "BOTTOM_N",
-              ],
-            },
-            quantifier: {
-              type: "string",
-              enum: ["AUTO", "EVERY", "ANY", "AT_LEAST_N"],
-            },
-            value: { type: "number" },
-            count: { type: "integer", minimum: 0, maximum: 365 },
-            direction: { type: "string", enum: ["ASC", "DESC"] },
-            scale: { type: "number" },
-          },
-          required: [
-            "kind",
-            "result_ref",
-            "label",
-            "input_refs",
-            "partition_refs",
-            "operator",
-            "quantifier",
-            "value",
-            "count",
-            "direction",
-            "scale",
-          ],
-        },
+          "仅当用户问题或后续证据补充确实需要显式粒度时提交；否则由服务端推导",
+        enum: ["DAY", "WEEK", "MONTH", "QUARTER", "YEAR"],
       },
+      ...operationSchema,
       sort_ref: {
         type: "string",
         enum: entityRefs,
       },
       sort_direction: {
         type: "string",
-        enum: ["AUTO", "ASC", "DESC"],
+        enum: ["ASC", "DESC"],
       },
       limit: {
         type: "integer",
-        minimum: 0,
+        minimum: 1,
         maximum: 1000,
-        description: "0 表示按问题框架和安全默认值决定",
-      },
-      result_kind: {
-        type: "string",
-        enum: ["AUTO", "AGGREGATE", "DETAIL"],
-      },
-      title: {
-        type: "string",
-        description: "可为空字符串，服务端将使用原问题",
-      },
-      analysis_step: {
-        type: "object",
-        additionalProperties: false,
-        properties: {
-          objective: { type: "string" },
-          rationale: { type: "string" },
-          role: {
-            type: "string",
-            enum: ["OVERVIEW", "DIAGNOSTIC", "SUPPORTING"],
-          },
-          criterion_refs: {
-            type: "array",
-            maxItems: 12,
-            uniqueItems: true,
-            items: {
-              type: "string",
-              enum: enumOrUnavailable(acceptanceRefs),
-            },
-          },
-        },
-        required: ["objective", "rationale", "role", "criterion_refs"],
       },
     },
-    required: [
-      "root_ref",
-      "measure_refs",
-      "dimension_refs",
-      "binding_refs",
-      "time_grain",
-      "operations",
-      "sort_ref",
-      "sort_direction",
-      "limit",
-      "result_kind",
-      "title",
-      "analysis_step",
-    ],
+    required: ["measure_refs"],
   };
 }
 
 function availableOperationKinds(
   frame: QuestionLanguageFrame | undefined,
 ): string[] {
-  const all = [
-    "DERIVED",
-    "YEAR_OVER_YEAR",
-    "PREVIOUS_PERIOD",
-    "PERCENT_OF_TOTAL",
-    "PERCENT_OF_PARTITION",
-    "RANK",
-    "DENSE_RANK",
-    "RUNNING_SUM",
-    "MOVING_AVG",
-    "GROUP_TOP_N",
-    "GROUP_BOTTOM_N",
-    "PERIOD_CONDITION",
-  ];
-  if (!frame || frame.intentKind !== "DIRECT_QUERY") return all;
+  if (!frame) return [];
   const text = `${frame.originalQuestion} ${frame.calculationTerms.join(" ")}`;
   const selected = new Set<string>();
-  if (/同比/.test(text)) selected.add("YEAR_OVER_YEAR");
-  if (/环比/.test(text)) selected.add("PREVIOUS_PERIOD");
-  if (/占比|比例|份额/.test(text)) {
-    selected.add(
-      /组内|各.+(?:中|内)/.test(text)
-        ? "PERCENT_OF_PARTITION"
-        : "PERCENT_OF_TOTAL",
-    );
-  }
   if (/排名|排行|第几/.test(text)) {
     selected.add("RANK");
     selected.add("DENSE_RANK");
@@ -2866,10 +2758,10 @@ function availableOperationKinds(
   if (/每(?:年|月|周|日|季度|期).*?(?:都|均)|任意(?:年|月|周|日|季度|期)|至少.+(?:年|月|周|日|季度|期)/.test(text)) {
     selected.add("PERIOD_CONDITION");
   }
-  if (/[+\-*/÷×]|加上|减去|除以|乘以|毛利|转化率/.test(text)) {
+  if (/[+\-*/÷×]|加上|减去|除以|乘以/.test(text)) {
     selected.add("DERIVED");
   }
-  return selected.size ? [...selected] : ["DERIVED"];
+  return [...selected];
 }
 
 function synthesizeAnalysisPlan(
@@ -3157,13 +3049,6 @@ function synthesizeAnalysisPlan(
     },
   );
 
-  const rawStep =
-    (args.analysis_step as Record<string, unknown> | undefined) ?? {};
-  const criterionIds = Array.isArray(rawStep.criterion_refs)
-    ? rawStep.criterion_refs.map((ref) =>
-        resolveRef(ref, ["ACCEPTANCE"]).id,
-      )
-    : [];
   const requestedTimeGrain = String(args.time_grain ?? "AUTO");
   const sortRef = String(args.sort_ref ?? "AUTO");
   const sortDirection =
@@ -3171,7 +3056,9 @@ function synthesizeAnalysisPlan(
       ? "ASC"
       : args.sort_direction === "DESC"
         ? "DESC"
-        : frame.presentation.sortDirection;
+        : sortRef !== "AUTO"
+          ? "DESC"
+          : frame.presentation.sortDirection;
   const sortEntityId =
     sortRef !== "AUTO"
       ? resolveEntityRef(sortRef)
@@ -3184,6 +3071,25 @@ function synthesizeAnalysisPlan(
     (requestedResultKind === "AUTO" && /明细|逐条|记录/.test(frame.originalQuestion))
       ? "detail"
       : "aggregate";
+  const pendingKinds = new Set(
+    state.acceptanceContract?.criteria
+      .filter(
+        (criterion) =>
+          criterion.status === "PENDING" || criterion.status === "BLOCKED",
+      )
+      .map((criterion) => criterion.kind) ?? [],
+  );
+  const stepRole: AnalysisRunStep["role"] =
+    state.captures.length === 0
+      ? "OVERVIEW"
+      : dimensionIds.length > 0 &&
+          (pendingKinds.has("STRUCTURE") || pendingKinds.has("DRIVERS"))
+        ? "DIAGNOSTIC"
+        : "SUPPORTING";
+  const selectedLabels = [
+    ...measureReferences.map((reference) => reference.label),
+    ...dimensionReferences.map((reference) => reference.label),
+  ];
   return {
     root_object_id: rootObjectId,
     measure_ids: measureIds,
@@ -3212,18 +3118,16 @@ function synthesizeAnalysisPlan(
         ? Number(args.limit)
         : frame.presentation.limit,
     result_kind: resultKind,
-    title: String(args.title ?? "").trim() || frame.originalQuestion,
+    title: frame.originalQuestion,
     analysis_step: {
       id: `step_${state.captures.length + 1}`,
       objective:
-        String(rawStep.objective ?? "").trim() || frame.originalQuestion,
-      rationale:
-        String(rawStep.rationale ?? "").trim() ||
-        "由确定性计划合成器根据问题框架和本体短句柄生成",
-      role: ["DIAGNOSTIC", "SUPPORTING"].includes(String(rawStep.role))
-        ? String(rawStep.role)
-        : "OVERVIEW",
-      acceptance_criterion_ids: criterionIds,
+        state.captures.length === 0
+          ? frame.originalQuestion
+          : `补充${selectedLabels.join("、")}证据`,
+      rationale: "由确定性计划合成器根据请求结构和待验收项生成",
+      role: stepRole,
+      acceptance_criterion_ids: [],
     },
   };
 }

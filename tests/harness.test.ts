@@ -261,11 +261,13 @@ describe("DataAgentHarness", () => {
     const valuePayload = model.seenToolPayloads.get("PropertyValueSearch") as {
       matches?: Array<Record<string, unknown>>;
       selectedMatch?: Record<string, unknown>;
+      nextAction?: string;
     };
     expect(valuePayload.matches?.[0]).not.toHaveProperty("column");
     expect(valuePayload.matches?.[0]).not.toHaveProperty("objectId");
     expect(valuePayload.matches?.[0]).not.toHaveProperty("propertyId");
-    expect(valuePayload.selectedMatch).toHaveProperty("planningRef", "B1");
+    expect(valuePayload.selectedMatch).not.toHaveProperty("planningRef");
+    expect(valuePayload.nextAction).toBe("CONTINUE_WITH_RESOLVED_BINDING");
 
     const resultPayload = model.seenToolPayloads.get("ExecuteAnalysisPlan") as {
       result?: {
@@ -1510,6 +1512,8 @@ describe("DataAgentHarness", () => {
     const model = new MultiMetricYoyMontaneModel();
     const queries: string[] = [];
     const syntheses: Array<Record<string, unknown>> = [];
+    const evidenceRequests: Array<Record<string, unknown>> = [];
+    const generatedSteps: Array<Record<string, unknown>> = [];
     const harness = new DataAgentHarness(
       root,
       repository,
@@ -1551,8 +1555,15 @@ describe("DataAgentHarness", () => {
             status === "succeeded" &&
             result?.data
           ) {
+            const data = result.data as Record<string, unknown>;
             syntheses.push(
-              (result.data as { synthesis: Record<string, unknown> }).synthesis,
+              data.synthesis as Record<string, unknown>,
+            );
+            evidenceRequests.push(
+              data.evidenceRequest as Record<string, unknown>,
+            );
+            generatedSteps.push(
+              data.analysisStep as Record<string, unknown>,
             );
           }
         },
@@ -1567,10 +1578,28 @@ describe("DataAgentHarness", () => {
     expect(syntheses).toContainEqual(
       expect.objectContaining({ selectedMeasureCount: 2 }),
     );
+    expect(evidenceRequests).toEqual([{
+      measure_refs: ["M1", "M2"],
+    }]);
+    expect(generatedSteps).toContainEqual(
+      expect.objectContaining({
+        objective: "今年薇诺娜销售额、成本额和同比",
+        rationale: "由确定性计划合成器根据请求结构和待验收项生成",
+        role: "OVERVIEW",
+      }),
+    );
     expect(model.planSchema).toContain('"measure_refs"');
     expect(model.planSchema).toContain('"strict":true');
     expect(model.planSchema).not.toContain('"root_object_id"');
-    expect(model.planSchema.length).toBeLessThan(12_000);
+    expect(model.planSchema).not.toContain('"root_ref"');
+    expect(model.planSchema).not.toContain('"binding_refs"');
+    expect(model.planSchema).not.toContain('"operations"');
+    expect(model.planSchema).not.toContain('"result_kind"');
+    expect(model.planSchema).not.toContain('"analysis_step"');
+    expect(model.planSchema).not.toContain('"rationale"');
+    expect(model.planSchema).not.toContain('"criterion_refs"');
+    expect(model.planSchema).toContain('"required":["measure_refs"]');
+    expect(model.planSchema.length).toBeLessThan(4_000);
     await harness.close();
     repository.close();
   });
@@ -1589,25 +1618,25 @@ function evidenceRequest(options: {
   rationale?: string;
   role?: "OVERVIEW" | "DIAGNOSTIC" | "SUPPORTING";
 }): Record<string, unknown> {
-  return {
-    root_ref: "AUTO",
+  const request: Record<string, unknown> = {
     measure_refs: options.measureRefs ?? ["M1"],
-    dimension_refs: options.dimensionRefs ?? [],
-    binding_refs: options.bindingRefs ?? [],
-    time_grain: options.timeGrain ?? "AUTO",
-    operations: [],
-    sort_ref: options.sortRef ?? "AUTO",
-    sort_direction: options.sortDirection ?? "AUTO",
-    limit: options.limit ?? 0,
-    result_kind: "AGGREGATE",
-    title: options.title,
-    analysis_step: {
-      objective: options.objective ?? options.title,
-      rationale: options.rationale ?? "测试紧凑证据请求",
-      role: options.role ?? "OVERVIEW",
-      criterion_refs: [],
-    },
   };
+  if (options.dimensionRefs?.length) {
+    request.dimension_refs = options.dimensionRefs;
+  }
+  if (options.timeGrain && options.timeGrain !== "AUTO") {
+    request.time_grain = options.timeGrain;
+  }
+  if (options.sortRef && options.sortRef !== "AUTO") {
+    request.sort_ref = options.sortRef;
+  }
+  if (options.sortDirection && options.sortDirection !== "AUTO") {
+    request.sort_direction = options.sortDirection;
+  }
+  if (options.limit && options.limit > 0) {
+    request.limit = options.limit;
+  }
+  return request;
 }
 
 class ScriptedMontaneModel implements ModelClient {

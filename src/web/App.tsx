@@ -605,6 +605,14 @@ function AnalysisRunTrace({ run }: { run: AnalysisRun }) {
             : ""}
         </p>
       ) : null}
+      {run.mode === "DIAGNOSTIC_ANALYSIS" && run.diagnosticCandidates?.length ? (
+        <p className="analysis-space-summary">
+          诊断队列：
+          {run.diagnosticCandidates.map((candidate) =>
+            `${candidate.label}${candidate.status === "ESTABLISHED" ? "（成立）" : candidate.status === "EVALUATED" ? "（已排除）" : "（待验证）"}`
+          ).join(" → ")}
+        </p>
+      ) : null}
       <ol className="analysis-step-list">
         {run.steps.map((step) => (
           <li className={step.status} key={step.callId}>
@@ -653,6 +661,28 @@ function AnalysisRunTrace({ run }: { run: AnalysisRun }) {
                 </p>
               ) : null}
               <small>{step.summary}</small>
+              {step.diagnosticEvaluation ? (
+                <details className="analysis-step-evidence">
+                  <summary>
+                    归因评分：
+                    {step.diagnosticEvaluation.status === "ESTABLISHED"
+                      ? "因素成立"
+                      : step.diagnosticEvaluation.status === "NO_DOMINANT_DRIVER_WITHIN_BUDGET"
+                        ? "预算内无主导因素"
+                        : "解释力不足"}
+                  </summary>
+                  <p>{step.diagnosticEvaluation.reason}</p>
+                  <span>
+                    强度 {(step.diagnosticEvaluation.driverStrength * 100).toFixed(1)}%
+                    {step.diagnosticEvaluation.top1ContributionShare != null
+                      ? ` · Top1 贡献 ${(step.diagnosticEvaluation.top1ContributionShare * 100).toFixed(1)}%`
+                      : ""}
+                    {step.diagnosticEvaluation.top1ContributionLift != null
+                      ? ` · 贡献提升 ${step.diagnosticEvaluation.top1ContributionLift.toFixed(2)}x`
+                      : ""}
+                  </span>
+                </details>
+              ) : null}
               {step.ir || step.rows?.length ? (
                 <details className="analysis-step-evidence">
                   <summary>查看本步 IR 与结果</summary>

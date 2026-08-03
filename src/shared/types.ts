@@ -97,9 +97,54 @@ export interface AnalysisRunStep {
   rows?: Array<Record<string, string | number>>;
   rowCount?: number;
   truncated?: boolean;
+  diagnosticEvaluation?: DiagnosticEvaluation;
   error?: string;
   startedAt: string;
   completedAt?: string;
+}
+
+export interface DiagnosticCandidate {
+  dimensionId: string;
+  label: string;
+  objectLabel: string;
+  score: number;
+  reasons: string[];
+  status: "PENDING" | "EVALUATED" | "ESTABLISHED";
+}
+
+export interface DiagnosticContribution {
+  member: string;
+  currentValue: number;
+  previousValue: number;
+  delta: number;
+  growthRate?: number;
+  alignedContributionShare: number;
+  baselineShare: number;
+  contributionLift?: number;
+}
+
+export interface DiagnosticEvaluation {
+  dimensionId: string;
+  dimensionLabel: string;
+  measureId: string;
+  measureLabel: string;
+  status:
+    | "ESTABLISHED"
+    | "INSUFFICIENT_EXPLANATORY_POWER"
+    | "INELIGIBLE"
+    | "NO_DOMINANT_DRIVER_WITHIN_BUDGET";
+  reason: string;
+  rowCount: number;
+  reconciliationRate?: number;
+  relativeMateriality?: number;
+  top1ContributionShare?: number;
+  top3ContributionShare?: number;
+  top1ToTop2Ratio?: number;
+  top1ContributionLift?: number;
+  maxGrowthRateDeviation?: number;
+  driverStrength: number;
+  dominantMembers: DiagnosticContribution[];
+  nextCandidateRefs: string[];
 }
 
 export type AcceptanceCriterionKind =
@@ -161,6 +206,7 @@ export interface AnalysisRun {
     label: string;
     objectLabel: string;
   }>;
+  diagnosticCandidates?: DiagnosticCandidate[];
   steps: AnalysisRunStep[];
 }
 

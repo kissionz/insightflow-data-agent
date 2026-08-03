@@ -18,6 +18,8 @@ import type {
   AcceptanceCriterion,
   AnalysisAcceptanceContract,
   AnalysisIntent,
+  DiagnosticCandidate,
+  DiagnosticEvaluation,
   AnalysisRunStep,
   Conversation,
   Metric,
@@ -58,8 +60,9 @@ const DATA_AGENT_SYSTEM_PROMPT = `
 9. ExecuteAnalysisPlan 是唯一查询入口。服务端 Plan Synthesizer 把紧凑请求确定性展开成强类型 IR，校验关系、粒度、可加性、筛选逻辑和窗口计算，再编译参数化 Doris SQL 并执行。
 9.1 SubmitQuestionFrame 返回 acceptanceContract。所有分析类型共用同一个受控查询循环和四条成功查询预算；意图不能把明确问数限制为一条查询，也不能强制探索分析执行多条查询。
 9.2 服务端根据请求结构、已有查询和待验收项自动生成 analysis_step，并自动关联本次查询能够关闭的验收缺口。模型不构造步骤说明或验收句柄；后续查询必须由上一查询返回的真实数据驱动，并选择能够补充现有证据的不同指标、维度、粒度或高级计算。
-9.3 每次 ExecuteAnalysisPlan 返回受控查询数据和更新后的 acceptanceContract。你必须自行根据返回数据判断变化，不得要求服务端预先生成趋势、涨跌或原因描述。只有全部必需验收项为 SATISFIED 或 NOT_APPLICABLE 才能宣称完成；预算耗尽、没有进展或主动停止但仍有缺口时，必须明确为部分完成。
-9.4 不得重复相同计划，不得跨事实对象。下一条查询若不能关闭任何待验收项，立即停止；不得为了“多分析一步”而机械穷举维度。
+9.3 每次 ExecuteAnalysisPlan 返回受控查询数据和更新后的 acceptanceContract。非归因分析由服务端优先补齐可用核心指标、同比和月度趋势，不要求机械执行结构分组。归因分析的 diagnosticEvaluation 由服务端根据贡献集中度、基期份额抬升、增速分化和结果对账计算，模型不得凭最大枚举值自行宣布原因成立。
+9.4 归因分析应严格按 diagnosticCandidates/nextCandidateRefs 的顺序一次验证一个维度；只有 diagnosticEvaluation.status=ESTABLISHED 才能表述为主要因素。若解释力不足则继续下一个候选，直到成立或预算耗尽；NO_DOMINANT_DRIVER_WITHIN_BUDGET 是合法结论，不得强行归因。
+9.5 只有全部必需验收项为 SATISFIED 或 NOT_APPLICABLE 才能宣称完成；预算耗尽、没有进展或主动停止但仍有缺口时，必须明确为部分完成。不得重复相同计划，不得跨事实对象。
 10. 不得猜测或创造 O*/M*/D*/B*/A* 句柄、数据库值或关系。临时计算只可使用 C1、C2 等本请求内句柄，输入必须引用本轮工具真实返回的 M*/D* 或前序 C*。
 11. 最终使用中文给出简洁、可验证的结论，只能引用 ExecuteAnalysisPlan 返回的数据。
 12. 信息不足、语义存在多个候选或工具拒绝计划时，向用户说明需要补充的具体条件。
@@ -88,6 +91,7 @@ interface CapturedAnalysis {
   stepId?: string;
   role: AnalysisRunStep["role"];
   acceptanceCriterionIds: string[];
+  diagnosticEvaluation?: DiagnosticEvaluation;
 }
 
 interface AnalysisExecutionState {
@@ -97,6 +101,7 @@ interface AnalysisExecutionState {
   acceptanceContract?: AnalysisAcceptanceContract;
   queryBudgetReached: boolean;
   planningCatalog: PlanningCatalog;
+  diagnosticCandidates: DiagnosticCandidate[];
 }
 
 type PlanningReferenceKind =
@@ -183,6 +188,7 @@ export class DataAgentHarness {
       seenPlanHashes: new Set(),
       queryBudgetReached: false,
       planningCatalog: createPlanningCatalog(),
+      diagnosticCandidates: [],
     };
     let questionFrame: QuestionLanguageFrame | undefined;
     const valueBindings = new Map<string, ResolvedValueBinding>();
@@ -1024,7 +1030,7 @@ export class DataAgentHarness {
           })
           .slice(0, 1);
         const spaces = rankedObjects.map((object) =>
-          buildAnalysisSpace(ontology, object),
+          buildAnalysisSpace(ontology, object, frame),
         );
         if (state) {
           for (const object of rankedObjects) {
@@ -1065,6 +1071,12 @@ export class DataAgentHarness {
               );
             }
           }
+          if (frame.intentKind === "DIAGNOSTIC_ANALYSIS") {
+            state.diagnosticCandidates = buildDiagnosticCandidates(
+              spaces[0],
+              state,
+            );
+          }
         }
         if (state?.acceptanceContract) {
           refineAcceptanceContractForAnalysisSpace(
@@ -1085,6 +1097,9 @@ export class DataAgentHarness {
           acceptanceContract: state?.acceptanceContract,
           planningReferences: state
             ? describePlanningReferences(state)
+            : undefined,
+          diagnosticCandidates: state
+            ? describeDiagnosticCandidates(state)
             : undefined,
           instructions: [
             "选择一个事实对象完成本轮分析，不得跨事实对象混算",
@@ -1506,6 +1521,7 @@ export class DataAgentHarness {
       seenPlanHashes: new Set(),
       queryBudgetReached: false,
       planningCatalog: createPlanningCatalog(),
+      diagnosticCandidates: [],
     },
   ): Tool {
     return {
@@ -2151,12 +2167,20 @@ export class DataAgentHarness {
             compiled.ir.resultContract.expectedPeriodCount,
           claimPolicy: "DATABASE_EVIDENCE_ONLY",
         };
+        const diagnosticEvaluation = evaluateDiagnosticEvidence(
+          frame,
+          intent,
+          query,
+          ontology,
+          state,
+        );
         satisfyAcceptanceCriteria(
           state.acceptanceContract,
           acceptanceCriterionIds,
           analysisStep.id,
           intent,
           artifact,
+          diagnosticEvaluation,
         );
         capture({
           artifact,
@@ -2166,6 +2190,7 @@ export class DataAgentHarness {
           stepId: analysisStep.id,
           role: analysisStep.role,
           acceptanceCriterionIds,
+          diagnosticEvaluation,
         });
         state.rootObjectId ??= compiled.ir.rootObjectId;
         state.seenPlanHashes.add(planHash);
@@ -2186,6 +2211,8 @@ export class DataAgentHarness {
               acceptanceCriterionIds,
             },
             observation,
+            diagnosticEvaluation,
+            diagnosticCandidates: describeDiagnosticCandidates(state),
             acceptanceContract: state.acceptanceContract,
             analysisProgress: {
               successfulQueries: state.captures.length,
@@ -2213,6 +2240,8 @@ export class DataAgentHarness {
               acceptanceCriterionIds,
             },
             observation,
+            diagnosticEvaluation,
+            diagnosticCandidates: state.diagnosticCandidates,
             acceptanceContract: state.acceptanceContract,
             analysisProgress: {
               successfulQueries: state.captures.length,
@@ -2526,6 +2555,7 @@ function modelVisibleAnalysisResult(
       ? payload.verification as Record<string, unknown>
       : {};
   const acceptance = state.acceptanceContract;
+  const diagnosticEvaluation = capture?.diagnosticEvaluation;
   return {
     status: "success",
     result: {
@@ -2542,6 +2572,26 @@ function modelVisibleAnalysisResult(
       },
     },
     acceptanceContract: modelVisibleAcceptanceContract(acceptance),
+    diagnosticEvaluation: diagnosticEvaluation
+      ? {
+          dimension: diagnosticEvaluation.dimensionLabel,
+          measure: diagnosticEvaluation.measureLabel,
+          status: diagnosticEvaluation.status,
+          reason: diagnosticEvaluation.reason,
+          driverStrength: diagnosticEvaluation.driverStrength,
+          top1ContributionShare:
+            diagnosticEvaluation.top1ContributionShare,
+          top1ContributionLift: diagnosticEvaluation.top1ContributionLift,
+          maxGrowthRateDeviation:
+            diagnosticEvaluation.maxGrowthRateDeviation,
+          dominantMembers: diagnosticEvaluation.dominantMembers,
+          nextCandidateRefs: diagnosticEvaluation.nextCandidateRefs,
+        }
+      : undefined,
+    diagnosticCandidates:
+      state.acceptanceContract?.profile === "DIAGNOSTIC_ANALYSIS"
+        ? describeDiagnosticCandidates(state)
+        : undefined,
     analysisProgress: {
       successfulQueries: state.captures.length,
       maxSuccessfulQueries: DATA_AGENT_MAX_SUCCESSFUL_QUERIES,
@@ -2549,6 +2599,12 @@ function modelVisibleAnalysisResult(
         DATA_AGENT_MAX_SUCCESSFUL_QUERIES - state.captures.length,
     },
     nextAction:
+      diagnosticEvaluation?.status === "INSUFFICIENT_EXPLANATORY_POWER" ||
+        diagnosticEvaluation?.status === "INELIGIBLE"
+        ? diagnosticEvaluation.nextCandidateRefs.length
+          ? "QUERY_NEXT_DIAGNOSTIC_CANDIDATE"
+          : "FINALIZE_WITHOUT_DOMINANT_DRIVER"
+        :
       acceptanceContractSatisfied(acceptance)
         ? "FINALIZE_FROM_RETURNED_DATA"
         : state.captures.length < DATA_AGENT_MAX_SUCCESSFUL_QUERIES
@@ -2624,7 +2680,21 @@ function buildEvidenceRequestSchema(
   const enumOrUnavailable = (values: string[]) =>
     values.length ? values : ["UNAVAILABLE"];
   const measureRefs = refs("MEASURE");
-  const dimensionRefs = refs("DIMENSION");
+  const allDimensionRefs = refs("DIMENSION");
+  const nextDiagnosticRef = state.diagnosticCandidates
+    .filter((candidate) => candidate.status === "PENDING")
+    .map((candidate) => state.planningCatalog.references.find(
+      (reference) =>
+        reference.kind === "DIMENSION" &&
+        reference.id === candidate.dimensionId,
+    )?.ref)
+    .find(Boolean);
+  const dimensionRefs =
+    frame?.intentKind === "DIAGNOSTIC_ANALYSIS" &&
+      state.captures.length > 0 &&
+      nextDiagnosticRef
+      ? [nextDiagnosticRef]
+      : allDimensionRefs;
   const operationKinds = availableOperationKinds(frame);
   const entityRefs = enumOrUnavailable([...measureRefs, ...dimensionRefs]);
   const operationSchema = operationKinds.length
@@ -2708,9 +2778,13 @@ function buildEvidenceRequestSchema(
       },
       dimension_refs: {
         type: "array",
-        maxItems: 8,
+        maxItems: frame?.intentKind === "DIAGNOSTIC_ANALYSIS" ? 1 : 8,
         uniqueItems: true,
         items: { type: "string", enum: enumOrUnavailable(dimensionRefs) },
+        description:
+          frame?.intentKind === "DIAGNOSTIC_ANALYSIS"
+            ? "归因分析一次只验证一个服务端排序后的候选维度；解释力不足后 schema 会开放下一个候选"
+            : "仅在用户明确要求分组时提交",
       },
       time_grain: {
         type: "string",
@@ -2787,7 +2861,7 @@ function synthesizeAnalysisPlan(
   };
   const list = (key: string): string[] =>
     Array.isArray(args[key]) ? (args[key] as unknown[]).map(String) : [];
-  const measureReferences = list("measure_refs").map((ref) =>
+  let measureReferences = list("measure_refs").map((ref) =>
     resolveRef(ref, ["MEASURE"]),
   );
   if (!measureReferences.length) {
@@ -2802,6 +2876,30 @@ function synthesizeAnalysisPlan(
   const dimensionReferences = list("dimension_refs").map((ref) =>
     resolveRef(ref, ["DIMENSION"]),
   );
+  if (
+    frame.intentKind === "DIAGNOSTIC_ANALYSIS" &&
+    dimensionReferences.length > 1
+  ) {
+    throw new Error("归因分析每次只能验证一个候选维度");
+  }
+  if (
+    frame.intentKind === "DIAGNOSTIC_ANALYSIS" &&
+    state.captures.length > 0 &&
+    dimensionReferences.length === 1
+  ) {
+    const expected = state.diagnosticCandidates.find(
+      (candidate) => candidate.status === "PENDING",
+    );
+    if (expected && dimensionReferences[0]!.id !== expected.dimensionId) {
+      const expectedRef = state.planningCatalog.references.find(
+        (reference) =>
+          reference.kind === "DIMENSION" && reference.id === expected.dimensionId,
+      )?.ref;
+      throw new Error(
+        `请先验证服务端排序后的下一候选 ${expectedRef ?? expected.label}（${expected.label}）`,
+      );
+    }
+  }
   const requestedBindingRefs = list("binding_refs");
   const bindingReferences = (
     requestedBindingRefs.length
@@ -2823,6 +2921,25 @@ function synthesizeAnalysisPlan(
     rootRef === "AUTO"
       ? measureReferences[0]?.objectId
       : resolveRef(rootRef, ["OBJECT"]).id;
+  if (
+    frame.intentKind === "EXPLORATORY_ANALYSIS" &&
+    state.captures.length === 0
+  ) {
+    const coreSalesMeasures = referencesOfKind(state, "MEASURE").filter(
+      (reference) =>
+        reference.objectId === rootObjectId &&
+        /销售额|成交金额|交易金额|销售数量|销量|成交数量|订单量|成本|毛利|销售均价|客单价/.test(
+          reference.label,
+        ),
+    );
+    measureReferences = [
+      ...new Map(
+        [...measureReferences, ...coreSalesMeasures]
+          .slice(0, 6)
+          .map((reference) => [reference.id, reference]),
+      ).values(),
+    ];
+  }
   const measureIds = measureReferences.map((reference) => reference.id);
   const dimensionIds = dimensionReferences.map((reference) => reference.id);
   const calculationRefs = new Map<string, string>();
@@ -2976,19 +3093,69 @@ function synthesizeAnalysisPlan(
   const explicitKinds = new Set(operations.map((operation) =>
     String(operation.kind),
   ));
+  const rootObject = ontology.objects.find((object) => object.id === rootObjectId);
+  const hasUsableTimeProperty = Boolean(
+    rootObject?.defaultTimePropertyId ||
+    rootObject?.properties.some(
+      (property) =>
+        property.meaning === "TIME" && property.visibility === "ANALYTICAL",
+    ),
+  );
   const comparisonKind = /同比/.test(calculationText)
     ? "YEAR_OVER_YEAR"
     : /环比/.test(calculationText)
       ? "PREVIOUS_PERIOD"
-      : undefined;
+      : ["EXPLORATORY_ANALYSIS", "DIAGNOSTIC_ANALYSIS"].includes(
+          frame.intentKind,
+        ) && hasUsableTimeProperty
+        ? "YEAR_OVER_YEAR"
+        : undefined;
   if (comparisonKind && !explicitKinds.has(comparisonKind)) {
-    for (const [index, measure] of measureReferences.entries()) {
-      timeComparisons.push({
-        id: `calc_auto_comparison_${index + 1}`,
-        label: `${measure.label}${comparisonKind === "YEAR_OVER_YEAR" ? "同比" : "环比"}`,
-        measure_id: measure.id,
-        comparison: comparisonKind,
-        output: "GROWTH_RATE",
+    if (frame.intentKind === "DIAGNOSTIC_ANALYSIS") {
+      const measure = measureReferences[0]!;
+      for (const [suffix, label, output] of [
+        ["previous", `${measure.label}基期值`, "PREVIOUS_VALUE"],
+        ["delta", `${measure.label}变化额`, "DIFFERENCE"],
+        ["growth", `${measure.label}变化率`, "GROWTH_RATE"],
+      ] as const) {
+        timeComparisons.push({
+          id: `calc_auto_${suffix}`,
+          label,
+          measure_id: measure.id,
+          comparison: comparisonKind,
+          output,
+        });
+      }
+    } else {
+      for (const [index, measure] of measureReferences.entries()) {
+        timeComparisons.push({
+          id: `calc_auto_comparison_${index + 1}`,
+          label: `${measure.label}${comparisonKind === "YEAR_OVER_YEAR" ? "同比" : "环比"}`,
+          measure_id: measure.id,
+          comparison: comparisonKind,
+          output: "GROWTH_RATE",
+        });
+      }
+    }
+  }
+  if (frame.intentKind === "EXPLORATORY_ANALYSIS") {
+    const amount = measureReferences.find((measure) =>
+      /销售额|成交金额|交易金额/.test(measure.label),
+    );
+    const quantity = measureReferences.find((measure) =>
+      /销售数量|销量|成交数量/.test(measure.label),
+    );
+    const hasAverage = measureReferences.some((measure) =>
+      /销售均价|客单价/.test(measure.label),
+    );
+    if (amount && quantity && !hasAverage) {
+      derivedCalculations.push({
+        id: "calc_auto_average_price",
+        label: "销售均价",
+        operator: "RATIO",
+        left_measure_id: amount.id,
+        right_measure_id: quantity.id,
+        scale: 1,
       });
     }
   }
@@ -3098,11 +3265,13 @@ function synthesizeAnalysisPlan(
     aggregate_filters: aggregateFilters,
     time_range: frame.timeTerms.length
       ? { expression: frame.timeTerms.join("、") }
-      : undefined,
+      : comparisonKind
+        ? { expression: "今年" }
+        : undefined,
     time_grain:
       requestedTimeGrain === "AUTO"
         ? comparisonKind
-          ? { unit: inferComparisonTimeGrain(frame) }
+          ? { unit: inferAutomaticTimeGrain(frame) }
           : undefined
         : { unit: requestedTimeGrain },
     derived_calculations: derivedCalculations,
@@ -3138,6 +3307,14 @@ function inferComparisonTimeGrain(frame: QuestionLanguageFrame): TimeGrain {
   if (/本月|上月|月/.test(text)) return "MONTH";
   if (/本季|上季|季度|季/.test(text)) return "QUARTER";
   return "YEAR";
+}
+
+function inferAutomaticTimeGrain(frame: QuestionLanguageFrame): TimeGrain {
+  const text = `${frame.timeTerms.join(" ")} ${frame.originalQuestion}`;
+  if (/年|今年|去年/.test(text) || frame.intentKind === "EXPLORATORY_ANALYSIS") {
+    return "MONTH";
+  }
+  return inferComparisonTimeGrain(frame);
 }
 
 function resolveMeasureForTerm(
@@ -4072,6 +4249,7 @@ function listAvailableMeasures(
 function buildAnalysisSpace(
   ontology: OntologySnapshot,
   root: OntologyObject,
+  frame?: QuestionLanguageFrame,
 ): Record<string, unknown> {
   const formalMetrics = ontology.metrics
     .filter((metric) => metric.objectId === root.id)
@@ -4174,6 +4352,7 @@ function buildAnalysisSpace(
       label: property.label,
       isDefault: property.id === root.defaultTimePropertyId,
     }));
+  const rankedDimensions = rankAnalysisDimensions(dimensions, frame);
   return {
     object: {
       id: root.id,
@@ -4185,9 +4364,7 @@ function buildAnalysisSpace(
     },
     metrics: [...formalMetrics, ...propertyMeasures].slice(0, 24),
     timeProperties: timeProperties.slice(0, 8),
-    dimensions: [
-      ...new Map(dimensions.map((dimension) => [dimension.id, dimension])).values(),
-    ].slice(0, 32),
+    dimensions: rankedDimensions.slice(0, 32),
     dimensionHierarchies: (ontology.dimensionHierarchies ?? [])
       .filter((hierarchy) =>
         hierarchy.levels.some((level) => level.objectId === root.id),
@@ -4207,6 +4384,111 @@ function buildAnalysisSpace(
         })),
       })),
   };
+}
+
+type AnalysisDimensionCandidate = {
+  id: string;
+  label: string;
+  objectId: string;
+  objectLabel: string;
+  meaning: string;
+  relationIds: string[];
+  diagnosticScore?: number;
+  diagnosticReasons?: string[];
+};
+
+function rankAnalysisDimensions(
+  dimensions: AnalysisDimensionCandidate[],
+  frame?: QuestionLanguageFrame,
+): AnalysisDimensionCandidate[] {
+  const unique = [
+    ...new Map(dimensions.map((dimension) => [dimension.id, dimension])).values(),
+  ];
+  const text = `${frame?.originalQuestion ?? ""} ${(frame?.groupingTerms ?? []).join(" ")}`;
+  const semanticGroups: Array<{ pattern: RegExp; terms: RegExp; weight: number }> = [
+    { pattern: /渠道|端口|来源|平台/, terms: /渠道|端口|来源|平台/, weight: 34 },
+    { pattern: /品牌/, terms: /品牌/, weight: 36 },
+    { pattern: /事业部|组织|部门|团队/, terms: /事业部|组织|部门|团队/, weight: 34 },
+    { pattern: /区域|省|市|城市|地区/, terms: /区域|省|市|城市|地区/, weight: 32 },
+    { pattern: /门店|店铺|店/, terms: /门店|店铺|店/, weight: 30 },
+    { pattern: /商品|产品|品类|类目|SPU|SKU/i, terms: /商品|产品|品类|类目|SPU|SKU/i, weight: 30 },
+    { pattern: /客户|会员|等级|人群/, terms: /客户|会员|等级|人群/, weight: 28 },
+  ];
+  return unique
+    .map((dimension) => {
+      const reasons: string[] = [];
+      let score = 0;
+      if ((frame?.groupingTerms ?? []).some((term) =>
+        dimension.label.includes(term) || term.includes(dimension.label)
+      )) {
+        score += 80;
+        reasons.push("用户明确提及");
+      }
+      for (const group of semanticGroups) {
+        if (group.pattern.test(text) && group.terms.test(dimension.label)) {
+          score += group.weight;
+          reasons.push("与问题语义匹配");
+          break;
+        }
+      }
+      if (!dimension.relationIds.length) {
+        score += 14;
+        reasons.push("事实表原生维度");
+      }
+      if (dimension.meaning === "CATEGORY" || dimension.meaning === "GEOGRAPHY") {
+        score += 10;
+        reasons.push("适合贡献拆解");
+      } else if (dimension.meaning === "NAME" || dimension.meaning === "CODE") {
+        score += 6;
+      }
+      return {
+        ...dimension,
+        diagnosticScore: score,
+        diagnosticReasons: reasons.length ? reasons : ["通用诊断候选"],
+      };
+    })
+    .sort((left, right) =>
+      (right.diagnosticScore ?? 0) - (left.diagnosticScore ?? 0) ||
+      left.label.localeCompare(right.label, "zh-CN")
+    );
+}
+
+function buildDiagnosticCandidates(
+  rawSpace: Record<string, unknown> | undefined,
+  state: AnalysisExecutionState,
+): DiagnosticCandidate[] {
+  const dimensions = Array.isArray(rawSpace?.dimensions)
+    ? rawSpace.dimensions as Array<Record<string, unknown>>
+    : [];
+  return dimensions.map((dimension) => ({
+    dimensionId: String(dimension.id),
+    label: String(dimension.label),
+    objectLabel: String(dimension.objectLabel ?? "当前对象"),
+    score: Number(dimension.diagnosticScore ?? 0),
+    reasons: Array.isArray(dimension.diagnosticReasons)
+      ? dimension.diagnosticReasons.map(String)
+      : ["通用诊断候选"],
+    status: state.diagnosticCandidates.find(
+      (candidate) => candidate.dimensionId === String(dimension.id),
+    )?.status ?? "PENDING",
+  }));
+}
+
+function describeDiagnosticCandidates(
+  state: AnalysisExecutionState,
+): Array<Record<string, unknown>> {
+  return state.diagnosticCandidates.map((candidate) => ({
+    ref: state.planningCatalog.references.find(
+      (reference) =>
+        reference.kind === "DIMENSION" &&
+        reference.id === candidate.dimensionId,
+    )?.ref,
+    label: candidate.label,
+    objectLabel: candidate.objectLabel,
+    score: candidate.score,
+    reasons: candidate.reasons,
+    status: candidate.status,
+  }));
 }
 
 function metricFormulaLabel(metric: Metric, metrics: Metric[]): string {
@@ -4461,12 +4743,6 @@ function createAcceptanceContract(
               "时间变化已覆盖",
               "在存在可用时间字段时，已取得趋势或同期/前期比较证据",
             ),
-            createAcceptanceCriterion(
-              "structure_covered",
-              "STRUCTURE",
-              "主要结构已覆盖",
-              "在存在可用诊断维度时，已取得至少一个高价值结构分组结果",
-            ),
           ];
   return {
     profile: frame.intentKind,
@@ -4594,12 +4870,258 @@ function canIntentAddressCriterion(
   );
 }
 
+function evaluateDiagnosticEvidence(
+  frame: QuestionLanguageFrame,
+  intent: AnalysisIntent,
+  query: QueryResult,
+  ontology: OntologySnapshot,
+  state: AnalysisExecutionState,
+): DiagnosticEvaluation | undefined {
+  if (
+    frame.intentKind !== "DIAGNOSTIC_ANALYSIS" ||
+    intent.dimensionPropertyIds.length !== 1
+  ) {
+    return undefined;
+  }
+  const dimensionId = intent.dimensionPropertyIds[0]!;
+  const dimension = findPropertyBinding(ontology, dimensionId)?.property;
+  const measureId = intent.measureIds[0]!;
+  const measure = listAvailableMeasures(ontology).find(
+    (candidate) => candidate.id === measureId,
+  );
+  const dimensionLabel = dimension?.label ?? dimensionId;
+  const measureLabel = measure?.label ?? measureId;
+  const previousLabel = `${measureLabel}基期值`;
+  const deltaLabel = `${measureLabel}变化额`;
+  if (!state.diagnosticCandidates.some(
+    (item) => item.dimensionId === dimensionId,
+  )) {
+    state.diagnosticCandidates.push({
+      dimensionId,
+      label: dimensionLabel,
+      objectLabel:
+        findPropertyBinding(ontology, dimensionId)?.object.label ?? "当前对象",
+      score: 0,
+      reasons: ["查询选择的诊断维度"],
+      status: "PENDING",
+    });
+  }
+
+  const asNumber = (value: unknown): number | undefined => {
+    const number = typeof value === "number" ? value : Number(value);
+    return Number.isFinite(number) ? number : undefined;
+  };
+  const grouped = new Map<
+    string,
+    { currentValue: number; previousValue: number; delta: number }
+  >();
+  for (const row of query.rows) {
+    const memberValue = row[dimensionLabel];
+    const current = asNumber(row[measureLabel]);
+    const previous = asNumber(row[previousLabel]);
+    const delta = asNumber(row[deltaLabel]);
+    if (memberValue == null || current == null || previous == null) continue;
+    const member = String(memberValue);
+    const existing = grouped.get(member) ?? {
+      currentValue: 0,
+      previousValue: 0,
+      delta: 0,
+    };
+    existing.currentValue += current;
+    existing.previousValue += previous;
+    existing.delta += delta ?? current - previous;
+    grouped.set(member, existing);
+  }
+
+  const pendingRefs = () => state.diagnosticCandidates
+    .filter(
+      (item) => item.status === "PENDING" && item.dimensionId !== dimensionId,
+    )
+    .flatMap((item) => {
+      const reference = state.planningCatalog.references.find(
+        (ref) => ref.kind === "DIMENSION" && ref.id === item.dimensionId,
+      );
+      return reference ? [reference.ref] : [];
+    });
+  const markAndReturn = (
+    evaluation: DiagnosticEvaluation,
+  ): DiagnosticEvaluation => {
+    const matched = state.diagnosticCandidates.find(
+      (item) => item.dimensionId === dimensionId,
+    );
+    if (matched) {
+      matched.status = evaluation.status === "ESTABLISHED"
+        ? "ESTABLISHED"
+        : "EVALUATED";
+    }
+    const nextCandidateRefs = pendingRefs();
+    const budgetExhausted =
+      state.captures.length + 1 >= DATA_AGENT_MAX_SUCCESSFUL_QUERIES;
+    if (
+      evaluation.status !== "ESTABLISHED" &&
+      (budgetExhausted || !nextCandidateRefs.length)
+    ) {
+      return {
+        ...evaluation,
+        status: "NO_DOMINANT_DRIVER_WITHIN_BUDGET",
+        reason:
+          "已检查预算内可用候选维度，但没有枚举值同时满足贡献集中和差异显著条件",
+        nextCandidateRefs: [],
+      };
+    }
+    return { ...evaluation, nextCandidateRefs };
+  };
+
+  if (grouped.size < 2) {
+    return markAndReturn({
+      dimensionId,
+      dimensionLabel,
+      measureId,
+      measureLabel,
+      status: "INELIGIBLE",
+      reason: `维度“${dimensionLabel}”不足两个有效枚举值，无法比较解释力`,
+      rowCount: grouped.size,
+      driverStrength: 0,
+      dominantMembers: [],
+      nextCandidateRefs: [],
+    });
+  }
+
+  const entries = [...grouped.entries()];
+  const totalPrevious = entries.reduce(
+    (sum, [, value]) => sum + value.previousValue,
+    0,
+  );
+  const totalDelta = entries.reduce((sum, [, value]) => sum + value.delta, 0);
+  const direction = totalDelta < 0 ? -1 : 1;
+  const alignedTotal = entries.reduce(
+    (sum, [, value]) => sum + Math.max(0, value.delta * direction),
+    0,
+  );
+  const totalBaseline = entries.reduce(
+    (sum, [, value]) => sum + Math.abs(value.previousValue),
+    0,
+  );
+  if (alignedTotal <= 0 || totalBaseline <= 0) {
+    return markAndReturn({
+      dimensionId,
+      dimensionLabel,
+      measureId,
+      measureLabel,
+      status: "INELIGIBLE",
+      reason: `维度“${dimensionLabel}”缺少可量化的同向变化或有效基期`,
+      rowCount: grouped.size,
+      driverStrength: 0,
+      dominantMembers: [],
+      nextCandidateRefs: [],
+    });
+  }
+
+  const overallGrowth = totalPrevious !== 0
+    ? totalDelta / Math.abs(totalPrevious)
+    : 0;
+  const contributions = entries
+    .map(([member, value]) => {
+      const alignedContributionShare =
+        Math.max(0, value.delta * direction) / alignedTotal;
+      const baselineShare = Math.abs(value.previousValue) / totalBaseline;
+      const growthRate = value.previousValue !== 0
+        ? value.delta / Math.abs(value.previousValue)
+        : undefined;
+      return {
+        member,
+        currentValue: value.currentValue,
+        previousValue: value.previousValue,
+        delta: value.delta,
+        growthRate,
+        alignedContributionShare,
+        baselineShare,
+        contributionLift:
+          baselineShare > 0 ? alignedContributionShare / baselineShare : undefined,
+      };
+    })
+    .sort(
+      (left, right) =>
+        right.alignedContributionShare - left.alignedContributionShare,
+    );
+  const top1 = contributions[0]!;
+  const top2 = contributions[1];
+  const top1ContributionShare = top1.alignedContributionShare;
+  const top3ContributionShare = contributions
+    .slice(0, 3)
+    .reduce((sum, item) => sum + item.alignedContributionShare, 0);
+  const top1ToTop2Ratio = top2?.alignedContributionShare
+    ? top1ContributionShare / top2.alignedContributionShare
+    : undefined;
+  const maxGrowthRateDeviation = Math.max(
+    ...contributions.map((item) =>
+      item.growthRate == null
+        ? 0
+        : Math.abs(item.growthRate - overallGrowth),
+    ),
+  );
+  const relativeMateriality = Math.abs(totalDelta) / totalBaseline;
+  const overviewDelta = state.captures
+    .filter((capture) => !capture.compiled.ir.dimensionPropertyIds.length)
+    .map((capture) => capture.artifact.rows.reduce((sum, row) => {
+      const value = asNumber(row[deltaLabel]);
+      return sum + (value ?? 0);
+    }, 0))
+    .find((value) => Math.abs(value) > 0);
+  const reconciliationRate = overviewDelta == null
+    ? undefined
+    : Math.max(
+        0,
+        1 - Math.abs(totalDelta - overviewDelta) / Math.max(Math.abs(overviewDelta), 1e-9),
+      );
+  const concentrated = top1ContributionShare >= 0.5;
+  const differentiated =
+    (top1.contributionLift ?? 0) >= 1.25 || maxGrowthRateDeviation >= 0.05;
+  const reconciled = reconciliationRate == null || reconciliationRate >= 0.95;
+  const material = relativeMateriality >= 0.01;
+  const established = concentrated && differentiated && reconciled && material;
+  const driverStrength = Math.max(
+    0,
+    Math.min(
+      1,
+      top1ContributionShare * 0.4 +
+        Math.min(1, (top1.contributionLift ?? 0) / 2) * 0.25 +
+        Math.min(1, maxGrowthRateDeviation / 0.2) * 0.25 +
+        (reconciled ? 0.1 : 0),
+    ),
+  );
+  return markAndReturn({
+    dimensionId,
+    dimensionLabel,
+    measureId,
+    measureLabel,
+    status: established
+      ? "ESTABLISHED"
+      : "INSUFFICIENT_EXPLANATORY_POWER",
+    reason: established
+      ? `${top1.member}贡献占比为${(top1ContributionShare * 100).toFixed(1)}%，且相对基期份额或增速差异显著`
+      : `维度“${dimensionLabel}”未同时满足贡献集中、相对基期抬升和增速分化条件`,
+    rowCount: grouped.size,
+    reconciliationRate,
+    relativeMateriality,
+    top1ContributionShare,
+    top3ContributionShare,
+    top1ToTop2Ratio,
+    top1ContributionLift: top1.contributionLift,
+    maxGrowthRateDeviation,
+    driverStrength,
+    dominantMembers: contributions.slice(0, 3),
+    nextCandidateRefs: [],
+  });
+}
+
 function satisfyAcceptanceCriteria(
   contract: AnalysisAcceptanceContract | undefined,
   criterionIds: string[],
   stepId: string,
   intent: AnalysisIntent,
   artifact: ResultArtifact,
+  diagnosticEvaluation?: DiagnosticEvaluation,
 ): void {
   if (!contract) return;
   const completeness = contract.criteria.find(
@@ -4654,6 +5176,28 @@ function satisfyAcceptanceCriteria(
     ) {
       criterion.status = "BLOCKED";
       criterion.summary = "当前分组查询没有返回可用于结构或驱动判断的数据";
+      continue;
+    }
+    if (criterion.kind === "DRIVERS") {
+      criterion.evidenceStepIds = [
+        ...new Set([...criterion.evidenceStepIds, stepId]),
+      ];
+      if (!diagnosticEvaluation) {
+        criterion.summary = "当前分组结果没有可用的服务端归因评分";
+        continue;
+      }
+      if (
+        ![
+          "ESTABLISHED",
+          "NO_DOMINANT_DRIVER_WITHIN_BUDGET",
+        ].includes(diagnosticEvaluation.status)
+      ) {
+        criterion.status = "PENDING";
+        criterion.summary = diagnosticEvaluation.reason;
+        continue;
+      }
+      criterion.status = "SATISFIED";
+      criterion.summary = diagnosticEvaluation.reason;
       continue;
     }
     criterion.status = "SATISFIED";

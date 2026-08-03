@@ -1081,7 +1081,7 @@ describe("DataAgentHarness", () => {
     repository.close();
   });
 
-  it("lets Montane explore one published fact object through multiple governed IR queries", async () => {
+  it("completes a non-attribution overview without forcing a structural dimension", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-harness-"));
     roots.push(root);
     const repository = new Repository(
@@ -1203,11 +1203,11 @@ describe("DataAgentHarness", () => {
     expect(rejectedPlanContents.join("\n")).not.toContain("rootObjectId");
     expect(rejectedPlanContents.join("\n")).not.toContain("measureIds");
     expect(model.turnCount).toBe(9);
-    expect(queries).toHaveLength(2);
-    expect(queries[1]).toContain("member_level");
+    expect(queries).toHaveLength(1);
+    expect(queries[0]).not.toContain("member_level");
     expect(output.responseKind).toBe("analysis");
     expect(output.result?.rows).toEqual([{ 成交金额: 128000 }]);
-    expect(output.answer).toContain("VIP");
+    expect(output.answer).not.toContain("VIP");
     const events = fs.readFileSync(
       path.join(root, ".montane", "sessions", output.sessionId, "events.jsonl"),
       "utf8",
@@ -1302,7 +1302,7 @@ describe("DataAgentHarness", () => {
     repository.close();
   });
 
-  it("marks an exploratory answer partial when required evidence gaps remain", async () => {
+  it("fills the exploratory comparison contract deterministically", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-harness-"));
     roots.push(root);
     const repository = new Repository(
@@ -1367,22 +1367,29 @@ describe("DataAgentHarness", () => {
       },
     );
 
-    expect(output.responseKind, failures.join("\n")).toBe("partial_analysis");
-    expect(output.acceptanceContract?.status).toBe("PARTIAL_NO_PROGRESS");
-    expect(output.answer).toContain("部分完成");
-    expect(output.answer).toContain("时间变化已覆盖");
-    expect(output.answer).toContain("主要结构已覆盖");
+    expect(output.responseKind, failures.join("\n")).toBe("analysis");
+    expect(output.acceptanceContract?.status).toBe("SATISFIED");
+    expect(output.acceptanceContract?.criteria.map((criterion) => criterion.kind))
+      .not.toContain("STRUCTURE");
     await harness.close();
     repository.close();
   });
 
-  it("treats query-budget exhaustion as partial instead of successful completion", async () => {
+  it("returns no dominant driver as a valid conclusion at the query budget", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-harness-"));
     roots.push(root);
     const repository = new Repository(
       path.join(root, ".montane/data-agent/ontology.sqlite"),
     );
     const ontology = ontologyWithGrossMargin();
+    const diagnosticOrder = ontology.objects.find(
+      (object) => object.id === "o_order",
+    )!;
+    diagnosticOrder.properties.push(
+      diagnosticProperty("p_channel", "channel", "渠道"),
+      diagnosticProperty("p_brand", "brand", "品牌"),
+      diagnosticProperty("p_division", "division", "事业部"),
+    );
     repository.saveOntology(ontology);
     repository.upsertScannedTables([{
       id: "t_orders",
@@ -1414,13 +1421,47 @@ describe("DataAgentHarness", () => {
       repository,
       async (sql) => {
         queries.push(sql);
+        const dimensionLabel = ["渠道", "品牌", "事业部"].find((label) =>
+          sql.includes(`AS \`${label}\``),
+        );
         return {
-          columns: queries.length === 1
-            ? ["成交金额"]
-            : ["时间", "成交金额"],
-          rows: queries.length === 1
-            ? [{ 成交金额: 128000 }]
-            : [{ 时间: "2026-01-01", 成交金额: 128000 }],
+          columns: dimensionLabel
+            ? [
+                dimensionLabel,
+                "成交金额",
+                "成交金额基期值",
+                "成交金额变化额",
+                "成交金额变化率",
+              ]
+            : [
+                "成交金额",
+                "成交金额基期值",
+                "成交金额变化额",
+                "成交金额变化率",
+              ],
+          rows: dimensionLabel
+            ? [
+                {
+                  [dimensionLabel]: "A",
+                  成交金额: 80,
+                  成交金额基期值: 100,
+                  成交金额变化额: -20,
+                  成交金额变化率: -0.2,
+                },
+                {
+                  [dimensionLabel]: "B",
+                  成交金额: 40,
+                  成交金额基期值: 50,
+                  成交金额变化额: -10,
+                  成交金额变化率: -0.2,
+                },
+              ]
+            : [{
+                成交金额: 120,
+                成交金额基期值: 150,
+                成交金额变化额: -30,
+                成交金额变化率: -0.2,
+              }],
           durationMs: 8,
           truncated: false,
         };
@@ -1447,9 +1488,122 @@ describe("DataAgentHarness", () => {
     );
 
     expect(queries).toHaveLength(4);
-    expect(output.responseKind).toBe("partial_analysis");
-    expect(output.acceptanceContract?.status).toBe("PARTIAL_BUDGET");
-    expect(output.answer).toContain("已达到 4 条成功查询预算");
+    expect(output.responseKind).toBe("analysis");
+    expect(output.acceptanceContract?.status).toBe("SATISFIED");
+    expect(output.acceptanceContract?.criteria.find(
+      (criterion) => criterion.kind === "DRIVERS",
+    )?.summary).toContain("没有枚举值同时满足");
+    await harness.close();
+    repository.close();
+  });
+
+  it("rejects a uniform split and establishes the next differentiated driver", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-harness-"));
+    roots.push(root);
+    const repository = new Repository(
+      path.join(root, ".montane/data-agent/ontology.sqlite"),
+    );
+    const ontology = ontologyWithGrossMargin();
+    const order = ontology.objects.find((object) => object.id === "o_order")!;
+    order.properties.push(
+      diagnosticProperty("p_channel", "channel", "渠道"),
+      diagnosticProperty("p_brand", "brand", "品牌"),
+    );
+    repository.saveOntology(ontology);
+    repository.upsertScannedTables([{
+      id: "t_orders",
+      catalog: "internal",
+      database: "retail",
+      name: "fact_orders",
+      type: "TABLE",
+      status: "MODELED",
+      columns: [],
+      fingerprint: "fact_orders:driver-established",
+      scannedAt: "2026-07-29T00:00:00.000Z",
+    }]);
+    repository.saveDataSource({
+      ...repository.getDataSource(),
+      configured: true,
+      host: "selectdb.test",
+      port: 9030,
+      username: "reader",
+      database: "retail",
+      catalog: "internal",
+      tls: false,
+      passwordStored: true,
+    });
+    const conversation = createConversation();
+    repository.saveConversation(conversation);
+    const queries: string[] = [];
+    const evaluations: string[] = [];
+    const harness = new DataAgentHarness(
+      root,
+      repository,
+      async (sql) => {
+        queries.push(sql);
+        const dimensionLabel = ["渠道", "品牌", "会员等级"].find((label) =>
+          sql.includes(`AS \`${label}\``),
+        );
+        if (!dimensionLabel) {
+          return {
+            columns: ["成交金额", "成交金额基期值", "成交金额变化额", "成交金额变化率"],
+            rows: [{ 成交金额: 210, 成交金额基期值: 300, 成交金额变化额: -90, 成交金额变化率: -0.3 }],
+            durationMs: 8,
+            truncated: false,
+          };
+        }
+        const strong = queries.length === 3;
+        return {
+          columns: [dimensionLabel, "成交金额", "成交金额基期值", "成交金额变化额", "成交金额变化率"],
+          rows: strong
+            ? [
+                { [dimensionLabel]: "A", 成交金额: 20, 成交金额基期值: 100, 成交金额变化额: -80, 成交金额变化率: -0.8 },
+                { [dimensionLabel]: "B", 成交金额: 90, 成交金额基期值: 100, 成交金额变化额: -10, 成交金额变化率: -0.1 },
+              ]
+            : [
+                { [dimensionLabel]: "A", 成交金额: 240, 成交金额基期值: 300, 成交金额变化额: -60, 成交金额变化率: -0.2 },
+                { [dimensionLabel]: "B", 成交金额: 120, 成交金额基期值: 150, 成交金额变化额: -30, 成交金额变化率: -0.2 },
+              ],
+          durationMs: 8,
+          truncated: false,
+        };
+      },
+      () => runtimeFor(new EstablishedDiagnosticMontaneModel()),
+    );
+
+    const output = await harness.run(
+      conversation,
+      {
+        id: "turn_driver_established",
+        conversationId: conversation.id,
+        question: "为什么订单成交金额下降",
+        status: "planning",
+        createdAt: new Date().toISOString(),
+        ontologyVersion: ontology.version,
+        trace: [],
+      },
+      {
+        onTextDelta() {},
+        onTextEnd() {},
+        onToolStatus(_call, status, result) {
+          if (status !== "succeeded") return;
+          const evaluation = (result?.data as {
+            diagnosticEvaluation?: { status?: string };
+          } | undefined)?.diagnosticEvaluation;
+          if (evaluation?.status) evaluations.push(evaluation.status);
+        },
+      },
+    );
+
+    expect(queries).toHaveLength(3);
+    expect(evaluations).toEqual([
+      "INSUFFICIENT_EXPLANATORY_POWER",
+      "ESTABLISHED",
+    ]);
+    expect(output.acceptanceContract?.status).toBe("SATISFIED");
+    expect(output.acceptanceContract?.criteria.find(
+      (criterion) => criterion.kind === "DRIVERS",
+    )?.summary).toContain("贡献占比");
     await harness.close();
     repository.close();
   });
@@ -1637,6 +1791,20 @@ function evidenceRequest(options: {
     request.limit = options.limit;
   }
   return request;
+}
+
+function firstDimensionRefFromTool(value: unknown): string | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  if (Array.isArray(value)) {
+    return value.map(firstDimensionRefFromTool).find(Boolean);
+  }
+  const record = value as Record<string, unknown>;
+  const dimension = record.dimension_refs as
+    | { items?: { enum?: string[] } }
+    | undefined;
+  const direct = dimension?.items?.enum?.find((item) => item !== "UNAVAILABLE");
+  if (direct) return direct;
+  return Object.values(record).map(firstDimensionRefFromTool).find(Boolean);
 }
 
 class ScriptedMontaneModel implements ModelClient {
@@ -1875,30 +2043,100 @@ class BudgetLimitedDiagnosticMontaneModel implements ModelClient {
       }));
     }
     if ([5, 6, 7].includes(this.step)) {
-      const units = ["YEAR", "QUARTER", "MONTH"] as const;
-      const unit = units[this.step - 5]!;
+      const planTool = options.tools.find(
+        (tool) => tool.name === "ExecuteAnalysisPlan",
+      );
+      const dimensionRef = firstDimensionRefFromTool(planTool);
       return this.tool(
-        `budget_baseline_${unit.toLowerCase()}`,
+        `budget_driver_${this.step - 4}`,
         "ExecuteAnalysisPlan",
         evidenceRequest({
-          timeGrain: unit,
-          title: `${unit}成交金额基准`,
-          objective: "补足比较基准",
-          rationale: "上一轮只有一个时间点，继续尝试受控时间粒度",
-          role: "SUPPORTING",
+          dimensionRefs: dimensionRef ? [dimensionRef] : [],
+          title: "候选维度归因验证",
+          objective: "按服务端候选队列验证贡献集中度",
+          rationale: "上一候选解释力不足，继续检查下一候选",
+          role: "DIAGNOSTIC",
         }),
       );
     }
-    if (this.step === 8) {
-      return this.tool("budget_driver_after_limit", "ExecuteAnalysisPlan", evidenceRequest({
-        dimensionRefs: ["D2"],
-        title: "会员等级驱动",
-        objective: "检查会员等级驱动",
-        rationale: "基准证据仍不足，继续检查结构",
-        role: "DIAGNOSTIC",
+    const finalText = "已检查预算内候选维度，没有发现贡献显著集中的主导因素。";
+    options.onTextDelta?.(finalText);
+    return { finalText, stopReason: "end_turn" };
+  }
+
+  private tool(
+    id: string,
+    name: string,
+    args: Record<string, unknown>,
+  ): AgentResponse {
+    return {
+      toolCalls: [{ id: `call_${id}`, name, args }],
+      stopReason: "tool_use",
+    };
+  }
+}
+
+class EstablishedDiagnosticMontaneModel implements ModelClient {
+  readonly capabilities = {
+    contextWindow: 32_000,
+    maxOutputTokens: 2_000,
+    supportsStreaming: true,
+    supportsToolUse: true,
+    supportsImages: false,
+  };
+  private step = 0;
+
+  async complete(options: {
+    messages: AgentMessage[];
+    tools: Array<Record<string, unknown>>;
+    onTextDelta?: (delta: string) => void;
+  }): Promise<AgentResponse> {
+    this.step += 1;
+    if (this.step === 1) {
+      return this.tool("established_frame", "SubmitQuestionFrame", {
+        original_question: "为什么订单成交金额下降",
+        intent_kind: "DIAGNOSTIC_ANALYSIS",
+        metric_terms: ["成交金额"],
+        time_terms: [],
+        object_terms: ["订单"],
+        business_value_terms: [],
+        grouping_terms: [],
+        calculation_terms: ["下降", "原因"],
+        presentation: { kind: "AUTO" },
+      });
+    }
+    if (this.step === 2) {
+      return this.tool("established_ontology", "OntologySearch", {
+        query: "为什么订单成交金额下降",
+      });
+    }
+    if (this.step === 3) {
+      return this.tool("established_space", "DiscoverAnalysisSpace", {
+        objective: "为什么订单成交金额下降",
+        object_ids: ["o_order"],
+      });
+    }
+    if (this.step === 4) {
+      return this.tool("established_overview", "ExecuteAnalysisPlan", evidenceRequest({
+        title: "成交金额现象确认",
       }));
     }
-    const finalText = "已取得部分数据库证据，但诊断尚未完成。";
+    if ([5, 6].includes(this.step)) {
+      const planTool = options.tools.find(
+        (tool) => tool.name === "ExecuteAnalysisPlan",
+      );
+      const dimensionRef = firstDimensionRefFromTool(planTool);
+      return this.tool(
+        `established_driver_${this.step - 4}`,
+        "ExecuteAnalysisPlan",
+        evidenceRequest({
+          dimensionRefs: dimensionRef ? [dimensionRef] : [],
+          title: "候选维度归因验证",
+          role: "DIAGNOSTIC",
+        }),
+      );
+    }
+    const finalText = "第二个候选维度通过贡献集中度与差异性验证，因素成立。";
     options.onTextDelta?.(finalText);
     return { finalText, stopReason: "end_turn" };
   }
@@ -2280,7 +2518,7 @@ class ExploratoryMontaneModel implements ModelClient {
         stopReason: "tool_use",
       };
     }
-    const finalText = "成交金额为 128,000 元，其中 VIP 客户贡献 88,000 元。";
+    const finalText = "成交金额为 128,000 元，已完成当前可用指标的销售概览。";
     options.onTextDelta?.(finalText);
     return { finalText, stopReason: "end_turn" };
   }
@@ -2387,6 +2625,26 @@ function ontologyWithGrossMargin() {
     },
   );
   return ontology;
+}
+
+function diagnosticProperty(id: string, name: string, label: string) {
+  return {
+    id,
+    name,
+    label,
+    description: `${label}诊断维度`,
+    dataType: "VARCHAR",
+    sourceColumn: name,
+    sensitive: false,
+    meaning: "CATEGORY" as const,
+    unique: false,
+    valueSearchable: true,
+    visibility: "ANALYTICAL" as const,
+    synonyms: [],
+    defaultDisplay: true,
+    exportable: true,
+    bindingPriority: 50,
+  };
 }
 
 async function runtimeFor(client: ModelClient): Promise<ConfiguredModelRuntime> {

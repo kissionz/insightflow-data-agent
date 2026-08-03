@@ -6,6 +6,8 @@ import type {
 } from "montane-code";
 import type {
   AnalysisAcceptanceContract,
+  DiagnosticCandidate,
+  DiagnosticEvaluation,
   AnalysisRun,
   AnalysisRunStep,
   TraceStep,
@@ -367,6 +369,7 @@ class HarnessTurnReporter implements AgentReporter {
             }>;
             limits?: { maxSuccessfulQueries?: number };
             acceptanceContract?: AnalysisAcceptanceContract;
+            diagnosticCandidates?: DiagnosticCandidate[];
           }
         | undefined;
       const space = data?.spaces?.[0];
@@ -406,6 +409,8 @@ class HarnessTurnReporter implements AgentReporter {
           rootObjectLabel: space?.object?.label,
           availableMetrics: selectedSpace?.metrics ?? [],
           availableDimensions: selectedSpace?.dimensions ?? [],
+          diagnosticCandidates:
+            data?.diagnosticCandidates ?? this.analysisRun.diagnosticCandidates,
         };
         this.publishAnalysisRun(this.analysisRun);
       }
@@ -633,10 +638,14 @@ class HarnessTurnReporter implements AgentReporter {
       this.startAnalysisStep(call);
       const measureCount = Array.isArray(call.args.measure_ids)
         ? call.args.measure_ids.length
-        : 0;
+        : Array.isArray(call.args.measure_refs)
+          ? call.args.measure_refs.length
+          : 0;
       const dimensionCount = Array.isArray(call.args.dimension_property_ids)
         ? call.args.dimension_property_ids.length
-        : 0;
+        : Array.isArray(call.args.dimension_refs)
+          ? call.args.dimension_refs.length
+          : 0;
       const filterCount = Array.isArray(call.args.filters)
         ? call.args.filters.length
         : 0;
@@ -952,8 +961,14 @@ class HarnessTurnReporter implements AgentReporter {
       truncated?: boolean;
       observation?: Record<string, unknown>;
       analysisStep?: {
+        id?: string;
+        objective?: string;
+        rationale?: string;
+        role?: AnalysisRunStep["role"];
         acceptanceCriterionIds?: string[];
       };
+      diagnosticEvaluation?: DiagnosticEvaluation;
+      diagnosticCandidates?: DiagnosticCandidate[];
       acceptanceContract?: AnalysisAcceptanceContract;
     };
     const executedSpace = data.ir?.rootObjectId
@@ -970,6 +985,8 @@ class HarnessTurnReporter implements AgentReporter {
         executedSpace?.dimensions ?? this.analysisRun.availableDimensions,
       acceptance:
         data.acceptanceContract ?? this.analysisRun.acceptance,
+      diagnosticCandidates:
+        data.diagnosticCandidates ?? this.analysisRun.diagnosticCandidates,
       steps: this.analysisRun.steps.map((step) =>
         step.callId === call.id
           ? {
@@ -980,12 +997,18 @@ class HarnessTurnReporter implements AgentReporter {
                   ? `返回 ${data.rowCount ?? 0} 行，Montane 正在判断是否需要继续分析`
                   : result?.content?.split("\n")[0] || "本步查询失败",
               ir: data.ir,
+              id: data.analysisStep?.id ?? step.id,
+              title: data.analysisStep?.objective ?? step.title,
+              objective: data.analysisStep?.objective ?? step.objective,
+              rationale: data.analysisStep?.rationale ?? step.rationale,
+              role: data.analysisStep?.role ?? step.role,
               sql: data.sql,
               parameters: data.parameters,
               columns: data.columns,
               rows: data.rows,
               rowCount: data.rowCount,
               truncated: data.truncated,
+              diagnosticEvaluation: data.diagnosticEvaluation,
               acceptanceCriterionIds:
                 data.analysisStep?.acceptanceCriterionIds ??
                 step.acceptanceCriterionIds,

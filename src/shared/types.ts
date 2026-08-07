@@ -144,7 +144,29 @@ export interface DiagnosticEvaluation {
   maxGrowthRateDeviation?: number;
   driverStrength: number;
   dominantMembers: DiagnosticContribution[];
+  evaluatedMeasureCount: number;
+  metricEvaluations: DiagnosticMetricEvaluation[];
   nextCandidateRefs: string[];
+}
+
+export interface DiagnosticMetricEvaluation {
+  measureId: string;
+  measureLabel: string;
+  status:
+    | "ESTABLISHED"
+    | "INSUFFICIENT_EXPLANATORY_POWER"
+    | "INELIGIBLE";
+  reason: string;
+  rowCount: number;
+  reconciliationRate?: number;
+  relativeMateriality?: number;
+  top1ContributionShare?: number;
+  top3ContributionShare?: number;
+  top1ToTop2Ratio?: number;
+  top1ContributionLift?: number;
+  maxGrowthRateDeviation?: number;
+  driverStrength: number;
+  dominantMembers: DiagnosticContribution[];
 }
 
 export type AcceptanceCriterionKind =

@@ -20,6 +20,7 @@ import type {
   AnalysisIntent,
   DiagnosticCandidate,
   DiagnosticEvaluation,
+  DiagnosticMetricEvaluation,
   AnalysisRunStep,
   Conversation,
   Metric,
@@ -39,6 +40,8 @@ import { guardReadOnlySql } from "./sql-guard.js";
 
 const DATA_AGENT_MAX_MODEL_TURNS = 14;
 const DATA_AGENT_MAX_SUCCESSFUL_QUERIES = 4;
+const DATA_AGENT_MAX_CONSECUTIVE_PLANNING_FAILURES = 3;
+const DATA_AGENT_MAX_DIAGNOSTIC_MEASURES = 3;
 
 const DATA_AGENT_SYSTEM_PROMPT = `
 你是 InsightFlow Data Agent，运行在 Montane Harness 中。
@@ -60,9 +63,9 @@ const DATA_AGENT_SYSTEM_PROMPT = `
 9. ExecuteAnalysisPlan 是唯一查询入口。服务端 Plan Synthesizer 把紧凑请求确定性展开成强类型 IR，校验关系、粒度、可加性、筛选逻辑和窗口计算，再编译参数化 Doris SQL 并执行。
 9.1 SubmitQuestionFrame 返回 acceptanceContract。所有分析类型共用同一个受控查询循环和四条成功查询预算；意图不能把明确问数限制为一条查询，也不能强制探索分析执行多条查询。
 9.2 服务端根据请求结构、已有查询和待验收项自动生成 analysis_step，并自动关联本次查询能够关闭的验收缺口。模型不构造步骤说明或验收句柄；后续查询必须由上一查询返回的真实数据驱动，并选择能够补充现有证据的不同指标、维度、粒度或高级计算。
-9.3 每次 ExecuteAnalysisPlan 返回受控查询数据和更新后的 acceptanceContract。非归因分析由服务端优先补齐可用核心指标、同比和月度趋势，不要求机械执行结构分组。归因分析的 diagnosticEvaluation 由服务端根据贡献集中度、基期份额抬升、增速分化和结果对账计算，模型不得凭最大枚举值自行宣布原因成立。
+9.3 每次 ExecuteAnalysisPlan 返回受控查询数据和更新后的 acceptanceContract。非归因分析由服务端优先补齐可用核心指标、同比和月度趋势，不要求机械执行结构分组。归因分析单次最多选择三个相关指标，服务端分别按贡献集中度、基期份额抬升、增速分化和结果对账统一加权评分，并优先返回通过硬门槛且得分最高的指标证据；模型不得凭最大枚举值自行宣布原因成立。
 9.4 归因分析应严格按 diagnosticCandidates/nextCandidateRefs 的顺序一次验证一个维度；只有 diagnosticEvaluation.status=ESTABLISHED 才能表述为主要因素。若解释力不足则继续下一个候选，直到成立或预算耗尽；NO_DOMINANT_DRIVER_WITHIN_BUDGET 是合法结论，不得强行归因。
-9.5 只有全部必需验收项为 SATISFIED 或 NOT_APPLICABLE 才能宣称完成；预算耗尽、没有进展或主动停止但仍有缺口时，必须明确为部分完成。不得重复相同计划，不得跨事实对象。
+9.5 只有全部必需验收项为 SATISFIED 或 NOT_APPLICABLE 才能宣称完成；预算耗尽、没有进展或主动停止但仍有缺口时，必须明确为部分完成。不得重复相同计划，不得跨事实对象。连续规划失败最多三次；收到 ANALYSIS_RETRY_LIMIT_REACHED 后必须停止调用工具并说明缺口。
 10. 不得猜测或创造 O*/M*/D*/B*/A* 句柄、数据库值或关系。临时计算只可使用 C1、C2 等本请求内句柄，输入必须引用本轮工具真实返回的 M*/D* 或前序 C*。
 11. 最终使用中文给出简洁、可验证的结论，只能引用 ExecuteAnalysisPlan 返回的数据。
 12. 信息不足、语义存在多个候选或工具拒绝计划时，向用户说明需要补充的具体条件。
@@ -100,6 +103,7 @@ interface AnalysisExecutionState {
   rootObjectId?: string;
   acceptanceContract?: AnalysisAcceptanceContract;
   queryBudgetReached: boolean;
+  consecutivePlanningFailures: number;
   planningCatalog: PlanningCatalog;
   diagnosticCandidates: DiagnosticCandidate[];
 }
@@ -187,6 +191,7 @@ export class DataAgentHarness {
       captures: [],
       seenPlanHashes: new Set(),
       queryBudgetReached: false,
+      consecutivePlanningFailures: 0,
       planningCatalog: createPlanningCatalog(),
       diagnosticCandidates: [],
     };
@@ -197,7 +202,12 @@ export class DataAgentHarness {
     const tools = new ToolRegistry();
     tools.register(
       this.questionFrameTool(turn.question, (frame) => {
-        questionFrame ??= frame;
+        questionFrame ??= resolveContextualMonthReferences(
+          frame,
+          conversation,
+          turn.id,
+          agentConfig.timezone,
+        );
         analysisState.acceptanceContract ??=
           createAcceptanceContract(questionFrame);
         syncAcceptanceReferences(analysisState);
@@ -1445,6 +1455,12 @@ export class DataAgentHarness {
             }),
           };
         }
+        if (
+          state.consecutivePlanningFailures >=
+          DATA_AGENT_MAX_CONSECUTIVE_PLANNING_FAILURES
+        ) {
+          return analysisRetryLimitOutcome(state);
+        }
         try {
           const ontology = this.repository.getPublishedOntology();
           const expanded = synthesizeAnalysisPlan(
@@ -1458,6 +1474,7 @@ export class DataAgentHarness {
           if (!outcome.ok) {
             return modelSafeAnalysisFailure(outcome, state);
           }
+          state.consecutivePlanningFailures = 0;
           const payload =
             (outcome.data as Record<string, unknown> | undefined) ?? {};
           const enriched = {
@@ -1487,25 +1504,17 @@ export class DataAgentHarness {
         } catch (error) {
           const detail =
             error instanceof Error ? error.message : "证据请求无法合成";
-          return {
+          return modelSafeAnalysisFailure({
             ok: false,
-            content: JSON.stringify({
-              status: "error",
-              stage: "planning",
-              code: "EVIDENCE_REQUEST_SYNTHESIS_FAILED",
-              retryable: true,
-              planningReferences: describePlanningReferences(state),
-              nextAction: "RETRY_WITH_VISIBLE_REFS",
-            }),
+            content: `证据请求无法合成：${detail}`,
             data: {
               stage: "planning",
               code: "EVIDENCE_REQUEST_SYNTHESIS_FAILED",
               error: detail,
-              planningReferences: describePlanningReferences(state),
               retryInstruction:
                 "只使用 planningReferences 中本轮可见的短句柄；一个问题的多个指标应同时放入 measure_refs。",
             },
-          };
+          }, state);
         }
       },
     };
@@ -1520,6 +1529,7 @@ export class DataAgentHarness {
       captures: [],
       seenPlanHashes: new Set(),
       queryBudgetReached: false,
+      consecutivePlanningFailures: 0,
       planningCatalog: createPlanningCatalog(),
       diagnosticCandidates: [],
     },
@@ -2064,14 +2074,16 @@ export class DataAgentHarness {
           const availableMetrics = listAvailableMeasures(ontology).slice(0, 24);
           const detail =
             error instanceof Error ? error.message : "IR规则校验失败";
+          const classified = classifyIrValidationFailure(detail);
           return {
             ok: false,
-            content: `IR规则校验失败：${detail}\n请根据错误修正 ID 类型后再次调用 ExecuteAnalysisPlan。measure_ids 只能使用 metrics[].id。可用指标：${JSON.stringify(availableMetrics)}`,
+            content: `IR规则校验失败：${detail}`,
             data: {
               stage: "planning",
+              code: classified.code,
+              safeMessage: classified.safeMessage,
               intent: intent as unknown as Record<string, unknown>,
-              retryInstruction:
-                "根据错误重新检查 ID 类型并再次调用 ExecuteAnalysisPlan。measure_ids 只能使用 OntologySearch 或 DiscoverAnalysisSpace 返回的 metrics[].id，其中 measureKind=PROPERTY 的数字属性允许按默认聚合执行。",
+              retryInstruction: classified.retryInstruction,
               availableMetrics,
             },
           };
@@ -2585,6 +2597,16 @@ function modelVisibleAnalysisResult(
           maxGrowthRateDeviation:
             diagnosticEvaluation.maxGrowthRateDeviation,
           dominantMembers: diagnosticEvaluation.dominantMembers,
+          evaluatedMeasureCount:
+            diagnosticEvaluation.evaluatedMeasureCount,
+          metricEvaluations: diagnosticEvaluation.metricEvaluations.map(
+            (evaluation) => ({
+              measure: evaluation.measureLabel,
+              status: evaluation.status,
+              reason: evaluation.reason,
+              driverStrength: evaluation.driverStrength,
+            }),
+          ),
           nextCandidateRefs: diagnosticEvaluation.nextCandidateRefs,
         }
       : undefined,
@@ -2620,16 +2642,27 @@ function modelSafeAnalysisFailure(
   const data =
     (outcome.data as Record<string, unknown> | undefined) ?? {};
   const stage = String(data.stage ?? "planning");
-  const code = String(
+  let code = String(
     data.code ??
       inferSafeAnalysisErrorCode(outcome.content, stage),
   );
-  const retryable = ![
+  let retryable = ![
     "ACCEPTANCE_CONTRACT_SATISFIED",
     "ANALYSIS_STEP_BUDGET_REACHED",
+    "ANALYSIS_RETRY_LIMIT_REACHED",
     "DATA_SOURCE_NOT_CONFIGURED",
     "QUERY_EXECUTION_FAILED",
   ].includes(code);
+  if (stage === "planning" && retryable) {
+    state.consecutivePlanningFailures += 1;
+    if (
+      state.consecutivePlanningFailures >=
+      DATA_AGENT_MAX_CONSECUTIVE_PLANNING_FAILURES
+    ) {
+      code = "ANALYSIS_RETRY_LIMIT_REACHED";
+      retryable = false;
+    }
+  }
   return {
     ...outcome,
     content: JSON.stringify({
@@ -2637,11 +2670,74 @@ function modelSafeAnalysisFailure(
       stage,
       code,
       retryable,
+      ...(typeof data.safeMessage === "string"
+        ? { message: data.safeMessage }
+        : {}),
+      ...(typeof data.retryInstruction === "string"
+        ? { retryInstruction: data.retryInstruction }
+        : {}),
+      planningFailureProgress: {
+        attempts: state.consecutivePlanningFailures,
+        maxAttempts: DATA_AGENT_MAX_CONSECUTIVE_PLANNING_FAILURES,
+      },
       ...(retryable
         ? { planningReferences: describePlanningReferences(state) }
         : {}),
       nextAction: safeAnalysisErrorNextAction(code),
     }),
+  };
+}
+
+function analysisRetryLimitOutcome(
+  state: AnalysisExecutionState,
+): ToolOutcome {
+  return {
+    ok: false,
+    content: JSON.stringify({
+      status: "error",
+      stage: "planning",
+      code: "ANALYSIS_RETRY_LIMIT_REACHED",
+      retryable: false,
+      message: `连续规划失败已达到 ${DATA_AGENT_MAX_CONSECUTIVE_PLANNING_FAILURES} 次上限`,
+      planningFailureProgress: {
+        attempts: state.consecutivePlanningFailures,
+        maxAttempts: DATA_AGENT_MAX_CONSECUTIVE_PLANNING_FAILURES,
+      },
+      nextAction: "FINALIZE_AS_PARTIAL",
+    }),
+    data: {
+      stage: "planning",
+      code: "ANALYSIS_RETRY_LIMIT_REACHED",
+    },
+  };
+}
+
+function classifyIrValidationFailure(detail: string): {
+  code: string;
+  safeMessage: string;
+  retryInstruction: string;
+} {
+  if (/暂不支持时间表达式|时间表达式.+月份无效/.test(detail)) {
+    return {
+      code: "TIME_RANGE_UNSUPPORTED",
+      safeMessage: detail,
+      retryInstruction:
+        "补充明确年份，或使用今年、去年、本月、上月等受支持表达；不要更换指标或维度。",
+    };
+  }
+  if (/指标|measure|属性.+不是可聚合指标|计算项/i.test(detail)) {
+    return {
+      code: "MEASURE_REFERENCE_INVALID",
+      safeMessage: "指标或计算引用未通过治理校验",
+      retryInstruction:
+        "只使用 planningReferences.measures 中的短句柄，并保持同一事实对象。",
+    };
+  }
+  return {
+    code: "IR_VALIDATION_FAILED",
+    safeMessage: "当前证据请求未通过 IR 规则校验",
+    retryInstruction:
+      "根据错误类型修正一次；不要无依据地轮换指标和维度。",
   };
 }
 
@@ -2657,17 +2753,22 @@ function inferSafeAnalysisErrorCode(content: string, stage: string): string {
   if (/查询计划已成功执行|重复调用/.test(content)) {
     return "DUPLICATE_ANALYSIS_PLAN";
   }
+  if (/暂不支持时间表达式|时间表达式.+月份无效/.test(content)) {
+    return "TIME_RANGE_UNSUPPORTED";
+  }
   return "IR_VALIDATION_FAILED";
 }
 
 function safeAnalysisErrorNextAction(code: string): string {
   if (code === "ACCEPTANCE_CONTRACT_SATISFIED") return "FINALIZE_FROM_RETURNED_DATA";
   if (code === "ANALYSIS_STEP_BUDGET_REACHED") return "FINALIZE_AS_PARTIAL";
+  if (code === "ANALYSIS_RETRY_LIMIT_REACHED") return "FINALIZE_AS_PARTIAL";
   if (code === "DATA_SOURCE_NOT_CONFIGURED") return "ASK_USER_TO_CONFIGURE_DATA_SOURCE";
   if (code === "QUERY_EXECUTION_FAILED") return "STOP_WITHOUT_BUSINESS_CONCLUSION";
   if (code === "VALUE_BINDING_REQUIRED") return "CALL_PROPERTY_VALUE_SEARCH";
   if (code === "QUESTION_FRAME_REQUIRED") return "CALL_SUBMIT_QUESTION_FRAME";
   if (code === "DUPLICATE_ANALYSIS_PLAN") return "USE_DIFFERENT_PLAN_OR_FINALIZE";
+  if (code === "TIME_RANGE_UNSUPPORTED") return "RETRY_WITH_EXPLICIT_TIME";
   return "RETRY_WITH_VISIBLE_REFS";
 }
 
@@ -2770,11 +2871,16 @@ function buildEvidenceRequestSchema(
       measure_refs: {
         type: "array",
         minItems: 1,
-        maxItems: 8,
+        maxItems:
+          frame?.intentKind === "DIAGNOSTIC_ANALYSIS"
+            ? DATA_AGENT_MAX_DIAGNOSTIC_MEASURES
+            : 8,
         uniqueItems: true,
         items: { type: "string", enum: enumOrUnavailable(measureRefs) },
         description:
-          "本步需要的全部指标短句柄。用户一次问多个指标时必须全部放入同一数组，例如 [M1,M2,M3]",
+          frame?.intentKind === "DIAGNOSTIC_ANALYSIS"
+            ? "一次提交最多3个相关指标；服务端对每个指标统一评分并选择解释力最高者"
+            : "本步需要的全部指标短句柄。用户一次问多个指标时必须全部放入同一数组，例如 [M1,M2,M3]",
       },
       dimension_refs: {
         type: "array",
@@ -2921,24 +3027,37 @@ function synthesizeAnalysisPlan(
     rootRef === "AUTO"
       ? measureReferences[0]?.objectId
       : resolveRef(rootRef, ["OBJECT"]).id;
+  measureReferences = deduplicateMeasureReferences(
+    measureReferences,
+    ontology,
+  );
   if (
-    frame.intentKind === "EXPLORATORY_ANALYSIS" &&
-    state.captures.length === 0
+    ["EXPLORATORY_ANALYSIS", "DIAGNOSTIC_ANALYSIS"].includes(
+      frame.intentKind,
+    )
   ) {
-    const coreSalesMeasures = referencesOfKind(state, "MEASURE").filter(
-      (reference) =>
-        reference.objectId === rootObjectId &&
-        /销售额|成交金额|交易金额|销售数量|销量|成交数量|订单量|成本|毛利|销售均价|客单价/.test(
-          reference.label,
-        ),
+    const coreSalesMeasures = referencesOfKind(state, "MEASURE")
+      .filter(
+        (reference) =>
+          reference.objectId === rootObjectId &&
+          /销售额|成交金额|交易金额|销售数量|销量|成交数量|订单量|成本|毛利|销售均价|客单价/.test(
+            reference.label,
+          ),
+      )
+      .sort(
+        (left, right) =>
+          supportingMeasurePriority(right.label) -
+          supportingMeasurePriority(left.label),
+      );
+    measureReferences = deduplicateMeasureReferences(
+      [...measureReferences, ...coreSalesMeasures],
+      ontology,
+    ).slice(
+      0,
+      frame.intentKind === "DIAGNOSTIC_ANALYSIS"
+        ? DATA_AGENT_MAX_DIAGNOSTIC_MEASURES
+        : 6,
     );
-    measureReferences = [
-      ...new Map(
-        [...measureReferences, ...coreSalesMeasures]
-          .slice(0, 6)
-          .map((reference) => [reference.id, reference]),
-      ).values(),
-    ];
   }
   const measureIds = measureReferences.map((reference) => reference.id);
   const dimensionIds = dimensionReferences.map((reference) => reference.id);
@@ -3112,19 +3231,22 @@ function synthesizeAnalysisPlan(
         : undefined;
   if (comparisonKind && !explicitKinds.has(comparisonKind)) {
     if (frame.intentKind === "DIAGNOSTIC_ANALYSIS") {
-      const measure = measureReferences[0]!;
-      for (const [suffix, label, output] of [
-        ["previous", `${measure.label}基期值`, "PREVIOUS_VALUE"],
-        ["delta", `${measure.label}变化额`, "DIFFERENCE"],
-        ["growth", `${measure.label}变化率`, "GROWTH_RATE"],
-      ] as const) {
-        timeComparisons.push({
-          id: `calc_auto_${suffix}`,
-          label,
-          measure_id: measure.id,
-          comparison: comparisonKind,
-          output,
-        });
+      for (const [measureIndex, measure] of measureReferences
+        .slice(0, DATA_AGENT_MAX_DIAGNOSTIC_MEASURES)
+        .entries()) {
+        for (const [suffix, label, output] of [
+          ["previous", `${measure.label}基期值`, "PREVIOUS_VALUE"],
+          ["delta", `${measure.label}变化额`, "DIFFERENCE"],
+          ["growth", `${measure.label}变化率`, "GROWTH_RATE"],
+        ] as const) {
+          timeComparisons.push({
+            id: `calc_auto_${measureIndex + 1}_${suffix}`,
+            label,
+            measure_id: measure.id,
+            comparison: comparisonKind,
+            output,
+          });
+        }
       }
     } else {
       for (const [index, measure] of measureReferences.entries()) {
@@ -3315,6 +3437,34 @@ function inferAutomaticTimeGrain(frame: QuestionLanguageFrame): TimeGrain {
     return "MONTH";
   }
   return inferComparisonTimeGrain(frame);
+}
+
+function deduplicateMeasureReferences(
+  references: PlanningReference[],
+  ontology: OntologySnapshot,
+): PlanningReference[] {
+  const seen = new Set<string>();
+  return references.filter((reference) => {
+    const metric = ontology.metrics.find(
+      (candidate) => candidate.id === reference.id,
+    );
+    const sourceKey = metric?.sourcePropertyId
+      ? `property:${metric.sourcePropertyId}`
+      : findPropertyBinding(ontology, reference.id)
+        ? `property:${reference.id}`
+        : `measure:${reference.id}`;
+    if (seen.has(sourceKey)) return false;
+    seen.add(sourceKey);
+    return true;
+  });
+}
+
+function supportingMeasurePriority(label: string): number {
+  if (/销售数量|销量|成交数量|订单量/.test(label)) return 100;
+  if (/销售均价|客单价/.test(label)) return 90;
+  if (/成本|毛利/.test(label)) return 80;
+  if (/销售额|成交金额|交易金额/.test(label)) return 70;
+  return 0;
 }
 
 function resolveMeasureForTerm(
@@ -4515,6 +4665,50 @@ function normalizePropertyValue(value: string): string {
   return value.trim().toLocaleLowerCase("zh-CN").replace(/\s+/g, " ");
 }
 
+export function resolveContextualMonthReferences(
+  frame: QuestionLanguageFrame,
+  conversation: Conversation,
+  currentTurnId: string,
+  timezone: string,
+): QuestionLanguageFrame {
+  const bareMonthPattern = /^(\d{1,2})月(?:份)?$/;
+  if (!frame.timeTerms.some((term) => bareMonthPattern.test(term.trim()))) {
+    return frame;
+  }
+  const currentYear = Number(
+    new Intl.DateTimeFormat("en-US", {
+      year: "numeric",
+      timeZone: timezone,
+    }).format(new Date()),
+  );
+  const explicitYear = frame.originalQuestion.match(/(20\d{2})年/)?.[1];
+  const previousAnchor = [...conversation.turns]
+    .reverse()
+    .filter((turn) => turn.id !== currentTurnId)
+    .map((turn) => extractYearAnchor(turn.question, currentYear))
+    .find((year): year is number => year != null);
+  const anchorYear = explicitYear ? Number(explicitYear) : previousAnchor ?? currentYear;
+  return {
+    ...frame,
+    timeTerms: frame.timeTerms.map((term) => {
+      const match = term.trim().match(bareMonthPattern);
+      if (!match) return term;
+      const month = Number(match[1]);
+      return month >= 1 && month <= 12
+        ? `${anchorYear}年${month}月`
+        : term;
+    }),
+  };
+}
+
+function extractYearAnchor(text: string, currentYear: number): number | undefined {
+  const explicit = text.match(/(20\d{2})年/)?.[1];
+  if (explicit) return Number(explicit);
+  if (/今年|本年/.test(text)) return currentYear;
+  if (/去年/.test(text)) return currentYear - 1;
+  return undefined;
+}
+
 function quoteIdentifier(value: string): string {
   return `\`${value.replaceAll("`", "``")}\``;
 }
@@ -4885,14 +5079,7 @@ function evaluateDiagnosticEvidence(
   }
   const dimensionId = intent.dimensionPropertyIds[0]!;
   const dimension = findPropertyBinding(ontology, dimensionId)?.property;
-  const measureId = intent.measureIds[0]!;
-  const measure = listAvailableMeasures(ontology).find(
-    (candidate) => candidate.id === measureId,
-  );
   const dimensionLabel = dimension?.label ?? dimensionId;
-  const measureLabel = measure?.label ?? measureId;
-  const previousLabel = `${measureLabel}基期值`;
-  const deltaLabel = `${measureLabel}变化额`;
   if (!state.diagnosticCandidates.some(
     (item) => item.dimensionId === dimensionId,
   )) {
@@ -4906,7 +5093,77 @@ function evaluateDiagnosticEvidence(
       status: "PENDING",
     });
   }
+  const metricEvaluations = [...new Set(intent.measureIds)]
+    .slice(0, DATA_AGENT_MAX_DIAGNOSTIC_MEASURES)
+    .map((measureId) => scoreDiagnosticMetricEvidence(
+      dimensionLabel,
+      measureId,
+      query,
+      ontology,
+      state,
+    ));
+  const established = metricEvaluations.filter(
+    (evaluation) => evaluation.status === "ESTABLISHED",
+  );
+  const selected = [...(established.length ? established : metricEvaluations)]
+    .sort((left, right) =>
+      right.driverStrength - left.driverStrength ||
+      (right.relativeMateriality ?? 0) - (left.relativeMateriality ?? 0)
+    )[0];
+  if (!selected) return undefined;
 
+  const matched = state.diagnosticCandidates.find(
+    (item) => item.dimensionId === dimensionId,
+  );
+  if (matched) {
+    matched.status = selected.status === "ESTABLISHED"
+      ? "ESTABLISHED"
+      : "EVALUATED";
+  }
+  const nextCandidateRefs = state.diagnosticCandidates
+    .filter(
+      (item) => item.status === "PENDING" && item.dimensionId !== dimensionId,
+    )
+    .flatMap((item) => {
+      const reference = state.planningCatalog.references.find(
+        (ref) => ref.kind === "DIMENSION" && ref.id === item.dimensionId,
+      );
+      return reference ? [reference.ref] : [];
+    });
+  const budgetExhausted =
+    state.captures.length + 1 >= DATA_AGENT_MAX_SUCCESSFUL_QUERIES;
+  const noDominantDriver =
+    selected.status !== "ESTABLISHED" &&
+    (budgetExhausted || !nextCandidateRefs.length);
+  return {
+    dimensionId,
+    dimensionLabel,
+    ...selected,
+    status: noDominantDriver
+      ? "NO_DOMINANT_DRIVER_WITHIN_BUDGET"
+      : selected.status,
+    reason: noDominantDriver
+      ? `已对${metricEvaluations.length}个指标统一评分，并检查预算内可用候选维度，但没有发现满足硬门槛的主导因素`
+      : selected.reason,
+    evaluatedMeasureCount: metricEvaluations.length,
+    metricEvaluations,
+    nextCandidateRefs: noDominantDriver ? [] : nextCandidateRefs,
+  };
+}
+
+function scoreDiagnosticMetricEvidence(
+  dimensionLabel: string,
+  measureId: string,
+  query: QueryResult,
+  ontology: OntologySnapshot,
+  state: AnalysisExecutionState,
+): DiagnosticMetricEvaluation {
+  const measure = listAvailableMeasures(ontology).find(
+    (candidate) => candidate.id === measureId,
+  );
+  const measureLabel = measure?.label ?? measureId;
+  const previousLabel = `${measureLabel}基期值`;
+  const deltaLabel = `${measureLabel}变化额`;
   const asNumber = (value: unknown): number | undefined => {
     const number = typeof value === "number" ? value : Number(value);
     return Number.isFinite(number) ? number : undefined;
@@ -4932,61 +5189,20 @@ function evaluateDiagnosticEvidence(
     existing.delta += delta ?? current - previous;
     grouped.set(member, existing);
   }
-
-  const pendingRefs = () => state.diagnosticCandidates
-    .filter(
-      (item) => item.status === "PENDING" && item.dimensionId !== dimensionId,
-    )
-    .flatMap((item) => {
-      const reference = state.planningCatalog.references.find(
-        (ref) => ref.kind === "DIMENSION" && ref.id === item.dimensionId,
-      );
-      return reference ? [reference.ref] : [];
-    });
-  const markAndReturn = (
-    evaluation: DiagnosticEvaluation,
-  ): DiagnosticEvaluation => {
-    const matched = state.diagnosticCandidates.find(
-      (item) => item.dimensionId === dimensionId,
-    );
-    if (matched) {
-      matched.status = evaluation.status === "ESTABLISHED"
-        ? "ESTABLISHED"
-        : "EVALUATED";
-    }
-    const nextCandidateRefs = pendingRefs();
-    const budgetExhausted =
-      state.captures.length + 1 >= DATA_AGENT_MAX_SUCCESSFUL_QUERIES;
-    if (
-      evaluation.status !== "ESTABLISHED" &&
-      (budgetExhausted || !nextCandidateRefs.length)
-    ) {
-      return {
-        ...evaluation,
-        status: "NO_DOMINANT_DRIVER_WITHIN_BUDGET",
-        reason:
-          "已检查预算内可用候选维度，但没有枚举值同时满足贡献集中和差异显著条件",
-        nextCandidateRefs: [],
-      };
-    }
-    return { ...evaluation, nextCandidateRefs };
-  };
-
+  const ineligible = (reason: string): DiagnosticMetricEvaluation => ({
+    measureId,
+    measureLabel,
+    status: "INELIGIBLE",
+    reason,
+    rowCount: grouped.size,
+    driverStrength: 0,
+    dominantMembers: [],
+  });
   if (grouped.size < 2) {
-    return markAndReturn({
-      dimensionId,
-      dimensionLabel,
-      measureId,
-      measureLabel,
-      status: "INELIGIBLE",
-      reason: `维度“${dimensionLabel}”不足两个有效枚举值，无法比较解释力`,
-      rowCount: grouped.size,
-      driverStrength: 0,
-      dominantMembers: [],
-      nextCandidateRefs: [],
-    });
+    return ineligible(
+      `指标“${measureLabel}”在维度“${dimensionLabel}”下不足两个有效枚举值`,
+    );
   }
-
   const entries = [...grouped.entries()];
   const totalPrevious = entries.reduce(
     (sum, [, value]) => sum + value.previousValue,
@@ -5003,20 +5219,10 @@ function evaluateDiagnosticEvidence(
     0,
   );
   if (alignedTotal <= 0 || totalBaseline <= 0) {
-    return markAndReturn({
-      dimensionId,
-      dimensionLabel,
-      measureId,
-      measureLabel,
-      status: "INELIGIBLE",
-      reason: `维度“${dimensionLabel}”缺少可量化的同向变化或有效基期`,
-      rowCount: grouped.size,
-      driverStrength: 0,
-      dominantMembers: [],
-      nextCandidateRefs: [],
-    });
+    return ineligible(
+      `指标“${measureLabel}”缺少可量化的同向变化或有效基期`,
+    );
   }
-
   const overallGrowth = totalPrevious !== 0
     ? totalDelta / Math.abs(totalPrevious)
     : 0;
@@ -5072,14 +5278,15 @@ function evaluateDiagnosticEvidence(
     ? undefined
     : Math.max(
         0,
-        1 - Math.abs(totalDelta - overviewDelta) / Math.max(Math.abs(overviewDelta), 1e-9),
+        1 - Math.abs(totalDelta - overviewDelta) /
+          Math.max(Math.abs(overviewDelta), 1e-9),
       );
-  const concentrated = top1ContributionShare >= 0.5;
-  const differentiated =
-    (top1.contributionLift ?? 0) >= 1.25 || maxGrowthRateDeviation >= 0.05;
   const reconciled = reconciliationRate == null || reconciliationRate >= 0.95;
-  const material = relativeMateriality >= 0.01;
-  const established = concentrated && differentiated && reconciled && material;
+  const established =
+    top1ContributionShare >= 0.5 &&
+    ((top1.contributionLift ?? 0) >= 1.25 || maxGrowthRateDeviation >= 0.05) &&
+    reconciled &&
+    relativeMateriality >= 0.01;
   const driverStrength = Math.max(
     0,
     Math.min(
@@ -5090,17 +5297,15 @@ function evaluateDiagnosticEvidence(
         (reconciled ? 0.1 : 0),
     ),
   );
-  return markAndReturn({
-    dimensionId,
-    dimensionLabel,
+  return {
     measureId,
     measureLabel,
     status: established
       ? "ESTABLISHED"
       : "INSUFFICIENT_EXPLANATORY_POWER",
     reason: established
-      ? `${top1.member}贡献占比为${(top1ContributionShare * 100).toFixed(1)}%，且相对基期份额或增速差异显著`
-      : `维度“${dimensionLabel}”未同时满足贡献集中、相对基期抬升和增速分化条件`,
+      ? `指标“${measureLabel}”中${top1.member}贡献占比为${(top1ContributionShare * 100).toFixed(1)}%，统一加权得分${(driverStrength * 100).toFixed(1)}分`
+      : `指标“${measureLabel}”未同时满足贡献集中、相对基期抬升和增速分化条件`,
     rowCount: grouped.size,
     reconciliationRate,
     relativeMateriality,
@@ -5111,8 +5316,7 @@ function evaluateDiagnosticEvidence(
     maxGrowthRateDeviation,
     driverStrength,
     dominantMembers: contributions.slice(0, 3),
-    nextCandidateRefs: [],
-  });
+  };
 }
 
 function satisfyAcceptanceCriteria(

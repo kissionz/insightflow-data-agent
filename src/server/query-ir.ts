@@ -2412,6 +2412,19 @@ function resolveNaturalTimeRange(
       mode: "FULL_PERIOD",
     };
   }
+  const anchoredMonth = text.match(/^(今年|本年|去年)(\d{1,2})月(?:份)?$/);
+  if (anchoredMonth) {
+    const parsedYear = anchoredMonth[1] === "去年" ? year - 1 : year;
+    const parsedMonth = Number(anchoredMonth[2]);
+    if (parsedMonth < 1 || parsedMonth > 12) {
+      throw new Error(`时间表达式“${expression}”中的月份无效`);
+    }
+    return {
+      start: dateText(parsedYear, parsedMonth, 1),
+      endExclusive: dateText(parsedYear, parsedMonth + 1, 1),
+      mode: "FULL_PERIOD",
+    };
+  }
   const recentDays = text.match(/^(?:近|最近)(\d{1,3})天$/);
   if (recentDays) {
     const count = Number(recentDays[1]);

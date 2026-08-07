@@ -14,7 +14,10 @@ import type {
 } from "montane-code";
 import { afterEach, describe, expect, it } from "vitest";
 import type { Conversation, Turn } from "../src/shared/types.js";
-import { DataAgentHarness } from "../src/server/harness.js";
+import {
+  DataAgentHarness,
+  resolveContextualMonthReferences,
+} from "../src/server/harness.js";
 import { Repository } from "../src/server/repository.js";
 import { testOntology } from "./fixtures.js";
 
@@ -25,6 +28,30 @@ afterEach(() => {
 });
 
 describe("DataAgentHarness", () => {
+  it("defaults a bare month to the current business year", () => {
+    const currentYear = Number(new Intl.DateTimeFormat("en-US", {
+      year: "numeric",
+      timeZone: "Asia/Shanghai",
+    }).format(new Date()));
+    const frame = resolveContextualMonthReferences(
+      {
+        originalQuestion: "7月份销售额为什么下降",
+        intentKind: "DIAGNOSTIC_ANALYSIS",
+        metricTerms: ["销售额"],
+        timeTerms: ["7月"],
+        objectTerms: ["订单"],
+        businessValueTerms: [],
+        groupingTerms: [],
+        calculationTerms: ["原因"],
+        presentation: { kind: "AUTO" },
+      },
+      createConversation(),
+      "turn_current",
+      "Asia/Shanghai",
+    );
+    expect(frame.timeTerms).toEqual([`${currentYear}年7月`]);
+  });
+
   it("reports missing CLI configuration without asking InsightFlow for an API key", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-harness-"));
     roots.push(root);
@@ -1375,6 +1402,166 @@ describe("DataAgentHarness", () => {
     repository.close();
   });
 
+  it("maps a bare follow-up month onto the previous turn year", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-harness-"));
+    roots.push(root);
+    const repository = new Repository(
+      path.join(root, ".montane/data-agent/ontology.sqlite"),
+    );
+    const ontology = ontologyWithGrossMargin();
+    repository.saveOntology(ontology);
+    repository.upsertScannedTables([{
+      id: "t_orders",
+      catalog: "internal",
+      database: "retail",
+      name: "fact_orders",
+      type: "TABLE",
+      status: "MODELED",
+      columns: [],
+      fingerprint: "fact_orders:contextual-month",
+      scannedAt: "2026-08-07T00:00:00.000Z",
+    }]);
+    repository.saveDataSource({
+      ...repository.getDataSource(),
+      configured: true,
+      host: "selectdb.test",
+      port: 9030,
+      username: "reader",
+      database: "retail",
+      catalog: "internal",
+      tls: false,
+      passwordStored: true,
+    });
+    const conversation = createConversation();
+    conversation.turns.push({
+      id: "turn_previous_year_anchor",
+      conversationId: conversation.id,
+      question: "2025年订单销售情况",
+      answer: "已返回2025年销售情况。",
+      status: "completed",
+      responseKind: "analysis",
+      createdAt: "2026-08-07T00:00:00.000Z",
+      completedAt: "2026-08-07T00:01:00.000Z",
+      ontologyVersion: ontology.version,
+      trace: [],
+    });
+    repository.saveConversation(conversation);
+    const parameters: unknown[][] = [];
+    const harness = new DataAgentHarness(
+      root,
+      repository,
+      async (_sql, _maxRows, queryParameters) => {
+        parameters.push(queryParameters ?? []);
+        return {
+          columns: ["月份", "成交金额", "成交金额基期值", "成交金额变化额", "成交金额变化率"],
+          rows: [{ 月份: "2025-07-01", 成交金额: 90, 成交金额基期值: 100, 成交金额变化额: -10, 成交金额变化率: -0.1 }],
+          durationMs: 8,
+          truncated: false,
+        };
+      },
+      () => runtimeFor(new ContextualMonthMontaneModel()),
+    );
+
+    await harness.run(
+      conversation,
+      {
+        id: "turn_contextual_month",
+        conversationId: conversation.id,
+        parentTurnId: "turn_previous_year_anchor",
+        question: "7月份为什么下降了",
+        status: "planning",
+        createdAt: "2026-08-07T00:02:00.000Z",
+        ontologyVersion: ontology.version,
+        trace: [],
+      },
+      { onTextDelta() {}, onTextEnd() {}, onToolStatus() {} },
+    );
+
+    expect(parameters).toHaveLength(1);
+    expect(parameters[0]).toEqual(expect.arrayContaining([
+      "2025-07-01 00:00:00",
+      "2025-08-01 00:00:00",
+      "2024-07-01 00:00:00",
+      "2024-08-01 00:00:00",
+    ]));
+    await harness.close();
+    repository.close();
+  });
+
+  it("stops after three consecutive planning failures and exposes the time error", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-harness-"));
+    roots.push(root);
+    const repository = new Repository(
+      path.join(root, ".montane/data-agent/ontology.sqlite"),
+    );
+    const ontology = ontologyWithGrossMargin();
+    repository.saveOntology(ontology);
+    repository.upsertScannedTables([{
+      id: "t_orders",
+      catalog: "internal",
+      database: "retail",
+      name: "fact_orders",
+      type: "TABLE",
+      status: "MODELED",
+      columns: [],
+      fingerprint: "fact_orders:retry-limit",
+      scannedAt: "2026-08-07T00:00:00.000Z",
+    }]);
+    repository.saveDataSource({
+      ...repository.getDataSource(),
+      configured: true,
+      host: "selectdb.test",
+      port: 9030,
+      username: "reader",
+      database: "retail",
+      catalog: "internal",
+      tls: false,
+      passwordStored: true,
+    });
+    const conversation = createConversation();
+    repository.saveConversation(conversation);
+    const errorCodes: string[] = [];
+    const harness = new DataAgentHarness(
+      root,
+      repository,
+      async () => {
+        throw new Error("unsupported time must fail before query execution");
+      },
+      () => runtimeFor(new RetryLimitedMontaneModel()),
+    );
+
+    await harness.run(
+      conversation,
+      {
+        id: "turn_retry_limit",
+        conversationId: conversation.id,
+        question: "火星月订单为什么下降",
+        status: "planning",
+        createdAt: new Date().toISOString(),
+        ontologyVersion: ontology.version,
+        trace: [],
+      },
+      {
+        onTextDelta() {},
+        onTextEnd() {},
+        onToolStatus(call, status, result) {
+          if (call.name !== "ExecuteAnalysisPlan" || status !== "failed") return;
+          errorCodes.push(String(
+            (JSON.parse(result?.content ?? "{}") as { code?: string }).code,
+          ));
+        },
+      },
+    );
+
+    expect(errorCodes).toEqual([
+      "TIME_RANGE_UNSUPPORTED",
+      "TIME_RANGE_UNSUPPORTED",
+      "ANALYSIS_RETRY_LIMIT_REACHED",
+    ]);
+    await harness.close();
+    repository.close();
+  });
+
   it("returns no dominant driver as a valid conclusion at the query budget", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-harness-"));
     roots.push(root);
@@ -1492,7 +1679,7 @@ describe("DataAgentHarness", () => {
     expect(output.acceptanceContract?.status).toBe("SATISFIED");
     expect(output.acceptanceContract?.criteria.find(
       (criterion) => criterion.kind === "DRIVERS",
-    )?.summary).toContain("没有枚举值同时满足");
+    )?.summary).toContain("没有发现满足硬门槛");
     await harness.close();
     repository.close();
   });
@@ -1508,6 +1695,7 @@ describe("DataAgentHarness", () => {
     order.properties.push(
       diagnosticProperty("p_channel", "channel", "渠道"),
       diagnosticProperty("p_brand", "brand", "品牌"),
+      numericMeasureProperty("p_sales_quantity", "sales_quantity", "销售数量"),
     );
     repository.saveOntology(ontology);
     repository.upsertScannedTables([{
@@ -1535,7 +1723,12 @@ describe("DataAgentHarness", () => {
     const conversation = createConversation();
     repository.saveConversation(conversation);
     const queries: string[] = [];
-    const evaluations: string[] = [];
+    const evaluations: Array<{
+      status?: string;
+      measureLabel?: string;
+      evaluatedMeasureCount?: number;
+      metricEvaluations?: Array<{ measureLabel?: string }>;
+    }> = [];
     const harness = new DataAgentHarness(
       root,
       repository,
@@ -1546,23 +1739,51 @@ describe("DataAgentHarness", () => {
         );
         if (!dimensionLabel) {
           return {
-            columns: ["成交金额", "成交金额基期值", "成交金额变化额", "成交金额变化率"],
-            rows: [{ 成交金额: 210, 成交金额基期值: 300, 成交金额变化额: -90, 成交金额变化率: -0.3 }],
+            columns: [
+              "成交金额",
+              "成交金额基期值",
+              "成交金额变化额",
+              "成交金额变化率",
+              "销售数量",
+              "销售数量基期值",
+              "销售数量变化额",
+              "销售数量变化率",
+            ],
+            rows: [{
+              成交金额: 210,
+              成交金额基期值: 300,
+              成交金额变化额: -90,
+              成交金额变化率: -0.3,
+              销售数量: 210,
+              销售数量基期值: 300,
+              销售数量变化额: -90,
+              销售数量变化率: -0.3,
+            }],
             durationMs: 8,
             truncated: false,
           };
         }
         const strong = queries.length === 3;
         return {
-          columns: [dimensionLabel, "成交金额", "成交金额基期值", "成交金额变化额", "成交金额变化率"],
+          columns: [
+            dimensionLabel,
+            "成交金额",
+            "成交金额基期值",
+            "成交金额变化额",
+            "成交金额变化率",
+            "销售数量",
+            "销售数量基期值",
+            "销售数量变化额",
+            "销售数量变化率",
+          ],
           rows: strong
             ? [
-                { [dimensionLabel]: "A", 成交金额: 20, 成交金额基期值: 100, 成交金额变化额: -80, 成交金额变化率: -0.8 },
-                { [dimensionLabel]: "B", 成交金额: 90, 成交金额基期值: 100, 成交金额变化额: -10, 成交金额变化率: -0.1 },
+                { [dimensionLabel]: "A", 成交金额: 240, 成交金额基期值: 300, 成交金额变化额: -60, 成交金额变化率: -0.2, 销售数量: 20, 销售数量基期值: 100, 销售数量变化额: -80, 销售数量变化率: -0.8 },
+                { [dimensionLabel]: "B", 成交金额: 120, 成交金额基期值: 150, 成交金额变化额: -30, 成交金额变化率: -0.2, 销售数量: 90, 销售数量基期值: 100, 销售数量变化额: -10, 销售数量变化率: -0.1 },
               ]
             : [
-                { [dimensionLabel]: "A", 成交金额: 240, 成交金额基期值: 300, 成交金额变化额: -60, 成交金额变化率: -0.2 },
-                { [dimensionLabel]: "B", 成交金额: 120, 成交金额基期值: 150, 成交金额变化额: -30, 成交金额变化率: -0.2 },
+                { [dimensionLabel]: "A", 成交金额: 240, 成交金额基期值: 300, 成交金额变化额: -60, 成交金额变化率: -0.2, 销售数量: 240, 销售数量基期值: 300, 销售数量变化额: -60, 销售数量变化率: -0.2 },
+                { [dimensionLabel]: "B", 成交金额: 120, 成交金额基期值: 150, 成交金额变化额: -30, 成交金额变化率: -0.2, 销售数量: 120, 销售数量基期值: 150, 销售数量变化额: -30, 销售数量变化率: -0.2 },
               ],
           durationMs: 8,
           truncated: false,
@@ -1588,18 +1809,31 @@ describe("DataAgentHarness", () => {
         onToolStatus(_call, status, result) {
           if (status !== "succeeded") return;
           const evaluation = (result?.data as {
-            diagnosticEvaluation?: { status?: string };
+            diagnosticEvaluation?: {
+              status?: string;
+              measureLabel?: string;
+              evaluatedMeasureCount?: number;
+              metricEvaluations?: Array<{ measureLabel?: string }>;
+            };
           } | undefined)?.diagnosticEvaluation;
-          if (evaluation?.status) evaluations.push(evaluation.status);
+          if (evaluation?.status) evaluations.push(evaluation);
         },
       },
     );
 
     expect(queries).toHaveLength(3);
-    expect(evaluations).toEqual([
+    expect(evaluations.map((evaluation) => evaluation.status)).toEqual([
       "INSUFFICIENT_EXPLANATORY_POWER",
       "ESTABLISHED",
     ]);
+    expect(evaluations[1]).toMatchObject({
+      measureLabel: "销售数量",
+      evaluatedMeasureCount: 3,
+    });
+    expect(evaluations[1]?.metricEvaluations?.map(
+      (evaluation) => evaluation.measureLabel,
+    )).toEqual(["成交金额", "销售数量", "成本金额"]);
+    expect(queries[1]).toContain("销售数量变化率");
     expect(output.acceptanceContract?.status).toBe("SATISFIED");
     expect(output.acceptanceContract?.criteria.find(
       (criterion) => criterion.kind === "DRIVERS",
@@ -1993,6 +2227,119 @@ class IncompleteExplorationMontaneModel implements ModelClient {
     options.onTextDelta?.(finalText);
     return { finalText, stopReason: "end_turn" };
   }
+}
+
+class ContextualMonthMontaneModel implements ModelClient {
+  readonly capabilities = {
+    contextWindow: 32_000,
+    maxOutputTokens: 2_000,
+    supportsStreaming: true,
+    supportsToolUse: true,
+    supportsImages: false,
+  };
+  private step = 0;
+
+  async complete(options: {
+    messages: AgentMessage[];
+    tools: Array<Record<string, unknown>>;
+    onTextDelta?: (delta: string) => void;
+  }): Promise<AgentResponse> {
+    this.step += 1;
+    if (this.step === 1) {
+      return toolResponse("context_month_frame", "SubmitQuestionFrame", {
+        original_question: "7月份为什么下降了",
+        intent_kind: "DIAGNOSTIC_ANALYSIS",
+        metric_terms: ["成交金额"],
+        time_terms: ["7月"],
+        object_terms: ["订单"],
+        business_value_terms: [],
+        grouping_terms: [],
+        calculation_terms: ["同比", "原因"],
+        presentation: { kind: "AUTO" },
+      });
+    }
+    if (this.step === 2) {
+      return toolResponse("context_month_ontology", "OntologySearch", {
+        query: "7月份订单成交金额为什么下降",
+      });
+    }
+    if (this.step === 3) {
+      return toolResponse("context_month_space", "DiscoverAnalysisSpace", {
+        objective: "7月份订单成交金额为什么下降",
+        object_ids: ["o_order"],
+      });
+    }
+    if (this.step === 4) {
+      return toolResponse("context_month_plan", "ExecuteAnalysisPlan", evidenceRequest({
+        title: "7月份成交金额现象确认",
+      }));
+    }
+    const finalText = "已完成明确年份映射后的现象确认。";
+    options.onTextDelta?.(finalText);
+    return { finalText, stopReason: "end_turn" };
+  }
+}
+
+class RetryLimitedMontaneModel implements ModelClient {
+  readonly capabilities = {
+    contextWindow: 32_000,
+    maxOutputTokens: 2_000,
+    supportsStreaming: true,
+    supportsToolUse: true,
+    supportsImages: false,
+  };
+  private step = 0;
+
+  async complete(options: {
+    messages: AgentMessage[];
+    tools: Array<Record<string, unknown>>;
+    onTextDelta?: (delta: string) => void;
+  }): Promise<AgentResponse> {
+    this.step += 1;
+    if (this.step === 1) {
+      return toolResponse("retry_frame", "SubmitQuestionFrame", {
+        original_question: "火星月订单为什么下降",
+        intent_kind: "DIAGNOSTIC_ANALYSIS",
+        metric_terms: ["成交金额"],
+        time_terms: ["火星月"],
+        object_terms: ["订单"],
+        business_value_terms: [],
+        grouping_terms: [],
+        calculation_terms: ["原因"],
+        presentation: { kind: "AUTO" },
+      });
+    }
+    if (this.step === 2) {
+      return toolResponse("retry_ontology", "OntologySearch", {
+        query: "火星月订单成交金额为什么下降",
+      });
+    }
+    if (this.step === 3) {
+      return toolResponse("retry_space", "DiscoverAnalysisSpace", {
+        objective: "火星月订单成交金额为什么下降",
+        object_ids: ["o_order"],
+      });
+    }
+    if ([4, 5, 6].includes(this.step)) {
+      return toolResponse(`retry_plan_${this.step}`, "ExecuteAnalysisPlan", evidenceRequest({
+        title: "无效时间重试",
+      }));
+    }
+    const finalText = "时间条件未通过校验，已在重试上限内停止。";
+    options.onTextDelta?.(finalText);
+    return { finalText, stopReason: "end_turn" };
+  }
+}
+
+function toolResponse(
+  id: string,
+  name: string,
+  args: Record<string, unknown>,
+): AgentResponse {
+  return {
+    toolCalls: [{ id: `call_${id}`, name, args }],
+    stopReason: "tool_use",
+  };
 }
 
 class BudgetLimitedDiagnosticMontaneModel implements ModelClient {
@@ -2639,6 +2986,31 @@ function diagnosticProperty(id: string, name: string, label: string) {
     meaning: "CATEGORY" as const,
     unique: false,
     valueSearchable: true,
+    visibility: "ANALYTICAL" as const,
+    synonyms: [],
+    defaultDisplay: true,
+    exportable: true,
+    bindingPriority: 50,
+  };
+}
+
+function numericMeasureProperty(id: string, name: string, label: string) {
+  return {
+    id,
+    name,
+    label,
+    description: `${label}可加指标`,
+    dataType: "DECIMAL",
+    sourceColumn: name,
+    sensitive: false,
+    meaning: "NUMBER" as const,
+    unique: false,
+    valueSearchable: false,
+    numericSpec: {
+      kind: "COUNT" as const,
+      defaultAggregation: "SUM" as const,
+      aggregationBehavior: "ADDITIVE" as const,
+    },
     visibility: "ANALYTICAL" as const,
     synonyms: [],
     defaultDisplay: true,

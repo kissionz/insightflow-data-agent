@@ -63,11 +63,44 @@ export type QueryFilterOperator =
 
 export type TimeGrain = "DAY" | "WEEK" | "MONTH" | "QUARTER" | "YEAR";
 
+export type TimeRangeKind =
+  | "NONE"
+  | "TODAY"
+  | "YESTERDAY"
+  | "CURRENT_WEEK"
+  | "PREVIOUS_WEEK"
+  | "CURRENT_MONTH"
+  | "PREVIOUS_MONTH"
+  | "CURRENT_QUARTER"
+  | "PREVIOUS_QUARTER"
+  | "CURRENT_YEAR"
+  | "PREVIOUS_YEAR"
+  | "ABSOLUTE_YEAR"
+  | "ABSOLUTE_MONTH"
+  | "CONTEXT_MONTH"
+  | "ROLLING_PERIODS"
+  | "LAST_N_COMPLETE_PERIODS"
+  | "ABSOLUTE_RANGE";
+
+export interface StructuredTimeRange {
+  kind: TimeRangeKind;
+  originalText?: string;
+  year?: number;
+  month?: number;
+  count?: number;
+  unit?: TimeGrain;
+  start?: string;
+  endExclusive?: string;
+}
+
 export interface QuestionLanguageFrame {
   originalQuestion: string;
   intentKind: "DIRECT_QUERY" | "EXPLORATORY_ANALYSIS" | "DIAGNOSTIC_ANALYSIS";
   metricTerms: string[];
+  /** Original user spans retained for audit only; execution uses timeRange/timeGrain. */
   timeTerms: string[];
+  timeRange?: StructuredTimeRange;
+  timeGrain?: TimeGrain;
   objectTerms: string[];
   businessValueTerms: string[];
   groupingTerms: string[];
@@ -374,9 +407,14 @@ export interface AnalysisIntent {
   timeRange?: {
     expression: string;
     propertyId?: string;
+    kind?: TimeRangeKind;
     mode?: "AUTO" | "ROLLING" | "LAST_N_COMPLETE_PERIODS";
     count?: number;
     unit?: TimeGrain;
+    year?: number;
+    month?: number;
+    start?: string;
+    endExclusive?: string;
   };
   timeGrain?: {
     unit: TimeGrain;

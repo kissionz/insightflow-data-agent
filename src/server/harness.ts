@@ -28,6 +28,7 @@ import type {
   OntologySnapshot,
   QuestionLanguageFrame,
   ResultArtifact,
+  StructuredTimeRange,
   TimeGrain,
   Turn,
 } from "../shared/types.js";
@@ -50,16 +51,16 @@ const DATA_AGENT_SYSTEM_PROMPT = `
 必须遵循以下执行协议：
 1. 先判断用户是在打招呼、询问能力，还是提出数据分析请求。
 2. 打招呼或询问能力时直接简短回答，不调用数据工具，不生成图表或业务结论。
-3. 数据分析请求必须先单独调用一次 SubmitQuestionFrame，把原问题按分析类型、时间、指标、对象、完整业务值、分组、计算方式和展现方式结构化；不得把具体商品名、组织名等业务值放进 object_terms，不得并行调用后续工具，也不得在同一轮重复提交或改写问题框架。
+3. 数据分析请求必须先单独调用一次 SubmitQuestionFrame，把原问题按分析类型、时间、指标、对象、完整业务值、分组、计算方式和展现方式结构化；time_terms 只保留用户原始时间片段用于审计，必须把时间范围归一化为 time_range.kind、把展示粒度归一化为 time_grain，不得把“今年、每个月”等范围与粒度拼成一个范围；不得把具体商品名、组织名等业务值放进 object_terms，不得并行调用后续工具，也不得在同一轮重复提交或改写问题框架。
 4. 随后只调用一次 OntologySearch。业务值短语不参与属性名称词形检索；OntologySearch 的词形匹配只是候选证据，不能证明用户词一定是属性名称。若明确指标没有候选，应澄清或提示发布草稿，不得改写同义词重复搜索。
 4.1 intent_kind 只定义本轮验收标准，不限制工具和查询轮数。未指定单一指标、需要补充分析空间或现有证据无法关闭验收缺口时，可以在 OntologySearch 后调用一次 DiscoverAnalysisSpace，查看候选事实对象下已发布的指标、受控数字属性、时间和诊断维度。不得把“销售表现”等主题词伪造成正式指标。
 5. question_frame.business_value_terms 中的每个完整短语都必须且只能调用 PropertyValueSearch。不得把指标名、计算词或自己扩展的近义词提交为属性值。具体值的真实字段归属以全局已发布值索引为准。工具返回 resolved 时，后续只能把 selectedMatch.planningRef 的 B* 句柄放入 binding_refs，不得重新选择字段或改写值；返回 ambiguous 时必须让用户澄清。
 6. 你不能生成 SQL，也不能提交本体内部长 ID。完成语义理解后调用 ExecuteAnalysisPlan，只使用最近工具结果 planningReferences 中的 M*/D* 短句柄。measure_refs 是唯一必填项；用户一次询问多个指标时，必须把全部指标同时放入同一个 measure_refs 数组，不得拆成互不必要的多轮查询。
-6.1 ExecuteAnalysisPlan 是最小 Evidence Request：仅在确实需要分组、指定时间粒度、排序、限制行数或执行工具 schema 当前明确开放的高级计算时，提交对应可选字段。根对象、全部已解析业务值、常规时间、同比、环比、占比、指标阈值、标题、结果类型、分析步骤和验收项由服务端确定性补齐。
+6.1 ExecuteAnalysisPlan 是最小 Evidence Request：仅在确实需要分组、排序、限制行数或执行工具 schema 当前明确开放的高级计算时，提交对应可选字段。时间范围与粒度完全来自已提交的规范化问题框架；根对象、全部已解析业务值、常规时间、同比、环比、占比、指标阈值、标题、结果类型、分析步骤和验收项由服务端确定性补齐。
 7. 不得提交空数组、AUTO、0、空字符串、解释性 rationale 或工具 schema 未提供的字段；能省略的默认项必须省略。
 8. 只有临时复合计算、主动诊断算法、组内占比、排名、累计、移动平均、组内 Top N 或跨期间集合条件需要 operations。operation 使用短句柄作为 input_refs/partition_refs，并用 C1、C2 等引用本请求内前序计算；正式复合指标直接选择对应 M*，不要重复构建公式。
 8.1 同比使用 YEAR_OVER_YEAR，环比使用 PREVIOUS_PERIOD；占全体比例使用 PERCENT_OF_TOTAL，组内占比使用 PERCENT_OF_PARTITION；占比固定在业务筛选之后、排序和 Top N 之前计算，禁止用同一指标除以自身模拟占比。
-8.2 “今年、本月、本季度、本周”等未结束自然周期按截至当前日期处理；同比和环比由 IR 生成同进度基期。
+8.2 time_range.kind 使用 CURRENT_YEAR、PREVIOUS_YEAR、CURRENT_MONTH 等有限语义枚举；不同自然语言说法由你归一化到这些语义，不得要求服务端逐句匹配。“今年、本月、本季度、本周”等未结束自然周期按截至当前日期处理；同比和环比由 IR 生成同进度基期。
 8.3 “每个类目最高的SPU”“各区域前3名”使用 GROUP_TOP_N/GROUP_BOTTOM_N；“每期都/任意期/至少N期”使用 PERIOD_CONDITION。不得根据截断结果人工归并。
 9. ExecuteAnalysisPlan 是唯一查询入口。服务端 Plan Synthesizer 把紧凑请求确定性展开成强类型 IR，校验关系、粒度、可加性、筛选逻辑和窗口计算，再编译参数化 Doris SQL 并执行。
 9.1 SubmitQuestionFrame 返回 acceptanceContract。所有分析类型共用同一个受控查询循环和四条成功查询预算；意图不能把明确问数限制为一条查询，也不能强制探索分析执行多条查询。
@@ -438,7 +439,62 @@ export class DataAgentHarness {
               "明确指标问数用 DIRECT_QUERY；未指定单一指标、要求整体表现或开放探索用 EXPLORATORY_ANALYSIS；询问原因、异常或驱动因素用 DIAGNOSTIC_ANALYSIS",
           },
           metric_terms: { type: "array", items: { type: "string" } },
-          time_terms: { type: "array", items: { type: "string" } },
+          time_terms: {
+            type: "array",
+            items: { type: "string" },
+            description:
+              "仅原样保留用户的时间片段用于审计，不参与查询构造；范围和粒度必须分别提交到 time_range 与 time_grain",
+          },
+          time_range: {
+            type: "object",
+            additionalProperties: false,
+            description:
+              "把任意自然语言时间范围归一化为有限语义。没有时间范围时使用 NONE；不要把按月、逐日等粒度词放进范围",
+            properties: {
+              kind: {
+                type: "string",
+                enum: [
+                  "NONE",
+                  "TODAY",
+                  "YESTERDAY",
+                  "CURRENT_WEEK",
+                  "PREVIOUS_WEEK",
+                  "CURRENT_MONTH",
+                  "PREVIOUS_MONTH",
+                  "CURRENT_QUARTER",
+                  "PREVIOUS_QUARTER",
+                  "CURRENT_YEAR",
+                  "PREVIOUS_YEAR",
+                  "ABSOLUTE_YEAR",
+                  "ABSOLUTE_MONTH",
+                  "CONTEXT_MONTH",
+                  "ROLLING_PERIODS",
+                  "LAST_N_COMPLETE_PERIODS",
+                  "ABSOLUTE_RANGE",
+                ],
+              },
+              original_text: {
+                type: "string",
+                description: "用户表达范围的原始片段，例如今年、2025年、近6个月",
+              },
+              year: { type: "integer", minimum: 1, maximum: 9999 },
+              month: { type: "integer", minimum: 1, maximum: 12 },
+              count: { type: "integer", minimum: 1, maximum: 366 },
+              unit: {
+                type: "string",
+                enum: ["DAY", "WEEK", "MONTH", "QUARTER", "YEAR"],
+              },
+              start: { type: "string", description: "YYYY-MM-DD" },
+              end_exclusive: { type: "string", description: "YYYY-MM-DD，不包含该日" },
+            },
+            required: ["kind"],
+          },
+          time_grain: {
+            type: "string",
+            enum: ["NONE", "DAY", "WEEK", "MONTH", "QUARTER", "YEAR"],
+            description:
+              "用户要求的展示/分组粒度；例如每个月、逐月、月度趋势都归一化为 MONTH，没有粒度时使用 NONE",
+          },
           object_terms: {
             type: "array",
             items: { type: "string" },
@@ -471,6 +527,8 @@ export class DataAgentHarness {
           "intent_kind",
           "metric_terms",
           "time_terms",
+          "time_range",
+          "time_grain",
           "object_terms",
           "business_value_terms",
           "grouping_terms",
@@ -492,6 +550,18 @@ export class DataAgentHarness {
             : [];
         const rawPresentation =
           (args.presentation as Record<string, unknown> | undefined) ?? {};
+        let timeRange: StructuredTimeRange;
+        try {
+          timeRange = parseStructuredTimeRange(
+            (args.time_range as Record<string, unknown> | undefined) ?? { kind: "NONE" },
+          );
+        } catch (error) {
+          return {
+            ok: false,
+            content: `时间语义结构无效：${error instanceof Error ? error.message : String(error)}`,
+          };
+        }
+        const rawTimeGrain = String(args.time_grain ?? "NONE");
         const businessValueTerms = list("business_value_terms");
         const businessValues = new Set(
           businessValueTerms.map(normalizePropertyValue),
@@ -506,6 +576,12 @@ export class DataAgentHarness {
             : "DIRECT_QUERY",
           metricTerms: list("metric_terms"),
           timeTerms: list("time_terms"),
+          timeRange,
+          timeGrain: ["DAY", "WEEK", "MONTH", "QUARTER", "YEAR"].includes(
+            rawTimeGrain,
+          )
+            ? rawTimeGrain as TimeGrain
+            : undefined,
           objectTerms: list("object_terms").filter(
             (term) => !businessValues.has(normalizePropertyValue(term)),
           ),
@@ -2893,12 +2969,6 @@ function buildEvidenceRequestSchema(
             ? "归因分析一次只验证一个服务端排序后的候选维度；解释力不足后 schema 会开放下一个候选"
             : "仅在用户明确要求分组时提交",
       },
-      time_grain: {
-        type: "string",
-        description:
-          "仅当用户问题或后续证据补充确实需要显式粒度时提交；否则由服务端推导",
-        enum: ["DAY", "WEEK", "MONTH", "QUARTER", "YEAR"],
-      },
       ...operationSchema,
       sort_ref: {
         type: "string",
@@ -3339,7 +3409,7 @@ function synthesizeAnalysisPlan(
     },
   );
 
-  const requestedTimeGrain = String(args.time_grain ?? "AUTO");
+  const legacyRequestedTimeGrain = String(args.time_grain ?? "AUTO");
   const sortRef = String(args.sort_ref ?? "AUTO");
   const sortDirection =
     args.sort_direction === "ASC"
@@ -3386,17 +3456,18 @@ function synthesizeAnalysisPlan(
     dimension_property_ids: dimensionIds,
     filters,
     aggregate_filters: aggregateFilters,
-    time_range: frame.timeTerms.length
-      ? { expression: frame.timeTerms.join("、") }
-      : comparisonKind
-        ? { expression: "今年" }
-        : undefined,
-    time_grain:
-      requestedTimeGrain === "AUTO"
-        ? comparisonKind
+    time_range:
+      synthesizeStructuredTimeRange(frame) ??
+      (comparisonKind
+        ? { expression: "今年", kind: "CURRENT_YEAR" as const }
+        : undefined),
+    time_grain: frame.timeGrain
+      ? { unit: frame.timeGrain }
+      : legacyRequestedTimeGrain !== "AUTO"
+        ? { unit: legacyRequestedTimeGrain as TimeGrain }
+        : comparisonKind
           ? { unit: inferAutomaticTimeGrain(frame) }
-          : undefined
-        : { unit: requestedTimeGrain },
+          : undefined,
     derived_calculations: derivedCalculations,
     time_comparisons: timeComparisons,
     window_calculations: windowCalculations,
@@ -3424,7 +3495,66 @@ function synthesizeAnalysisPlan(
   };
 }
 
+function synthesizeStructuredTimeRange(
+  frame: QuestionLanguageFrame,
+): AnalysisIntent["timeRange"] | undefined {
+  const range = frame.timeRange;
+  if (!range) {
+    return frame.timeTerms.length
+      ? { expression: frame.timeTerms.join("、") }
+      : undefined;
+  }
+  if (range.kind === "NONE") return undefined;
+  if (range.kind === "CONTEXT_MONTH") {
+    throw new Error("上下文月份尚未解析到明确年份");
+  }
+  const expression = range.originalText ?? canonicalTimeRangeLabel(range);
+  return {
+    expression,
+    kind: range.kind,
+    ...(range.year ? { year: range.year } : {}),
+    ...(range.month ? { month: range.month } : {}),
+    ...(range.count ? { count: range.count } : {}),
+    ...(range.unit ? { unit: range.unit } : {}),
+    ...(range.start ? { start: range.start } : {}),
+    ...(range.endExclusive ? { endExclusive: range.endExclusive } : {}),
+    ...(range.kind === "ROLLING_PERIODS" ? { mode: "ROLLING" as const } : {}),
+    ...(range.kind === "LAST_N_COMPLETE_PERIODS"
+      ? { mode: "LAST_N_COMPLETE_PERIODS" as const }
+      : {}),
+  };
+}
+
+function canonicalTimeRangeLabel(range: StructuredTimeRange): string {
+  const labels: Partial<Record<StructuredTimeRange["kind"], string>> = {
+    TODAY: "今天",
+    YESTERDAY: "昨天",
+    CURRENT_WEEK: "本周",
+    PREVIOUS_WEEK: "上周",
+    CURRENT_MONTH: "本月",
+    PREVIOUS_MONTH: "上月",
+    CURRENT_QUARTER: "本季度",
+    PREVIOUS_QUARTER: "上季度",
+    CURRENT_YEAR: "今年",
+    PREVIOUS_YEAR: "去年",
+  };
+  if (labels[range.kind]) return labels[range.kind]!;
+  if (range.kind === "ABSOLUTE_YEAR") return `${range.year}年`;
+  if (range.kind === "ABSOLUTE_MONTH") return `${range.year}年${range.month}月`;
+  if (range.kind === "ABSOLUTE_RANGE") {
+    return `${range.start}至${range.endExclusive}`;
+  }
+  if (range.kind === "ROLLING_PERIODS") {
+    return `近${range.count}${range.unit}`;
+  }
+  if (range.kind === "LAST_N_COMPLETE_PERIODS") {
+    return `近${range.count}个完整${range.unit}`;
+  }
+  return range.originalText ?? range.kind;
+}
+
 function inferComparisonTimeGrain(frame: QuestionLanguageFrame): TimeGrain {
+  if (frame.timeGrain) return frame.timeGrain;
   const text = `${frame.timeTerms.join(" ")} ${frame.originalQuestion}`;
   if (/本周|上周|周/.test(text)) return "WEEK";
   if (/本月|上月|月/.test(text)) return "MONTH";
@@ -3433,6 +3563,7 @@ function inferComparisonTimeGrain(frame: QuestionLanguageFrame): TimeGrain {
 }
 
 function inferAutomaticTimeGrain(frame: QuestionLanguageFrame): TimeGrain {
+  if (frame.timeGrain) return frame.timeGrain;
   const text = `${frame.timeTerms.join(" ")} ${frame.originalQuestion}`;
   if (/年|今年|去年/.test(text) || frame.intentKind === "EXPLORATORY_ANALYSIS") {
     return "MONTH";
@@ -3746,6 +3877,11 @@ function normalizeAnalysisIntent(
           propertyId: rawTime.property_id
             ? String(rawTime.property_id)
             : undefined,
+          kind: rawTime.kind
+            ? String(rawTime.kind) as NonNullable<
+                AnalysisIntent["timeRange"]
+              >["kind"]
+            : undefined,
           mode: rawTime.mode
             ? String(rawTime.mode) as NonNullable<
                 AnalysisIntent["timeRange"]
@@ -3758,6 +3894,14 @@ function normalizeAnalysisIntent(
                 AnalysisIntent["timeRange"]
               >["unit"]
             : undefined,
+          year: rawTime.year == null ? undefined : Number(rawTime.year),
+          month: rawTime.month == null ? undefined : Number(rawTime.month),
+          start: rawTime.start ? String(rawTime.start) : undefined,
+          endExclusive: rawTime.endExclusive
+            ? String(rawTime.endExclusive)
+            : rawTime.end_exclusive
+              ? String(rawTime.end_exclusive)
+              : undefined,
         }
       : undefined,
     timeGrain: rawTimeGrain?.unit
@@ -4166,6 +4310,7 @@ function escapeRegExp(value: string): string {
 function inferTimeGrain(
   frame: QuestionLanguageFrame,
 ): NonNullable<AnalysisIntent["timeGrain"]>["unit"] | undefined {
+  if (frame.timeGrain) return frame.timeGrain;
   const groupingText = frame.groupingTerms.join(" ");
   const explicitText = `${groupingText} ${frame.originalQuestion}`;
   if (/(按日|逐日|每日|每天|日度)/.test(explicitText)) return "DAY";
@@ -4666,12 +4811,123 @@ function normalizePropertyValue(value: string): string {
   return value.trim().toLocaleLowerCase("zh-CN").replace(/\s+/g, " ");
 }
 
+function parseStructuredTimeRange(
+  raw: Record<string, unknown>,
+): StructuredTimeRange {
+  const kinds = new Set<StructuredTimeRange["kind"]>([
+    "NONE",
+    "TODAY",
+    "YESTERDAY",
+    "CURRENT_WEEK",
+    "PREVIOUS_WEEK",
+    "CURRENT_MONTH",
+    "PREVIOUS_MONTH",
+    "CURRENT_QUARTER",
+    "PREVIOUS_QUARTER",
+    "CURRENT_YEAR",
+    "PREVIOUS_YEAR",
+    "ABSOLUTE_YEAR",
+    "ABSOLUTE_MONTH",
+    "CONTEXT_MONTH",
+    "ROLLING_PERIODS",
+    "LAST_N_COMPLETE_PERIODS",
+    "ABSOLUTE_RANGE",
+  ]);
+  const kind = String(raw.kind ?? "NONE") as StructuredTimeRange["kind"];
+  if (!kinds.has(kind)) throw new Error(`不支持的规范化时间范围类型：${kind}`);
+  const originalText = String(raw.original_text ?? "").trim() || undefined;
+  const integer = (key: string): number | undefined => {
+    if (raw[key] == null) return undefined;
+    const value = Number(raw[key]);
+    if (!Number.isInteger(value)) throw new Error(`time_range.${key} 必须是整数`);
+    return value;
+  };
+  const year = integer("year");
+  const month = integer("month");
+  const count = integer("count");
+  const rawUnit = String(raw.unit ?? "");
+  const unit = ["DAY", "WEEK", "MONTH", "QUARTER", "YEAR"].includes(rawUnit)
+    ? rawUnit as TimeGrain
+    : undefined;
+
+  if (kind === "ABSOLUTE_YEAR" && (!year || year < 1 || year > 9999)) {
+    throw new Error("ABSOLUTE_YEAR 必须提供有效 year");
+  }
+  if (
+    (kind === "ABSOLUTE_MONTH" || kind === "CONTEXT_MONTH") &&
+    (!month || month < 1 || month > 12)
+  ) {
+    throw new Error(`${kind} 必须提供 1 到 12 的 month`);
+  }
+  if (kind === "ABSOLUTE_MONTH" && (!year || year < 1 || year > 9999)) {
+    throw new Error("ABSOLUTE_MONTH 必须提供有效 year");
+  }
+  if (
+    (kind === "ROLLING_PERIODS" || kind === "LAST_N_COMPLETE_PERIODS") &&
+    (!count || count < 1 || count > 366 || !unit)
+  ) {
+    throw new Error(`${kind} 必须提供 count（1 到 366）和 unit`);
+  }
+  const start = String(raw.start ?? "").trim() || undefined;
+  const endExclusive = String(raw.end_exclusive ?? "").trim() || undefined;
+  if (
+    kind === "ABSOLUTE_RANGE" &&
+    (!isIsoDate(start) || !isIsoDate(endExclusive) || start! >= endExclusive!)
+  ) {
+    throw new Error("ABSOLUTE_RANGE 必须提供有效且递增的 start/end_exclusive（YYYY-MM-DD）");
+  }
+  return {
+    kind,
+    originalText,
+    ...(year ? { year } : {}),
+    ...(month ? { month } : {}),
+    ...(count ? { count } : {}),
+    ...(unit ? { unit } : {}),
+    ...(start ? { start } : {}),
+    ...(endExclusive ? { endExclusive } : {}),
+  };
+}
+
+function isIsoDate(value: string | undefined): value is string {
+  if (!value || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const date = new Date(`${value}T00:00:00.000Z`);
+  return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === value;
+}
+
 export function resolveContextualMonthReferences(
   frame: QuestionLanguageFrame,
   conversation: Conversation,
   currentTurnId: string,
   timezone: string,
 ): QuestionLanguageFrame {
+  if (frame.timeRange?.kind === "CONTEXT_MONTH" && frame.timeRange.month) {
+    const currentYear = Number(
+      new Intl.DateTimeFormat("en-US", {
+        year: "numeric",
+        timeZone: timezone,
+      }).format(new Date()),
+    );
+    const explicitYear = frame.originalQuestion.match(/(20\d{2})年/)?.[1];
+    const previousAnchor = [...conversation.turns]
+      .reverse()
+      .filter((turn) => turn.id !== currentTurnId)
+      .map((turn) => extractYearAnchor(turn.question, currentYear))
+      .find((year): year is number => year != null);
+    const anchorYear = explicitYear ? Number(explicitYear) : previousAnchor ?? currentYear;
+    return {
+      ...frame,
+      timeRange: {
+        ...frame.timeRange,
+        kind: "ABSOLUTE_MONTH",
+        year: anchorYear,
+      },
+      timeTerms: frame.timeTerms.map((term) =>
+        /^\d{1,2}月(?:份)?$/.test(term.trim())
+          ? `${anchorYear}年${frame.timeRange!.month}月`
+          : term
+      ),
+    };
+  }
   const bareMonthPattern = /^(\d{1,2})月(?:份)?$/;
   if (!frame.timeTerms.some((term) => bareMonthPattern.test(term.trim()))) {
     return frame;

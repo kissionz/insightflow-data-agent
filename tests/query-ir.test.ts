@@ -4,7 +4,7 @@ import { QueryIrCompiler } from "../src/server/query-ir.js";
 import { testOntology } from "./fixtures.js";
 
 describe("QueryIrCompiler", () => {
-  it("compiles governed IDs and natural time into parameterized Doris SQL", () => {
+  it("compiles governed IDs and canonical time into parameterized Doris SQL", () => {
     const ontology = structuredClone(testOntology);
     const order = ontology.objects[0];
     order.defaultTimePropertyId = "p_paid_at";
@@ -54,7 +54,7 @@ describe("QueryIrCompiler", () => {
           value: "ONLINE",
         },
       ],
-      timeRange: { expression: "今年" },
+      timeRange: { expression: "本年度到现在", kind: "CURRENT_YEAR" },
       resultKind: "aggregate",
       title: "今年线上渠道销售额",
     };
@@ -73,7 +73,7 @@ describe("QueryIrCompiler", () => {
     ]);
     expect(compiled.ir.timeRange).toMatchObject({
       propertyId: "p_paid_at",
-      expression: "今年",
+      expression: "本年度到现在",
       mode: "TO_DATE",
     });
     expect(compiled.bindings).toContainEqual(

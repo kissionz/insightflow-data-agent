@@ -282,6 +282,8 @@ class HarnessTurnReporter implements AgentReporter {
               intentKind?: string;
               metricTerms?: string[];
               timeTerms?: string[];
+              timeRange?: { kind?: string; originalText?: string };
+              timeGrain?: string;
               objectTerms?: string[];
               businessValueTerms?: string[];
               groupingTerms?: string[];
@@ -300,7 +302,14 @@ class HarnessTurnReporter implements AgentReporter {
             : [],
         ],
         ["指标", frame?.metricTerms],
-        ["时间", frame?.timeTerms],
+        ["时间原文", frame?.timeTerms],
+        [
+          "时间范围",
+          frame?.timeRange?.kind
+            ? [`${frame.timeRange.kind}${frame.timeRange.originalText ? `（${frame.timeRange.originalText}）` : ""}`]
+            : [],
+        ],
+        ["时间粒度", frame?.timeGrain ? [frame.timeGrain] : []],
         ["对象词（待绑定）", frame?.objectTerms],
         ["业务值", frame?.businessValueTerms],
         ["分组", frame?.groupingTerms],

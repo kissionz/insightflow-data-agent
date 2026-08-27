@@ -39,6 +39,7 @@ describe("DataAgentHarness", () => {
         intentKind: "DIAGNOSTIC_ANALYSIS",
         metricTerms: ["销售额"],
         timeTerms: ["7月"],
+        timeRange: { kind: "CONTEXT_MONTH", originalText: "7月", month: 7 },
         objectTerms: ["订单"],
         businessValueTerms: [],
         groupingTerms: [],
@@ -50,6 +51,11 @@ describe("DataAgentHarness", () => {
       "Asia/Shanghai",
     );
     expect(frame.timeTerms).toEqual([`${currentYear}年7月`]);
+    expect(frame.timeRange).toMatchObject({
+      kind: "ABSOLUTE_MONTH",
+      year: currentYear,
+      month: 7,
+    });
   });
 
   it("reports missing CLI configuration without asking InsightFlow for an API key", async () => {
@@ -577,7 +583,7 @@ describe("DataAgentHarness", () => {
     repository.close();
   });
 
-  it("deterministically restores monthly grain when Montane omits time_grain", async () => {
+  it("separates current-year range from monthly grain without reparsing time terms", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-harness-"));
     roots.push(root);
     const repository = new Repository(
@@ -628,11 +634,13 @@ describe("DataAgentHarness", () => {
     const conversation = createConversation();
     repository.saveConversation(conversation);
     const queries: string[] = [];
+    const parameters: unknown[][] = [];
     const harness = new DataAgentHarness(
       root,
       repository,
-      async (sql) => {
+      async (sql, _maxRows, queryParameters) => {
         queries.push(sql);
+        parameters.push(queryParameters ?? []);
         return {
           columns: ["月份", "成交金额"],
           rows: [{ 月份: "2026-01-01", 成交金额: 100 }],
@@ -648,7 +656,7 @@ describe("DataAgentHarness", () => {
       {
         id: "turn_monthly_grain",
         conversationId: conversation.id,
-        question: "今年销售额按月看",
+        question: "今年每个月的销售额",
         status: "planning",
         createdAt: new Date().toISOString(),
         ontologyVersion: ontology.version,
@@ -664,6 +672,9 @@ describe("DataAgentHarness", () => {
     expect(output.responseKind).toBe("analysis");
     expect(queries[0]).toContain("DATE_TRUNC(t0.`paid_at`, 'month')");
     expect(queries[0]).not.toContain("GROUP BY t0.`paid_at`");
+    const currentYear = new Date().getFullYear();
+    expect(parameters[0]?.[0]).toBe(`${currentYear}-01-01 00:00:00`);
+    expect(parameters[0]).not.toContain("今年、每个月");
     await harness.close();
     repository.close();
   });
@@ -984,6 +995,8 @@ describe("DataAgentHarness", () => {
       intent_kind: "EXPLORATORY_ANALYSIS",
       metric_terms: [],
       time_terms: ["今年"],
+      time_range: { kind: "CURRENT_YEAR", original_text: "今年" },
+      time_grain: "NONE",
       object_terms: ["商品", "舒敏保湿特护霜"],
       business_value_terms: ["舒敏保湿特护霜"],
       grouping_terms: [],
@@ -1447,6 +1460,7 @@ describe("DataAgentHarness", () => {
     });
     repository.saveConversation(conversation);
     const parameters: unknown[][] = [];
+    const failures: string[] = [];
     const harness = new DataAgentHarness(
       root,
       repository,
@@ -1474,10 +1488,16 @@ describe("DataAgentHarness", () => {
         ontologyVersion: ontology.version,
         trace: [],
       },
-      { onTextDelta() {}, onTextEnd() {}, onToolStatus() {} },
+      {
+        onTextDelta() {},
+        onTextEnd() {},
+        onToolStatus(call, status, result) {
+          if (status === "failed") failures.push(`${call.name}: ${result?.content ?? ""}`);
+        },
+      },
     );
 
-    expect(parameters).toHaveLength(1);
+    expect(parameters, failures.join("\n")).toHaveLength(1);
     expect(parameters[0]).toEqual(expect.arrayContaining([
       "2025-07-01 00:00:00",
       "2025-08-01 00:00:00",
@@ -1488,76 +1508,50 @@ describe("DataAgentHarness", () => {
     repository.close();
   });
 
-  it("stops after three consecutive planning failures and exposes the time error", async () => {
+  it("rejects malformed canonical time before query planning", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-harness-"));
     roots.push(root);
     const repository = new Repository(
       path.join(root, ".montane/data-agent/ontology.sqlite"),
     );
-    const ontology = ontologyWithGrossMargin();
-    repository.saveOntology(ontology);
-    repository.upsertScannedTables([{
-      id: "t_orders",
-      catalog: "internal",
-      database: "retail",
-      name: "fact_orders",
-      type: "TABLE",
-      status: "MODELED",
-      columns: [],
-      fingerprint: "fact_orders:retry-limit",
-      scannedAt: "2026-08-07T00:00:00.000Z",
-    }]);
-    repository.saveDataSource({
-      ...repository.getDataSource(),
-      configured: true,
-      host: "selectdb.test",
-      port: 9030,
-      username: "reader",
-      database: "retail",
-      catalog: "internal",
-      tls: false,
-      passwordStored: true,
-    });
-    const conversation = createConversation();
-    repository.saveConversation(conversation);
-    const errorCodes: string[] = [];
     const harness = new DataAgentHarness(
       root,
       repository,
       async () => {
-        throw new Error("unsupported time must fail before query execution");
+        throw new Error("invalid canonical time must fail before query execution");
       },
-      () => runtimeFor(new RetryLimitedMontaneModel()),
+      () => runtimeFor(new ScriptedMontaneModel()),
     );
-
-    await harness.run(
-      conversation,
-      {
-        id: "turn_retry_limit",
-        conversationId: conversation.id,
-        question: "火星月订单为什么下降",
-        status: "planning",
-        createdAt: new Date().toISOString(),
-        ontologyVersion: ontology.version,
-        trace: [],
+    const tool = (
+      harness as unknown as {
+        questionFrameTool(
+          question: string,
+          capture: (frame: unknown) => unknown,
+        ): Tool;
+      }
+    ).questionFrameTool("火星月订单为什么下降", (frame) => frame);
+    const outcome = await tool.execute({
+      original_question: "火星月订单为什么下降",
+      intent_kind: "DIAGNOSTIC_ANALYSIS",
+      metric_terms: ["成交金额"],
+      time_terms: ["火星月"],
+      time_range: {
+        kind: "ABSOLUTE_MONTH",
+        original_text: "火星月",
+        year: 2026,
+        month: 13,
       },
-      {
-        onTextDelta() {},
-        onTextEnd() {},
-        onToolStatus(call, status, result) {
-          if (call.name !== "ExecuteAnalysisPlan" || status !== "failed") return;
-          errorCodes.push(String(
-            (JSON.parse(result?.content ?? "{}") as { code?: string }).code,
-          ));
-        },
-      },
-    );
+      time_grain: "MONTH",
+      object_terms: ["订单"],
+      business_value_terms: [],
+      grouping_terms: [],
+      calculation_terms: ["原因"],
+      presentation: { kind: "AUTO" },
+    });
 
-    expect(errorCodes).toEqual([
-      "TIME_RANGE_UNSUPPORTED",
-      "TIME_RANGE_UNSUPPORTED",
-      "ANALYSIS_RETRY_LIMIT_REACHED",
-    ]);
+    expect(outcome.ok).toBe(false);
+    expect(outcome.content).toContain("时间语义结构无效");
+    expect(outcome.content).toContain("1 到 12");
     await harness.close();
     repository.close();
   });
@@ -2092,6 +2086,8 @@ class CorrectiveDirectMontaneModel implements ModelClient {
             intent_kind: "DIRECT_QUERY",
             metric_terms: ["成交金额"],
             time_terms: [],
+            time_range: { kind: "NONE" },
+            time_grain: "NONE",
             object_terms: ["订单"],
             business_value_terms: [],
             grouping_terms: [],
@@ -2175,6 +2171,8 @@ class IncompleteExplorationMontaneModel implements ModelClient {
             intent_kind: "EXPLORATORY_ANALYSIS",
             metric_terms: [],
             time_terms: [],
+            time_range: { kind: "NONE" },
+            time_grain: "NONE",
             object_terms: ["订单"],
             business_value_terms: [],
             grouping_terms: [],
@@ -2251,6 +2249,8 @@ class ContextualMonthMontaneModel implements ModelClient {
         intent_kind: "DIAGNOSTIC_ANALYSIS",
         metric_terms: ["成交金额"],
         time_terms: ["7月"],
+        time_range: { kind: "CONTEXT_MONTH", original_text: "7月", month: 7 },
+        time_grain: "NONE",
         object_terms: ["订单"],
         business_value_terms: [],
         grouping_terms: [],
@@ -2302,6 +2302,8 @@ class RetryLimitedMontaneModel implements ModelClient {
         intent_kind: "DIAGNOSTIC_ANALYSIS",
         metric_terms: ["成交金额"],
         time_terms: ["火星月"],
+        time_range: { kind: "NONE" },
+        time_grain: "NONE",
         object_terms: ["订单"],
         business_value_terms: [],
         grouping_terms: [],
@@ -2364,6 +2366,8 @@ class BudgetLimitedDiagnosticMontaneModel implements ModelClient {
         intent_kind: "DIAGNOSTIC_ANALYSIS",
         metric_terms: ["成交金额"],
         time_terms: [],
+        time_range: { kind: "NONE" },
+        time_grain: "NONE",
         object_terms: ["订单"],
         business_value_terms: [],
         grouping_terms: [],
@@ -2445,6 +2449,8 @@ class EstablishedDiagnosticMontaneModel implements ModelClient {
         intent_kind: "DIAGNOSTIC_ANALYSIS",
         metric_terms: ["成交金额"],
         time_terms: [],
+        time_range: { kind: "NONE" },
+        time_grain: "NONE",
         object_terms: ["订单"],
         business_value_terms: [],
         grouping_terms: [],
@@ -2542,6 +2548,8 @@ class PlanningMontaneModel implements ModelClient {
             intent_kind: "DIRECT_QUERY",
             metric_terms: ["销售额"],
             time_terms: ["今年"],
+            time_range: { kind: "CURRENT_YEAR", original_text: "今年" },
+            time_grain: "NONE",
             object_terms: [],
             business_value_terms: ["线上渠道"],
             grouping_terms: [],
@@ -2624,6 +2632,8 @@ class MultiMetricYoyMontaneModel implements ModelClient {
             intent_kind: "DIRECT_QUERY",
             metric_terms: ["成交金额", "成本额"],
             time_terms: ["今年"],
+            time_range: { kind: "CURRENT_YEAR", original_text: "今年" },
+            time_grain: "NONE",
             object_terms: [],
             business_value_terms: ["薇诺娜"],
             grouping_terms: [],
@@ -2706,13 +2716,15 @@ class MonthlyPlanningMontaneModel implements ModelClient {
           id: "call_month_frame",
           name: "SubmitQuestionFrame",
           args: {
-            original_question: "今年销售额按月看",
+            original_question: "今年每个月的销售额",
             intent_kind: "DIRECT_QUERY",
             metric_terms: ["销售额"],
-            time_terms: ["今年"],
+            time_terms: ["今年", "每个月"],
+            time_range: { kind: "CURRENT_YEAR", original_text: "今年" },
+            time_grain: "MONTH",
             object_terms: [],
             business_value_terms: [],
-            grouping_terms: ["按月"],
+            grouping_terms: ["月"],
             calculation_terms: ["求和"],
             presentation: { kind: "TREND" },
           },
@@ -2725,7 +2737,7 @@ class MonthlyPlanningMontaneModel implements ModelClient {
         toolCalls: [{
           id: "call_month_ontology",
           name: "OntologySearch",
-          args: { query: "今年销售额按月看" },
+          args: { query: "今年每个月的销售额" },
         }],
         stopReason: "tool_use",
       };
@@ -2780,6 +2792,8 @@ class ExploratoryMontaneModel implements ModelClient {
             intent_kind: "EXPLORATORY_ANALYSIS",
             metric_terms: [],
             time_terms: [],
+            time_range: { kind: "NONE" },
+            time_grain: "NONE",
             object_terms: ["订单"],
             business_value_terms: [],
             grouping_terms: [],

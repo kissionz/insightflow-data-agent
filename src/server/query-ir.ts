@@ -2307,6 +2307,113 @@ function resolveNaturalTimeRange(
   const expression = input.expression;
   const text = expression.trim();
   const { year, month, day } = zonedDateParts(now, timezone);
+  if (input.kind) {
+    switch (input.kind) {
+      case "TODAY":
+        return {
+          start: dateText(year, month, day),
+          endExclusive: dateText(year, month, day + 1),
+          mode: "TO_DATE",
+        };
+      case "YESTERDAY":
+        return {
+          start: dateText(year, month, day - 1),
+          endExclusive: dateText(year, month, day),
+          mode: "FULL_PERIOD",
+        };
+      case "CURRENT_WEEK": {
+        const weekday = zonedWeekday(now, timezone);
+        return {
+          start: dateText(year, month, day - weekday),
+          endExclusive: dateText(year, month, day + 1),
+          mode: "TO_DATE",
+        };
+      }
+      case "PREVIOUS_WEEK": {
+        const weekday = zonedWeekday(now, timezone);
+        return {
+          start: dateText(year, month, day - weekday - 7),
+          endExclusive: dateText(year, month, day - weekday),
+          mode: "FULL_PERIOD",
+        };
+      }
+      case "CURRENT_MONTH":
+        return {
+          start: dateText(year, month, 1),
+          endExclusive: dateText(year, month, day + 1),
+          mode: "TO_DATE",
+        };
+      case "PREVIOUS_MONTH":
+        return {
+          start: dateText(year, month - 1, 1),
+          endExclusive: dateText(year, month, 1),
+          mode: "FULL_PERIOD",
+        };
+      case "CURRENT_QUARTER": {
+        const quarterMonth = Math.floor((month - 1) / 3) * 3 + 1;
+        return {
+          start: dateText(year, quarterMonth, 1),
+          endExclusive: dateText(year, month, day + 1),
+          mode: "TO_DATE",
+        };
+      }
+      case "PREVIOUS_QUARTER": {
+        const quarterMonth = Math.floor((month - 1) / 3) * 3 + 1;
+        return {
+          start: dateText(year, quarterMonth - 3, 1),
+          endExclusive: dateText(year, quarterMonth, 1),
+          mode: "FULL_PERIOD",
+        };
+      }
+      case "CURRENT_YEAR":
+        return {
+          start: dateText(year, 1, 1),
+          endExclusive: dateText(year, month, day + 1),
+          mode: "TO_DATE",
+        };
+      case "PREVIOUS_YEAR":
+        return {
+          start: dateText(year - 1, 1, 1),
+          endExclusive: dateText(year, 1, 1),
+          mode: "FULL_PERIOD",
+        };
+      case "ABSOLUTE_YEAR":
+        if (!input.year) throw new Error("ABSOLUTE_YEAR 缺少 year");
+        return {
+          start: dateText(input.year, 1, 1),
+          endExclusive: dateText(input.year + 1, 1, 1),
+          mode: "FULL_PERIOD",
+        };
+      case "ABSOLUTE_MONTH":
+        if (!input.year || !input.month) {
+          throw new Error("ABSOLUTE_MONTH 缺少 year 或 month");
+        }
+        return {
+          start: dateText(input.year, input.month, 1),
+          endExclusive: dateText(input.year, input.month + 1, 1),
+          mode: "FULL_PERIOD",
+        };
+      case "ROLLING_PERIODS":
+        return resolveRollingPeriods(input.count, input.unit, now, timezone);
+      case "LAST_N_COMPLETE_PERIODS":
+        if (!input.count || !input.unit) {
+          throw new Error("LAST_N_COMPLETE_PERIODS 缺少 count 或 unit");
+        }
+        return resolveCompletePeriods(input.count, input.unit, now, timezone);
+      case "ABSOLUTE_RANGE":
+        if (!input.start || !input.endExclusive || input.start >= input.endExclusive) {
+          throw new Error("ABSOLUTE_RANGE 缺少有效的 start 或 endExclusive");
+        }
+        return {
+          start: `${input.start} 00:00:00`,
+          endExclusive: `${input.endExclusive} 00:00:00`,
+          mode: "FULL_PERIOD",
+        };
+      case "NONE":
+      case "CONTEXT_MONTH":
+        throw new Error(`时间范围 ${input.kind} 不能进入查询编译阶段`);
+    }
+  }
   if (input.mode === "LAST_N_COMPLETE_PERIODS") {
     const count = input.count;
     const unit = input.unit;
@@ -2494,6 +2601,61 @@ function parseNaturalCount(value: string): number {
     return tens * 10 + ones;
   }
   return digits[value] ?? Number.NaN;
+}
+
+function resolveRollingPeriods(
+  count: number | undefined,
+  unit: TimeGrain | undefined,
+  now: Date,
+  timezone: string,
+): {
+  start: string;
+  endExclusive: string;
+  mode: "ROLLING";
+  periodCount: number;
+  periodUnit: TimeGrain;
+} {
+  if (!count || !Number.isInteger(count) || count < 1 || count > 366 || !unit) {
+    throw new Error("滚动时间范围必须提供 1 到 366 的 count 和有效 unit");
+  }
+  const { year, month, day } = zonedDateParts(now, timezone);
+  const endExclusive = dateText(year, month, day + 1);
+  if (unit === "YEAR") {
+    return {
+      start: dateText(year - count + 1, 1, 1),
+      endExclusive,
+      mode: "ROLLING",
+      periodCount: count,
+      periodUnit: unit,
+    };
+  }
+  if (unit === "QUARTER") {
+    const quarterMonth = Math.floor((month - 1) / 3) * 3 + 1;
+    return {
+      start: dateText(year, quarterMonth - (count - 1) * 3, 1),
+      endExclusive,
+      mode: "ROLLING",
+      periodCount: count,
+      periodUnit: unit,
+    };
+  }
+  if (unit === "MONTH") {
+    return {
+      start: dateText(year, month - count + 1, 1),
+      endExclusive,
+      mode: "ROLLING",
+      periodCount: count,
+      periodUnit: unit,
+    };
+  }
+  const days = unit === "WEEK" ? count * 7 : count;
+  return {
+    start: dateText(year, month, day - days + 1),
+    endExclusive,
+    mode: "ROLLING",
+    periodCount: count,
+    periodUnit: unit,
+  };
 }
 
 function resolveCompletePeriods(

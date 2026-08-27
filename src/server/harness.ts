@@ -34,6 +34,7 @@ import type {
 import { createId } from "./id.js";
 import { Repository } from "./repository.js";
 import { QueryIrCompiler, type CompiledQuery } from "./query-ir.js";
+import { createLiveResult } from "./result-artifact.js";
 import { SemanticIndex } from "./semantic-index.js";
 import type { QueryResult } from "./selectdb.js";
 import { guardReadOnlySql } from "./sql-guard.js";
@@ -2165,9 +2166,9 @@ export class DataAgentHarness {
           };
         }
         const artifact = createLiveResult(
-          intent.title,
+          intent,
           query,
-          Boolean(intent.timeGrain),
+          ontology,
         );
         artifact.verification = {
           calculationSource: compiled.ir.resultContract.calculationSource,
@@ -5579,55 +5580,5 @@ function summarizeAnalysisObservation(
     durationMs: query.durationMs,
     numericSummary,
     sampleRows: artifact.rows.slice(0, 12),
-  };
-}
-
-function createLiveResult(
-  title: string,
-  query: QueryResult,
-  isTimeSeries = false,
-): ResultArtifact {
-  const columns = query.columns;
-  const rows = query.rows.map((row) =>
-    Object.fromEntries(
-      Object.entries(row).map(([key, value]) => [
-        key,
-        typeof value === "number" ? value : value == null ? "—" : String(value),
-      ]),
-    ),
-  ) as ResultArtifact["rows"];
-  const categoryColumn = columns.find((column) =>
-    rows.some((row) => typeof row[column] === "string"),
-  );
-  const numberColumns = columns.filter((column) =>
-    rows.some((row) => typeof row[column] === "number"),
-  );
-  const categories = rows
-    .slice(0, 12)
-    .map((row, index) => String(row[categoryColumn ?? columns[0]] ?? index + 1));
-  const series = numberColumns.slice(0, 3).map((column) => ({
-    name: column,
-    data: rows.slice(0, 12).map((row) => Number(row[column] ?? 0)),
-  }));
-
-  return {
-    kind: "analysis",
-    mode: "live",
-    conclusion: "",
-    kpis: [
-      { label: "结果行数", value: String(query.rows.length) },
-      { label: "数值字段", value: String(numberColumns.length) },
-      { label: "查询耗时", value: `${query.durationMs}ms` },
-    ],
-    chart: {
-      title,
-      type: isTimeSeries ? "line" : "bar",
-      categories,
-      series: series.length ? series : [{ name: "记录数", data: categories.map(() => 1) }],
-    },
-    columns,
-    rows,
-    rowCount: query.rows.length,
-    truncated: query.truncated,
   };
 }

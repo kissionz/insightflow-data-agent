@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 import {
   ArrowClockwise,
   ArrowLeft,
@@ -42,6 +42,8 @@ import type {
   OntologyValidationResult,
   PhysicalTable,
   PropertyValueIndexProperty,
+  ResultArtifact,
+  ResultValueFormat,
   TraceStep,
   Turn,
 } from "../shared/types";
@@ -751,36 +753,167 @@ function AnalysisSqlTrace({ run }: { run: AnalysisRun }) {
   );
 }
 
+const CHART_COLORS = ["#146ef5", "#7a5af8", "#0e9384", "#f79009", "#d92d20"];
+
+function buildChartOption(
+  chart: ResultArtifact["chart"],
+): InsightChartOption | null {
+  if (chart.type === "none") return null;
+  const valueFormat = chart.valueFormat ?? "number";
+  if (chart.type === "donut") {
+    const series = chart.series[0];
+    if (!series) return null;
+    return {
+      color: CHART_COLORS,
+      aria: { enabled: true },
+      tooltip: {
+        trigger: "item",
+        confine: true,
+        formatter: valueFormat === "percent"
+          ? "{b}<br/>{c}%（占总体 {d}%）"
+          : "{b}<br/>{c}（占总体 {d}%）",
+      },
+      legend: {
+        type: "scroll",
+        bottom: 8,
+        left: "center",
+        itemWidth: 9,
+        itemHeight: 9,
+        textStyle: { color: "#667085", fontSize: 10 },
+      },
+      series: [{
+        name: series.name,
+        type: "pie",
+        radius: ["46%", "68%"],
+        center: ["50%", "43%"],
+        minAngle: 4,
+        avoidLabelOverlap: true,
+        itemStyle: {
+          borderColor: "#fff",
+          borderWidth: 2,
+          borderRadius: 3,
+        },
+        label: {
+          color: "#475467",
+          fontSize: 10,
+          formatter: "{b}\n{d}%",
+        },
+        labelLine: {
+          length: 10,
+          length2: 7,
+          lineStyle: { color: "#c5cedb" },
+        },
+        emphasis: { scaleSize: 4 },
+        data: chart.categories.map((name, index) => ({
+          name,
+          value: series.data[index] ?? 0,
+        })),
+      }],
+    };
+  }
+
+  const multiSeries = chart.series.length > 1;
+  const horizontal = chart.type === "horizontal-bar";
+  const valueAxis = {
+    type: "value" as const,
+    splitLine: { lineStyle: { color: "#eef2f7" } },
+    axisLabel: {
+      color: "#98a2b3",
+      fontSize: 10,
+      formatter: (value: number) => formatChartValue(value, valueFormat),
+    },
+  };
+  const categoryAxis = {
+    type: "category" as const,
+    data: chart.categories,
+    axisLine: { lineStyle: { color: "#d7deea" } },
+    axisTick: { show: false },
+    axisLabel: {
+      color: "#667085",
+      fontSize: 10,
+      hideOverlap: true,
+      ...(horizontal ? { width: 116, overflow: "truncate" as const } : {}),
+    },
+  };
+  return {
+    color: CHART_COLORS,
+    aria: { enabled: true },
+    tooltip: {
+      trigger: "axis",
+      confine: true,
+      valueFormatter: (value) => formatChartValue(Number(value), valueFormat),
+    },
+    legend: multiSeries
+      ? {
+          top: 8,
+          left: "center",
+          itemWidth: 10,
+          itemHeight: 4,
+          textStyle: { color: "#667085", fontSize: 10 },
+        }
+      : undefined,
+    grid: {
+      left: horizontal ? 138 : 52,
+      right: 18,
+      top: multiSeries ? 48 : 24,
+      bottom: horizontal ? 34 : 36,
+    },
+    xAxis: horizontal ? valueAxis : categoryAxis,
+    yAxis: horizontal
+      ? { ...categoryAxis, inverse: true }
+      : valueAxis,
+    series: chart.series.map((series) => ({
+      ...series,
+      type: chart.type === "line" ? "line" as const : "bar" as const,
+      barMaxWidth: horizontal ? 18 : 30,
+      itemStyle: chart.type === "line"
+        ? undefined
+        : { borderRadius: horizontal ? [0, 4, 4, 0] : [4, 4, 0, 0] },
+      lineStyle: chart.type === "line" ? { width: 2.5 } : undefined,
+      showSymbol: chart.type === "line" && chart.categories.length <= 24,
+      symbol: "circle",
+      symbolSize: 6,
+      connectNulls: false,
+      smooth: false,
+      emphasis: { focus: "series" as const },
+    })),
+  };
+}
+
+function formatChartValue(value: number, format: ResultValueFormat): string {
+  if (!Number.isFinite(value)) return "—";
+  const formatted = new Intl.NumberFormat("zh-CN", {
+    notation: "compact",
+    maximumFractionDigits: 2,
+  }).format(value);
+  if (format === "currency") return `¥${formatted}`;
+  if (format === "percent") return `${formatted}%`;
+  return formatted;
+}
+
+function chartLabel(type: ResultArtifact["chart"]["type"]): string {
+  if (type === "line") return "趋势";
+  if (type === "donut") return "构成";
+  if (type === "horizontal-bar") return "排名";
+  if (type === "bar") return "对比";
+  return "数据";
+}
+
 function ResultCard({ turn }: { turn: Turn }) {
   const result = turn.result!;
   const partial = turn.status === "partial";
-  const chartOption: InsightChartOption = {
-    tooltip: { trigger: "axis", confine: true },
-    grid: { left: 44, right: 16, top: 38, bottom: 30 },
-    xAxis: {
-      type: "category" as const,
-      data: result.chart.categories,
-      axisLine: { lineStyle: { color: "#d7deea" } },
-      axisTick: { show: false },
-      axisLabel: { color: "#667085", fontSize: 11 },
-    },
-    yAxis: {
-      type: "value" as const,
-      splitLine: { lineStyle: { color: "#eef2f7" } },
-      axisLabel: { color: "#98a2b3", fontSize: 11 },
-    },
-    series: result.chart.series.map((series) => ({
-      ...series,
-      type: result.chart.type as "bar" | "line",
-      barMaxWidth: 30,
-      itemStyle: {
-        color: "#146ef5",
-        borderRadius: result.chart.type === "bar" ? [4, 4, 0, 0] : 0,
-      },
-      lineStyle: { width: 3 },
-      smooth: true,
-    })),
-  };
+  const hasChart = result.chart.type !== "none";
+  const [tableOpen, setTableOpen] = useState(!hasChart);
+  const chartOption = useMemo(
+    () => buildChartOption(result.chart),
+    [result.chart],
+  );
+  const tableId = `result-data-${turn.id}`;
+  const chartHeight = result.chart.type === "horizontal-bar"
+    ? Math.min(480, Math.max(250, result.chart.categories.length * 24 + 72))
+    : result.chart.type === "donut"
+      ? 290
+      : 250;
 
   return (
     <div className="answer-block">
@@ -800,32 +933,52 @@ function ResultCard({ turn }: { turn: Turn }) {
         </span>
       </div>
       <p className="conclusion">{result.conclusion}</p>
-      <div className="kpi-grid">
-        {result.kpis.map((kpi) => (
-          <div className="kpi-card" key={kpi.label}>
-            <span>{kpi.label}</span>
-            <strong>{kpi.value}</strong>
-            {kpi.change && <small>{kpi.change} 环比</small>}
-          </div>
-        ))}
-      </div>
-      <div className="visual-card">
-        <div className="card-title-row">
-          <div>
-            <span className="section-kicker">趋势</span>
-            <h3>{result.chart.title}</h3>
-          </div>
-          <button className="subtle-button">查看数据</button>
+      {result.kpis.length ? (
+        <div className="kpi-grid">
+          {result.kpis.map((kpi) => (
+            <div className="kpi-card" key={kpi.label}>
+              <span>{kpi.label}</span>
+              <strong>{kpi.value}</strong>
+              {kpi.change && <small>{kpi.change} 环比</small>}
+            </div>
+          ))}
         </div>
-        <Suspense fallback={<div className="chart-view chart-loading">正在绘制趋势…</div>}>
-          <ChartView option={chartOption} />
-        </Suspense>
-      </div>
-      <div className="data-table-card">
+      ) : null}
+      {hasChart && chartOption ? (
+        <div className="visual-card">
+          <div className="card-title-row">
+            <div>
+              <span className="section-kicker">{result.chart.label ?? chartLabel(result.chart.type)}</span>
+              <h3>{result.chart.title}</h3>
+              <p className="chart-rationale">{result.chart.rationale}</p>
+              {result.chart.note ? <p className="chart-note">{result.chart.note}</p> : null}
+            </div>
+            <button
+              className="subtle-button"
+              aria-expanded={tableOpen}
+              aria-controls={tableId}
+              onClick={() => setTableOpen((open) => !open)}
+            >
+              {tableOpen ? "收起数据" : "查看数据"}
+            </button>
+          </div>
+          <Suspense fallback={<div className="chart-view chart-loading">正在绘制图表…</div>}>
+            <ChartView
+              option={chartOption}
+              ariaLabel={`${result.chart.label ?? chartLabel(result.chart.type)}：${result.chart.title}`}
+              height={chartHeight}
+            />
+          </Suspense>
+        </div>
+      ) : null}
+      {!hasChart || tableOpen ? <div className="data-table-card" id={tableId}>
         <div className="card-title-row">
           <div>
-            <span className="section-kicker">明细</span>
-            <h3>主要贡献项</h3>
+            <span className="section-kicker">数据</span>
+            <h3>查询结果</h3>
+            {!hasChart && result.chart.rationale ? (
+              <p className="chart-rationale">{result.chart.rationale}</p>
+            ) : null}
           </div>
           <span className="row-count">{result.rowCount} 行</span>
         </div>
@@ -839,17 +992,23 @@ function ResultCard({ turn }: { turn: Turn }) {
               </tr>
             </thead>
             <tbody>
-              {result.rows.map((row, index) => (
-                <tr key={index}>
-                  {result.columns.map((column) => (
-                    <td key={column}>{row[column]}</td>
-                  ))}
-                </tr>
-              ))}
+              {result.rows.length ? result.rows.map((row, index) => (
+                  <tr key={index}>
+                    {result.columns.map((column) => (
+                      <td key={column}>{row[column]}</td>
+                    ))}
+                  </tr>
+                )) : (
+                  <tr>
+                    <td className="empty-table-cell" colSpan={Math.max(1, result.columns.length)}>
+                      没有符合当前条件的数据
+                    </td>
+                  </tr>
+                )}
             </tbody>
           </table>
         </div>
-      </div>
+      </div> : null}
     </div>
   );
 }

@@ -491,8 +491,17 @@ export interface PropertyValueIndexProperty {
 
 export interface ResultSeries {
   name: string;
-  data: number[];
+  data: Array<number | null>;
 }
+
+export type ResultChartType =
+  | "line"
+  | "bar"
+  | "horizontal-bar"
+  | "donut"
+  | "none";
+
+export type ResultValueFormat = "currency" | "number" | "percent";
 
 export interface ResultArtifact {
   kind: "analysis";
@@ -505,7 +514,12 @@ export interface ResultArtifact {
   }>;
   chart: {
     title: string;
-    type: "line" | "bar";
+    type: ResultChartType;
+    label: "趋势" | "构成" | "排名" | "对比" | "数据";
+    rationale: string;
+    note?: string;
+    categoryLabel?: string;
+    valueFormat?: ResultValueFormat;
     categories: string[];
     series: ResultSeries[];
   };

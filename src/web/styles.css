@@ -1232,7 +1232,7 @@ button.brand-mark {
 
 .kpi-grid {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 8px;
   margin-bottom: 10px;
 }
@@ -1279,13 +1279,42 @@ button.brand-mark {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: 16px;
   padding: 14px 16px 4px;
+}
+
+.card-title-row > div {
+  min-width: 0;
+}
+
+.visual-card .card-title-row {
+  align-items: flex-start;
+  padding-bottom: 8px;
+}
+
+.visual-card .subtle-button {
+  flex: 0 0 auto;
 }
 
 .card-title-row h3 {
   margin: 3px 0 0;
   font-size: 12px;
   font-weight: 600;
+  text-wrap: balance;
+}
+
+.chart-rationale,
+.chart-note {
+  max-width: 68ch;
+  margin: 5px 0 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.55;
+  text-wrap: pretty;
+}
+
+.chart-note {
+  color: #7a5d19;
 }
 
 .row-count {
@@ -1323,6 +1352,12 @@ td {
 
 td {
   color: #475467;
+}
+
+.empty-table-cell {
+  height: 80px;
+  color: var(--muted);
+  text-align: center;
 }
 
 tbody tr:hover {

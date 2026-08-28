@@ -56,8 +56,13 @@ export function ChartView({
     const chart = echarts.init(hostRef.current, undefined, { renderer: "canvas" });
     chartRef.current = chart;
     const resize = () => chart.resize();
+    const observer = typeof ResizeObserver === "undefined"
+      ? null
+      : new ResizeObserver(resize);
+    observer?.observe(hostRef.current);
     window.addEventListener("resize", resize);
     return () => {
+      observer?.disconnect();
       window.removeEventListener("resize", resize);
       chart.dispose();
       chartRef.current = null;

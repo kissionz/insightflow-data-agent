@@ -78,6 +78,7 @@ const DATA_AGENT_SYSTEM_PROMPT = `
 interface HarnessRunResult {
   answer: string;
   result?: ResultArtifact;
+  resultIntent?: AnalysisIntent;
   responseKind:
     | "analysis"
     | "partial_analysis"
@@ -90,6 +91,7 @@ interface HarnessRunResult {
 
 interface CapturedAnalysis {
   artifact: ResultArtifact;
+  intent: AnalysisIntent;
   sql: string;
   parameters: unknown[];
   compiled: CompiledQuery;
@@ -342,6 +344,7 @@ export class DataAgentHarness {
             conclusion: answer,
           }
         : undefined,
+      resultIntent: completed?.intent,
       responseKind,
       acceptanceContract,
       sessionId: managed.id,
@@ -2210,6 +2213,7 @@ export class DataAgentHarness {
         const maxRows = intent.resultKind === "detail" ? 50 : 200;
         guardReadOnlySql(compiled.sql, maxRows);
         const evidence = {
+          intent,
           ir: compiled.ir,
           bindings: compiled.bindings,
           planSummary: compiled.planSummary,
@@ -2273,6 +2277,7 @@ export class DataAgentHarness {
         );
         capture({
           artifact,
+          intent,
           sql: compiled.sql,
           parameters: compiled.parameters,
           compiled,

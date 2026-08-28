@@ -1,9 +1,20 @@
-import { lazy, Suspense, useEffect, useMemo, useState } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   ArrowClockwise,
+  ArrowDown,
   ArrowLeft,
   ArrowRight,
   ArrowUp,
+  ArrowsInSimple,
+  ArrowsOutSimple,
   BookOpenText,
   Brain,
   CaretDown,
@@ -25,6 +36,7 @@ import {
   Plus,
   SealCheck,
   Sparkle,
+  SquaresFour,
   Table,
   Trash,
   Warning,
@@ -33,6 +45,8 @@ import {
 import type {
   AnalysisRun,
   BootstrapPayload,
+  CanvasItem,
+  CanvasQueryResponse,
   Conversation,
   DataSourceInput,
   Metric,
@@ -54,7 +68,7 @@ const ChartView = lazy(() =>
   import("./components/ChartView").then((module) => ({ default: module.ChartView })),
 );
 
-type Page = "chat" | "ontology" | "data" | "audit" | "settings";
+type Page = "chat" | "canvas" | "ontology" | "data" | "audit" | "settings";
 
 const NAV_ITEMS: Array<{
   page: Page;
@@ -62,6 +76,7 @@ const NAV_ITEMS: Array<{
   icon: typeof ChartBar;
 }> = [
   { page: "chat", label: "问数", icon: ChartBar },
+  { page: "canvas", label: "画布", icon: SquaresFour },
   { page: "ontology", label: "本体", icon: CirclesFour },
   { page: "data", label: "数据", icon: Database },
   { page: "audit", label: "审计", icon: BookOpenText },
@@ -121,6 +136,27 @@ export function App() {
     }
   }
 
+  async function addTurnToCanvas(turn: Turn): Promise<void> {
+    try {
+      const item = await api.addCanvasItem(turn.conversationId, turn.id);
+      setState((previous) => {
+        if (!previous) return previous;
+        const exists = previous.canvasItems.some((current) => current.id === item.id);
+        return {
+          ...previous,
+          canvasItems: exists
+            ? previous.canvasItems.map((current) =>
+                current.id === item.id ? item : current,
+              )
+            : [...previous.canvasItems, item],
+        };
+      });
+    } catch (reason) {
+      setError(asMessage(reason));
+      throw reason;
+    }
+  }
+
   if (loading) return <LoadingScreen />;
   if (!state) return <FatalState message={error || "无法加载应用"} />;
 
@@ -138,6 +174,8 @@ export function App() {
           <ChatWorkspace
             conversation={selected}
             ontology={state.ontology}
+            canvasItems={state.canvasItems}
+            onAddToCanvas={addTurnToCanvas}
             onTurnCreated={(turn) =>
               setState((previous) =>
                 previous
@@ -156,6 +194,17 @@ export function App() {
           />
           <ContextPanel conversation={selected} ontology={state.ontology} />
         </>
+      ) : page === "canvas" ? (
+        <CanvasWorkspace
+          items={state.canvasItems}
+          onItems={(items) =>
+            setState((previous) =>
+              previous ? { ...previous, canvasItems: items } : previous,
+            )
+          }
+          onBack={() => setPage("chat")}
+          onError={setError}
+        />
       ) : (
         <ManagementWorkspace
           page={page}
@@ -277,11 +326,15 @@ function ConversationRail({
 function ChatWorkspace({
   conversation,
   ontology,
+  canvasItems,
+  onAddToCanvas,
   onTurnCreated,
   onError,
 }: {
   conversation: Conversation | null;
   ontology: OntologySnapshot;
+  canvasItems: CanvasItem[];
+  onAddToCanvas: (turn: Turn) => Promise<void>;
   onTurnCreated: (turn: Turn) => void;
   onError: (message: string) => void;
 }) {
@@ -334,7 +387,16 @@ function ChatWorkspace({
         {conversation.turns.length === 0 ? (
           <StarterPrompts onPick={setQuestion} />
         ) : (
-          conversation.turns.map((turn) => <TurnCard key={turn.id} turn={turn} />)
+          conversation.turns.map((turn) => (
+            <TurnCard
+              key={turn.id}
+              turn={turn}
+              onAddToCanvas={onAddToCanvas}
+              addedToCanvas={canvasItems.some(
+                (item) => item.sourceTurnId === turn.id,
+              )}
+            />
+          ))
         )}
       </section>
       <div className="composer-wrap">
@@ -397,7 +459,15 @@ function StarterPrompts({ onPick }: { onPick: (value: string) => void }) {
   );
 }
 
-function TurnCard({ turn }: { turn: Turn }) {
+function TurnCard({
+  turn,
+  addedToCanvas,
+  onAddToCanvas,
+}: {
+  turn: Turn;
+  addedToCanvas: boolean;
+  onAddToCanvas: (turn: Turn) => Promise<void>;
+}) {
   const [traceOpen, setTraceOpen] = useState(!isTerminal(turn.status));
   useEffect(() => {
     setTraceOpen(!isTerminal(turn.status));
@@ -459,7 +529,11 @@ function TurnCard({ turn }: { turn: Turn }) {
         <TraceTimeline trace={turn.trace} analysisRun={turn.analysisRun} />
       )}
       {turn.result ? (
-        <ResultCard turn={turn} />
+        <ResultCard
+          turn={turn}
+          addedToCanvas={addedToCanvas}
+          onAddToCanvas={onAddToCanvas}
+        />
       ) : turn.answer && terminal ? (
         <TextAnswer turn={turn} />
       ) : (
@@ -899,11 +973,20 @@ function chartLabel(type: ResultArtifact["chart"]["type"]): string {
   return "数据";
 }
 
-function ResultCard({ turn }: { turn: Turn }) {
+function ResultCard({
+  turn,
+  addedToCanvas,
+  onAddToCanvas,
+}: {
+  turn: Turn;
+  addedToCanvas: boolean;
+  onAddToCanvas: (turn: Turn) => Promise<void>;
+}) {
   const result = turn.result!;
   const partial = turn.status === "partial";
   const hasChart = result.chart.type !== "none";
   const [tableOpen, setTableOpen] = useState(!hasChart);
+  const [addingToCanvas, setAddingToCanvas] = useState(false);
   const chartOption = useMemo(
     () => buildChartOption(result.chart),
     [result.chart],
@@ -953,14 +1036,38 @@ function ResultCard({ turn }: { turn: Turn }) {
               <p className="chart-rationale">{result.chart.rationale}</p>
               {result.chart.note ? <p className="chart-note">{result.chart.note}</p> : null}
             </div>
-            <button
-              className="subtle-button"
-              aria-expanded={tableOpen}
-              aria-controls={tableId}
-              onClick={() => setTableOpen((open) => !open)}
-            >
-              {tableOpen ? "收起数据" : "查看数据"}
-            </button>
+            <div className="result-card-actions">
+              {turn.resultIntent ? (
+                <button
+                  className={`subtle-button ${addedToCanvas ? "canvas-added" : ""}`}
+                  disabled={addedToCanvas || addingToCanvas}
+                  onClick={async () => {
+                    setAddingToCanvas(true);
+                    try {
+                      await onAddToCanvas(turn);
+                    } finally {
+                      setAddingToCanvas(false);
+                    }
+                  }}
+                >
+                  {addedToCanvas ? (
+                    <><Check size={14} /> 已添加</>
+                  ) : addingToCanvas ? (
+                    "添加中…"
+                  ) : (
+                    <><Plus size={14} /> 添加到画布</>
+                  )}
+                </button>
+              ) : null}
+              <button
+                className="subtle-button"
+                aria-expanded={tableOpen}
+                aria-controls={tableId}
+                onClick={() => setTableOpen((open) => !open)}
+              >
+                {tableOpen ? "收起数据" : "查看数据"}
+              </button>
+            </div>
           </div>
           <Suspense fallback={<div className="chart-view chart-loading">正在绘制图表…</div>}>
             <ChartView
@@ -1158,6 +1265,354 @@ function ContextItem({
       </span>
     </div>
   );
+}
+
+type CanvasRuntimeState =
+  | { status: "loading" }
+  | { status: "ready"; response: CanvasQueryResponse }
+  | { status: "error"; message: string };
+
+function CanvasWorkspace({
+  items,
+  onItems,
+  onBack,
+  onError,
+}: {
+  items: CanvasItem[];
+  onItems: (items: CanvasItem[]) => void;
+  onBack: () => void;
+  onError: (message: string) => void;
+}) {
+  const [runtime, setRuntime] = useState<Record<string, CanvasRuntimeState>>({});
+  const autoQueriedIds = useRef(new Set<string>());
+
+  const refreshItem = useCallback(async (item: CanvasItem) => {
+    setRuntime((previous) => ({
+      ...previous,
+      [item.id]: { status: "loading" },
+    }));
+    try {
+      const response = await api.queryCanvasItem(item.id);
+      setRuntime((previous) => ({
+        ...previous,
+        [item.id]: { status: "ready", response },
+      }));
+    } catch (reason) {
+      setRuntime((previous) => ({
+        ...previous,
+        [item.id]: { status: "error", message: asMessage(reason) },
+      }));
+    }
+  }, []);
+
+  const refreshItems = useCallback(
+    async (targetItems: CanvasItem[]) => {
+      await runWithConcurrency(targetItems, 5, refreshItem);
+    },
+    [refreshItem],
+  );
+
+  useEffect(() => {
+    const currentIds = new Set(items.map((item) => item.id));
+    for (const id of autoQueriedIds.current) {
+      if (!currentIds.has(id)) autoQueriedIds.current.delete(id);
+    }
+    const pending = items.filter((item) => !autoQueriedIds.current.has(item.id));
+    if (!pending.length) return;
+    pending.forEach((item) => autoQueriedIds.current.add(item.id));
+    void refreshItems(pending);
+  }, [items, refreshItems]);
+
+  const loadingCount = items.filter(
+    (item) => runtime[item.id]?.status === "loading",
+  ).length;
+  const completedCount = items.filter((item) => {
+    const status = runtime[item.id]?.status;
+    return status === "ready" || status === "error";
+  }).length;
+
+  async function toggleWidth(item: CanvasItem) {
+    const previous = items;
+    const nextWidth = item.width === "wide" ? "standard" : "wide";
+    onItems(
+      items.map((current) =>
+        current.id === item.id ? { ...current, width: nextWidth } : current,
+      ),
+    );
+    try {
+      const saved = await api.updateCanvasItem(item.id, { width: nextWidth });
+      onItems(
+        items.map((current) => (current.id === saved.id ? saved : current)),
+      );
+    } catch (reason) {
+      onItems(previous);
+      onError(asMessage(reason));
+    }
+  }
+
+  async function moveItem(index: number, direction: -1 | 1) {
+    const target = index + direction;
+    if (target < 0 || target >= items.length) return;
+    const previous = items;
+    const ordered = [...items];
+    const [moving] = ordered.splice(index, 1);
+    if (!moving) return;
+    ordered.splice(target, 0, moving);
+    const positioned = ordered.map((item, position) => ({ ...item, position }));
+    onItems(positioned);
+    try {
+      const saved = await api.reorderCanvasItems(positioned.map((item) => item.id));
+      onItems(saved.items);
+    } catch (reason) {
+      onItems(previous);
+      onError(asMessage(reason));
+    }
+  }
+
+  async function removeItem(item: CanvasItem) {
+    const previous = items;
+    onItems(items.filter((current) => current.id !== item.id));
+    try {
+      await api.deleteCanvasItem(item.id);
+      setRuntime((current) => {
+        const next = { ...current };
+        delete next[item.id];
+        return next;
+      });
+    } catch (reason) {
+      onItems(previous);
+      onError(asMessage(reason));
+    }
+  }
+
+  return (
+    <main className="canvas-workspace">
+      <header className="canvas-header">
+        <div>
+          <button className="back-link" onClick={onBack}>
+            <ArrowLeft size={16} /> 返回问数
+          </button>
+          <div className="canvas-title-row">
+            <span className="canvas-title-icon"><SquaresFour size={22} weight="fill" /></span>
+            <div>
+              <h1>重点指标画布</h1>
+              <p>打开画布时自动更新相对时间查询</p>
+            </div>
+          </div>
+        </div>
+        <div className="canvas-header-actions">
+          {items.length ? (
+            <span className="canvas-progress" aria-live="polite">
+              {loadingCount
+                ? `正在查询 ${loadingCount} / ${items.length}`
+                : `已更新 ${completedCount} / ${items.length}`}
+            </span>
+          ) : null}
+          <button
+            className="secondary-button"
+            disabled={!items.length || loadingCount > 0}
+            onClick={() => void refreshItems(items)}
+          >
+            <ArrowClockwise size={16} /> 刷新全部
+          </button>
+        </div>
+      </header>
+
+      {items.length ? (
+        <section className="canvas-grid" aria-label="重点指标图表">
+          {items.map((item, index) => (
+            <CanvasChartCard
+              key={item.id}
+              item={item}
+              index={index}
+              total={items.length}
+              runtime={runtime[item.id]}
+              onRefresh={() => void refreshItem(item)}
+              onToggleWidth={() => void toggleWidth(item)}
+              onMove={(direction) => void moveItem(index, direction)}
+              onRemove={() => void removeItem(item)}
+            />
+          ))}
+          <button className="canvas-add-hint" onClick={onBack}>
+            <Plus size={18} /> 从问数结果添加更多图表
+          </button>
+        </section>
+      ) : (
+        <section className="canvas-empty">
+          <span><ChartBar size={30} weight="duotone" /></span>
+          <h2>把常看的指标放到这里</h2>
+          <p>在问数结果中选择“添加到画布”，下次打开即可自动查询当前周期的数据。</p>
+          <button className="primary-button" onClick={onBack}>返回问数</button>
+        </section>
+      )}
+    </main>
+  );
+}
+
+function CanvasChartCard({
+  item,
+  index,
+  total,
+  runtime,
+  onRefresh,
+  onToggleWidth,
+  onMove,
+  onRemove,
+}: {
+  item: CanvasItem;
+  index: number;
+  total: number;
+  runtime?: CanvasRuntimeState;
+  onRefresh: () => void;
+  onToggleWidth: () => void;
+  onMove: (direction: -1 | 1) => void;
+  onRemove: () => void;
+}) {
+  const response = runtime?.status === "ready" ? runtime.response : undefined;
+  const chartOption = useMemo(
+    () => response ? buildChartOption(response.result.chart) : null,
+    [response],
+  );
+  const relativeTimeLabel = item.intent.timeRange?.expression ?? "全部时间";
+  const resolvedLabel = response?.resolvedTimeRange
+    ? formatResolvedRange(
+        response.resolvedTimeRange.start,
+        response.resolvedTimeRange.endExclusive,
+      )
+    : "";
+
+  return (
+    <article className={`canvas-card ${item.width === "wide" ? "wide" : ""}`}>
+      <div className="canvas-card-header">
+        <div>
+          <span className="section-kicker">{relativeTimeLabel}</span>
+          <h2>{item.title}</h2>
+          {resolvedLabel ? <p>{resolvedLabel}</p> : null}
+        </div>
+        <div className="canvas-card-actions">
+          <button
+            className="icon-button"
+            aria-label={`刷新${item.title}`}
+            title="刷新"
+            disabled={runtime?.status === "loading"}
+            onClick={onRefresh}
+          >
+            <ArrowClockwise size={17} className={runtime?.status === "loading" ? "rotating" : ""} />
+          </button>
+          <button
+            className="icon-button"
+            aria-label={item.width === "wide" ? "恢复标准宽度" : "横向展开"}
+            title={item.width === "wide" ? "恢复标准宽度" : "横向展开"}
+            onClick={onToggleWidth}
+          >
+            {item.width === "wide" ? <ArrowsInSimple size={17} /> : <ArrowsOutSimple size={17} />}
+          </button>
+          <details className="canvas-item-menu">
+            <summary className="icon-button" aria-label="图表操作">
+              <DotsThreeVertical size={18} />
+            </summary>
+            <div>
+              <button disabled={index === 0} onClick={() => onMove(-1)}>
+                <ArrowUp size={15} /> 向前移动
+              </button>
+              <button disabled={index === total - 1} onClick={() => onMove(1)}>
+                <ArrowDown size={15} /> 向后移动
+              </button>
+              <button className="danger" onClick={onRemove}>
+                <Trash size={15} /> 移出画布
+              </button>
+            </div>
+          </details>
+        </div>
+      </div>
+      <div className="canvas-card-body">
+        {!runtime || runtime.status === "loading" ? (
+          <CanvasChartSkeleton />
+        ) : runtime.status === "error" ? (
+          <div className="canvas-query-error">
+            <Warning size={24} weight="duotone" />
+            <strong>查询未完成</strong>
+            <p>{runtime.message}</p>
+            <button className="subtle-button" onClick={onRefresh}>重新查询</button>
+          </div>
+        ) : chartOption ? (
+          <Suspense fallback={<CanvasChartSkeleton />}>
+            <ChartView
+              option={chartOption}
+              ariaLabel={`${item.title}，${relativeTimeLabel}`}
+              height={280}
+            />
+          </Suspense>
+        ) : (
+          <div className="canvas-query-error">
+            <Info size={24} />
+            <strong>当前结果适合表格查看</strong>
+            <p>调整原问题的维度或时间粒度后，可生成图表并重新添加。</p>
+          </div>
+        )}
+      </div>
+      {response ? (
+        <footer className="canvas-card-footer">
+          <span>{response.result.rowCount} 行数据</span>
+          <time dateTime={response.refreshedAt}>{formatRefreshTime(response.refreshedAt)}</time>
+        </footer>
+      ) : null}
+    </article>
+  );
+}
+
+function CanvasChartSkeleton() {
+  return (
+    <div className="canvas-chart-skeleton" aria-label="正在查询图表">
+      <span className="skeleton-axis" />
+      {[46, 72, 58, 86, 64, 78].map((height, index) => (
+        <i key={index} style={{ height: `${height}%` }} />
+      ))}
+    </div>
+  );
+}
+
+async function runWithConcurrency<T>(
+  values: T[],
+  limit: number,
+  operation: (value: T) => Promise<void>,
+): Promise<void> {
+  let nextIndex = 0;
+  const workers = Array.from(
+    { length: Math.min(limit, values.length) },
+    async () => {
+      while (nextIndex < values.length) {
+        const value = values[nextIndex];
+        nextIndex += 1;
+        if (value !== undefined) await operation(value);
+      }
+    },
+  );
+  await Promise.all(workers);
+}
+
+function formatResolvedRange(start: string, endExclusive: string): string {
+  const end = new Date(`${endExclusive.slice(0, 10)}T00:00:00`);
+  end.setDate(end.getDate() - 1);
+  return `${formatDateOnly(start)} – ${formatDateOnly(end)}`;
+}
+
+function formatDateOnly(value: string | Date): string {
+  const date = value instanceof Date
+    ? value
+    : new Date(`${value.slice(0, 10)}T00:00:00`);
+  return new Intl.DateTimeFormat("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(date);
+}
+
+function formatRefreshTime(value: string): string {
+  return `${new Intl.DateTimeFormat("zh-CN", {
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(value))} 更新`;
 }
 
 function ManagementWorkspace({

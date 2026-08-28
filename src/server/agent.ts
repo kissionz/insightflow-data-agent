@@ -6,6 +6,7 @@ import type {
 } from "montane-code";
 import type {
   AnalysisAcceptanceContract,
+  AnalysisIntent,
   DiagnosticCandidate,
   DiagnosticEvaluation,
   AnalysisRun,
@@ -163,6 +164,7 @@ export class DataAgent {
           : "completed";
       turn.answer = output.answer;
       turn.responseKind = output.responseKind;
+      turn.resultIntent = output.resultIntent;
       turn.result = output.result;
       turn.completedAt = new Date().toISOString();
       turn = structuredClone(turn);
@@ -704,6 +706,7 @@ class HarnessTurnReporter implements AgentReporter {
     if (status === "succeeded") {
       const data = result?.data as
         | {
+            intent?: AnalysisIntent;
             ir?: {
               rootObjectId?: string;
               grain?: string;
@@ -961,6 +964,7 @@ class HarnessTurnReporter implements AgentReporter {
   ): void {
     if (!this.analysisRun) return;
     const data = (result?.data ?? {}) as {
+      intent?: AnalysisIntent;
       ir?: AnalysisRunStep["ir"] & { rootObjectId?: string };
       sql?: string;
       parameters?: unknown[];
@@ -1005,6 +1009,7 @@ class HarnessTurnReporter implements AgentReporter {
                 status === "completed"
                   ? `返回 ${data.rowCount ?? 0} 行，Montane 正在判断是否需要继续分析`
                   : result?.content?.split("\n")[0] || "本步查询失败",
+              intent: data.intent,
               ir: data.ir,
               id: data.analysisStep?.id ?? step.id,
               title: data.analysisStep?.objective ?? step.title,

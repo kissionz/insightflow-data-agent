@@ -2,7 +2,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import type { OntologySnapshot, PhysicalTable } from "../src/shared/types.js";
+import type {
+  CanvasItem,
+  OntologySnapshot,
+  PhysicalTable,
+} from "../src/shared/types.js";
 import { Repository } from "../src/server/repository.js";
 import { testOntology } from "./fixtures.js";
 
@@ -75,6 +79,46 @@ describe("Repository schema reconciliation", () => {
 
     expect(saved.version).toBe(2);
     expect(repository.getAgentConfig()).toEqual(saved);
+    repository.close();
+  });
+
+  it("persists canvas query definitions and layout without query results", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-repo-"));
+    roots.push(root);
+    const repository = new Repository(path.join(root, "ontology.sqlite"));
+    const item: CanvasItem = {
+      id: "canvas_gmv",
+      title: "本月成交金额",
+      intent: {
+        rootObjectId: "o_order",
+        measureIds: ["m_gmv"],
+        dimensionPropertyIds: [],
+        filters: [],
+        timeRange: { expression: "本月", kind: "CURRENT_MONTH" },
+        resultKind: "aggregate",
+        title: "本月成交金额",
+      },
+      width: "standard",
+      position: 0,
+      sourceConversationId: "conv_1",
+      sourceTurnId: "turn_1",
+      createdAt: "2026-08-28T00:00:00.000Z",
+      updatedAt: "2026-08-28T00:00:00.000Z",
+    };
+
+    repository.saveCanvasItem(item);
+    repository.saveCanvasItem({ ...item, width: "wide", title: "成交金额" });
+
+    expect(repository.getCanvasItems()).toEqual([
+      expect.objectContaining({
+        id: "canvas_gmv",
+        title: "成交金额",
+        width: "wide",
+        intent: item.intent,
+      }),
+    ]);
+    expect(repository.deleteCanvasItem(item.id)).toBe(true);
+    expect(repository.getCanvasItems()).toEqual([]);
     repository.close();
   });
 

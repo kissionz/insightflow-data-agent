@@ -4,6 +4,7 @@ import Fastify from "fastify";
 import fastifyStatic from "@fastify/static";
 import { z } from "zod";
 import type {
+  CanvasItem,
   Conversation,
   DataSourceInput,
   DimensionHierarchy,
@@ -14,6 +15,7 @@ import type {
   SafeDataSourceConfig,
 } from "../shared/types.js";
 import { DataAgent } from "./agent.js";
+import { CanvasQueryService } from "./canvas.js";
 import { loadConfig } from "./config.js";
 import { EventHub } from "./events.js";
 import { DataAgentHarness } from "./harness.js";
@@ -61,6 +63,7 @@ const harness = new DataAgentHarness(
   executeLiveQuery,
 );
 const valueIndexer = new PropertyValueIndexer(repository, executeLiveQuery);
+const canvasQueries = new CanvasQueryService(repository, executeLiveQuery);
 const agent = new DataAgent(repository, events, harness);
 const app = Fastify({ logger: true });
 
@@ -82,6 +85,16 @@ const agentConfigSchema = z.object({
     "Asia/Singapore",
   ]),
 });
+const canvasItemUpdateSchema = z
+  .object({
+    title: z.string().trim().min(1).max(120).optional(),
+    width: z.enum(["standard", "wide"]).optional(),
+    position: z.number().int().min(0).optional(),
+  })
+  .refine((value) => Object.keys(value).length > 0, "请提供要更新的字段");
+const canvasOrderSchema = z.object({
+  itemIds: z.array(z.string().min(1)),
+});
 
 app.get("/api/health", async () => ({ ok: true, version: "0.1.0" }));
 
@@ -90,6 +103,7 @@ app.get("/api/bootstrap", async () => {
   const montaneRuntime = await harness.runtimeStatus();
   return {
     conversations: repository.getConversations(),
+    canvasItems: repository.getCanvasItems(),
     ontology: repository.getPublishedOntology(),
     ontologyDraft: repository.getDraftOntology() ?? undefined,
     tables: repository.getTables(),
@@ -200,6 +214,119 @@ app.post<{ Params: { id: string }; Body: { question: string } }>(
     } catch (error) {
       return reply.code(404).send({
         message: error instanceof Error ? error.message : "无法创建分析任务",
+      });
+    }
+  },
+);
+
+app.get("/api/canvas-items", async () => ({
+  items: repository.getCanvasItems(),
+}));
+
+app.post<{ Body: { conversationId?: string; turnId?: string } }>(
+  "/api/canvas-items",
+  async (request, reply) => {
+    const conversationId = request.body?.conversationId?.trim();
+    const turnId = request.body?.turnId?.trim();
+    if (!conversationId || !turnId) {
+      return reply.code(400).send({ message: "缺少会话或查询结果标识" });
+    }
+    const existing = repository
+      .getCanvasItems()
+      .find((item) => item.sourceTurnId === turnId);
+    if (existing) return existing;
+
+    const conversation = repository.getConversation(conversationId);
+    const turn = conversation?.turns.find((item) => item.id === turnId);
+    if (!turn) return reply.code(404).send({ message: "查询结果不存在" });
+    if (!turn.resultIntent || !turn.result || turn.result.chart.type === "none") {
+      return reply.code(409).send({ message: "当前结果无法添加到画布" });
+    }
+
+    const now = new Date().toISOString();
+    const item: CanvasItem = {
+      id: createId("canvas"),
+      title: turn.result.chart.title,
+      intent: structuredClone(turn.resultIntent),
+      width: "standard",
+      position: repository.getCanvasItems().length,
+      sourceConversationId: conversationId,
+      sourceTurnId: turnId,
+      createdAt: now,
+      updatedAt: now,
+    };
+    repository.saveCanvasItem(item);
+    return reply.code(201).send(item);
+  },
+);
+
+app.put<{ Body: unknown }>("/api/canvas-items/order", async (request, reply) => {
+  const parsed = canvasOrderSchema.safeParse(request.body);
+  if (!parsed.success) {
+    return reply.code(400).send({ message: "画布顺序不完整" });
+  }
+  const items = repository.getCanvasItems();
+  const currentIds = new Set(items.map((item) => item.id));
+  const requestedIds = new Set(parsed.data.itemIds);
+  if (
+    requestedIds.size !== currentIds.size ||
+    parsed.data.itemIds.length !== currentIds.size ||
+    parsed.data.itemIds.some((id) => !currentIds.has(id))
+  ) {
+    return reply.code(400).send({ message: "画布顺序与现有项目不一致" });
+  }
+  const itemById = new Map(items.map((item) => [item.id, item]));
+  const now = new Date().toISOString();
+  const ordered = parsed.data.itemIds.map((id, position) => ({
+    ...itemById.get(id)!,
+    position,
+    updatedAt: now,
+  }));
+  ordered.forEach((item) => repository.saveCanvasItem(item));
+  return { items: ordered };
+});
+
+app.patch<{ Params: { id: string }; Body: unknown }>(
+  "/api/canvas-items/:id",
+  async (request, reply) => {
+    const parsed = canvasItemUpdateSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({
+        message: parsed.error.issues[0]?.message || "画布项目更新内容无效",
+      });
+    }
+    const current = repository.getCanvasItem(request.params.id);
+    if (!current) return reply.code(404).send({ message: "画布项目不存在" });
+    const item: CanvasItem = {
+      ...current,
+      ...parsed.data,
+      updatedAt: new Date().toISOString(),
+    };
+    repository.saveCanvasItem(item);
+    return item;
+  },
+);
+
+app.delete<{ Params: { id: string } }>(
+  "/api/canvas-items/:id",
+  async (request, reply) => {
+    if (!repository.deleteCanvasItem(request.params.id)) {
+      return reply.code(404).send({ message: "画布项目不存在" });
+    }
+    return { ok: true };
+  },
+);
+
+app.post<{ Params: { id: string } }>(
+  "/api/canvas-items/:id/query",
+  async (request, reply) => {
+    const item = repository.getCanvasItem(request.params.id);
+    if (!item) return reply.code(404).send({ message: "画布项目不存在" });
+    try {
+      return await canvasQueries.query(item);
+    } catch (error) {
+      return reply.code(422).send({
+        message: error instanceof Error ? error.message : "画布查询执行失败",
       });
     }
   },

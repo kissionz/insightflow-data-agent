@@ -3,6 +3,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type {
   AgentPromptConfig,
+  CanvasItem,
   Conversation,
   NumericPropertySpec,
   OntologyObjectType,
@@ -99,6 +100,50 @@ export class Repository {
     conversation.updatedAt = new Date().toISOString();
     this.saveConversation(conversation);
     return conversation;
+  }
+
+  getCanvasItems(): CanvasItem[] {
+    return this.db
+      .prepare(
+        "SELECT payload FROM canvas_items ORDER BY position, created_at",
+      )
+      .all()
+      .map((row) => JSON.parse((row as unknown as JsonRow).payload) as CanvasItem);
+  }
+
+  getCanvasItem(id: string): CanvasItem | null {
+    const row = this.db
+      .prepare("SELECT payload FROM canvas_items WHERE id = ?")
+      .get(id) as unknown as JsonRow | undefined;
+    return row ? (JSON.parse(row.payload) as CanvasItem) : null;
+  }
+
+  saveCanvasItem(item: CanvasItem): void {
+    this.db
+      .prepare(
+        `INSERT INTO canvas_items
+           (id, source_turn_id, title, position, created_at, updated_at, payload)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           title = excluded.title,
+           position = excluded.position,
+           updated_at = excluded.updated_at,
+           payload = excluded.payload`,
+      )
+      .run(
+        item.id,
+        item.sourceTurnId,
+        item.title,
+        item.position,
+        item.createdAt,
+        item.updatedAt,
+        JSON.stringify(item),
+      );
+  }
+
+  deleteCanvasItem(id: string): boolean {
+    return this.db.prepare("DELETE FROM canvas_items WHERE id = ?").run(id)
+      .changes > 0;
   }
 
   getOntology(): OntologySnapshot {
@@ -549,6 +594,17 @@ export class Repository {
         updated_at TEXT NOT NULL,
         payload TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS canvas_items (
+        id TEXT PRIMARY KEY,
+        source_turn_id TEXT NOT NULL UNIQUE,
+        title TEXT NOT NULL,
+        position INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        payload TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS canvas_items_position
+        ON canvas_items (position, created_at);
       CREATE TABLE IF NOT EXISTS physical_tables (
         id TEXT PRIMARY KEY,
         database_name TEXT NOT NULL,

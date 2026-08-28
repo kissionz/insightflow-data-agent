@@ -123,6 +123,7 @@ export interface AnalysisRunStep {
   acceptanceCriterionIds?: string[];
   status: "running" | "completed" | "failed";
   summary: string;
+  intent?: AnalysisIntent;
   ir?: QueryIR;
   sql?: string;
   parameters?: unknown[];
@@ -593,7 +594,29 @@ export interface Turn {
     | "conversation"
     | "configuration_required"
     | "clarification";
+  resultIntent?: AnalysisIntent;
   result?: ResultArtifact;
+}
+
+export type CanvasItemWidth = "standard" | "wide";
+
+export interface CanvasItem {
+  id: string;
+  title: string;
+  intent: AnalysisIntent;
+  width: CanvasItemWidth;
+  position: number;
+  sourceConversationId: string;
+  sourceTurnId: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CanvasQueryResponse {
+  itemId: string;
+  result: ResultArtifact;
+  resolvedTimeRange?: QueryIR["timeRange"];
+  refreshedAt: string;
 }
 
 export interface Conversation {
@@ -838,6 +861,7 @@ export interface DataSourceInput {
 
 export interface BootstrapPayload {
   conversations: Conversation[];
+  canvasItems: CanvasItem[];
   ontology: OntologySnapshot;
   ontologyDraft?: OntologySnapshot;
   tables: PhysicalTable[];

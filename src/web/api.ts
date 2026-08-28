@@ -1,6 +1,9 @@
 import type {
   AgentPromptConfig,
   BootstrapPayload,
+  CanvasItem,
+  CanvasItemWidth,
+  CanvasQueryResponse,
   Conversation,
   DataAgentEvent,
   DataSourceInput,
@@ -42,6 +45,32 @@ export const api = {
     request<Turn>(`/api/conversations/${conversationId}/turns`, {
       method: "POST",
       body: JSON.stringify({ question }),
+    }),
+  addCanvasItem: (conversationId: string, turnId: string) =>
+    request<CanvasItem>("/api/canvas-items", {
+      method: "POST",
+      body: JSON.stringify({ conversationId, turnId }),
+    }),
+  updateCanvasItem: (
+    id: string,
+    input: Partial<Pick<CanvasItem, "title" | "position">> & {
+      width?: CanvasItemWidth;
+    },
+  ) =>
+    request<CanvasItem>(`/api/canvas-items/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    }),
+  reorderCanvasItems: (itemIds: string[]) =>
+    request<{ items: CanvasItem[] }>("/api/canvas-items/order", {
+      method: "PUT",
+      body: JSON.stringify({ itemIds }),
+    }),
+  deleteCanvasItem: (id: string) =>
+    request<{ ok: true }>(`/api/canvas-items/${id}`, { method: "DELETE" }),
+  queryCanvasItem: (id: string) =>
+    request<CanvasQueryResponse>(`/api/canvas-items/${id}/query`, {
+      method: "POST",
     }),
   saveAgentConfig: (
     input: Pick<AgentPromptConfig, "businessInstructions" | "timezone">,

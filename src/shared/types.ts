@@ -604,6 +604,7 @@ export interface CanvasItem {
   id: string;
   title: string;
   intent: AnalysisIntent;
+  presentation?: "chart" | "metric";
   width: CanvasItemWidth;
   position: number;
   sourceConversationId: string;

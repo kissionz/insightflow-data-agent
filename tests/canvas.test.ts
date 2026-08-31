@@ -8,6 +8,7 @@ import type {
   PhysicalTable,
 } from "../src/shared/types.js";
 import {
+  canvasPresentationForResult,
   CanvasQueryService,
   MAX_CONCURRENT_CANVAS_QUERIES,
 } from "../src/server/canvas.js";
@@ -26,7 +27,10 @@ describe("CanvasQueryService", () => {
     const repository = createRepository();
     const execute = vi.fn(async () => ({
       columns: ["日期", "成交金额"],
-      rows: [{ 日期: "2026-08-28", 成交金额: 1280 }],
+      rows: [
+        { 日期: "2026-08-27", 成交金额: 1180 },
+        { 日期: "2026-08-28", 成交金额: 1280 },
+      ],
       durationMs: 12,
       truncated: false,
     }));
@@ -66,6 +70,30 @@ describe("CanvasQueryService", () => {
       180_000,
     );
     expect(response.result.chart.title).toBe("本月成交金额");
+    expect(canvasPresentationForResult(response.result)).toBe("chart");
+    repository.close();
+  });
+
+  it("returns KPI-only query results as metric canvas components", async () => {
+    const repository = createRepository();
+    const execute = vi.fn(async () => ({
+      columns: ["成交金额"],
+      rows: [{ 成交金额: 1280 }],
+      durationMs: 8,
+      truncated: false,
+    }));
+    const service = new CanvasQueryService(repository, execute);
+    const item = canvasItem("canvas_metric");
+    delete item.intent.timeRange;
+    delete item.intent.timeGrain;
+
+    const response = await service.query(item);
+
+    expect(response.result.chart.type).toBe("none");
+    expect(response.result.kpis).toEqual([
+      expect.objectContaining({ label: "成交金额", value: "¥1,280" }),
+    ]);
+    expect(canvasPresentationForResult(response.result)).toBe("metric");
     repository.close();
   });
 

@@ -1730,11 +1730,20 @@ tbody tr:hover {
   background: var(--canvas);
 }
 
-.result-card-actions {
+.answer-heading-actions {
   display: flex;
   flex: 0 0 auto;
   align-items: center;
   gap: 8px;
+  margin-left: auto;
+}
+
+.answer-heading-actions .completed-chip {
+  margin-left: 0;
+}
+
+.canvas-add-button {
+  min-height: 30px;
 }
 
 .subtle-button.canvas-added {
@@ -1813,11 +1822,14 @@ tbody tr:hover {
 .canvas-grid {
   display: grid;
   width: 100%;
-  max-width: 1480px;
   grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
   gap: 16px;
-  margin: 0 auto;
-  padding: 24px 28px 52px;
+  padding: 24px 36px 52px;
+}
+
+.canvas-grid.single {
+  grid-template-columns: minmax(0, 1fr);
 }
 
 .canvas-card {
@@ -1828,6 +1840,21 @@ tbody tr:hover {
   border-radius: 12px;
   background: white;
   box-shadow: var(--shadow);
+  transition:
+    border-color 180ms cubic-bezier(0.22, 1, 0.36, 1),
+    box-shadow 180ms cubic-bezier(0.22, 1, 0.36, 1),
+    opacity 180ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.canvas-card.dragging {
+  opacity: 0.52;
+}
+
+.canvas-card.drag-target {
+  border-color: color-mix(in oklab, var(--blue), white 35%);
+  box-shadow:
+    0 0 0 3px color-mix(in oklab, var(--blue), transparent 87%),
+    var(--shadow);
 }
 
 .canvas-card.wide {
@@ -1877,6 +1904,22 @@ tbody tr:hover {
   width: 30px;
   height: 30px;
   min-height: 30px;
+}
+
+.canvas-drag-handle {
+  cursor: grab;
+  color: var(--muted-2);
+  touch-action: none;
+  user-select: none;
+}
+
+.canvas-drag-handle:active {
+  cursor: grabbing;
+}
+
+.canvas-drag-handle:focus-visible {
+  outline: 2px solid color-mix(in oklab, var(--blue), white 15%);
+  outline-offset: 2px;
 }
 
 .canvas-item-menu {
@@ -1932,6 +1975,91 @@ tbody tr:hover {
 .canvas-card-body {
   min-height: 304px;
   padding: 12px 14px;
+}
+
+.canvas-card.metric .canvas-card-body {
+  min-height: 220px;
+}
+
+.canvas-metric-grid {
+  display: grid;
+  min-height: 196px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  place-content: center;
+  padding: 14px;
+}
+
+.canvas-metric-grid.single {
+  grid-template-columns: minmax(220px, 520px);
+  justify-content: center;
+}
+
+.canvas-metric {
+  display: flex;
+  min-width: 0;
+  min-height: 128px;
+  flex-direction: column;
+  justify-content: center;
+  border: 1px solid #e8edf4;
+  border-radius: 10px;
+  background: #f8faff;
+  padding: 20px 22px;
+}
+
+.canvas-metric span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.canvas-metric strong {
+  overflow: hidden;
+  margin-top: 9px;
+  color: var(--ink);
+  font-size: 30px;
+  letter-spacing: -0.04em;
+  line-height: 1.15;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.canvas-metric small {
+  margin-top: 7px;
+  color: var(--success);
+  font-size: 10px;
+}
+
+.canvas-metric-skeleton {
+  display: grid;
+  min-height: 196px;
+  place-items: center;
+}
+
+.canvas-metric-skeleton > div {
+  width: min(520px, 86%);
+  border: 1px solid #edf1f6;
+  border-radius: 10px;
+  background: #f8faff;
+  padding: 25px 24px;
+}
+
+.canvas-metric-skeleton i {
+  display: block;
+  height: 10px;
+  border-radius: 4px;
+  background: linear-gradient(100deg, #e8eef8 30%, #f8faff 50%, #e8eef8 70%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s linear infinite;
+}
+
+.canvas-metric-skeleton i:first-child {
+  width: 92px;
+}
+
+.canvas-metric-skeleton i:last-child {
+  width: 210px;
+  height: 28px;
+  margin-top: 14px;
 }
 
 .canvas-card-footer {
@@ -3833,6 +3961,15 @@ tbody tr:hover {
   .canvas-card.wide,
   .canvas-add-hint {
     grid-column: 1;
+  }
+
+  .answer-heading {
+    align-items: flex-start;
+  }
+
+  .answer-heading-actions {
+    align-items: flex-end;
+    flex-direction: column;
   }
 }
 

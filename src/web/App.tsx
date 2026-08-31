@@ -6,6 +6,8 @@ import {
   useMemo,
   useRef,
   useState,
+  type DragEvent as ReactDragEvent,
+  type PointerEvent as ReactPointerEvent,
 } from "react";
 import {
   ArrowClockwise,
@@ -25,6 +27,7 @@ import {
   CirclesFour,
   Clock,
   Database,
+  DotsSixVertical,
   DotsThreeVertical,
   GearSix,
   GitBranch,
@@ -985,6 +988,9 @@ function ResultCard({
   const result = turn.result!;
   const partial = turn.status === "partial";
   const hasChart = result.chart.type !== "none";
+  const canAddToCanvas = Boolean(
+    turn.resultIntent && (hasChart || result.kpis.length),
+  );
   const [tableOpen, setTableOpen] = useState(!hasChart);
   const [addingToCanvas, setAddingToCanvas] = useState(false);
   const chartOption = useMemo(
@@ -1008,12 +1014,36 @@ function ResultCard({
           <span className="message-label">InsightFlow</span>
           <strong>{partial ? "分析部分完成" : "分析完成"}</strong>
         </div>
-        <span className={`completed-chip ${partial ? "partial" : ""}`}>
-          {partial ? <Info size={15} /> : <CheckCircle size={15} weight="fill" />}
-          {turn.analysisRun?.steps.length
-            ? `${turn.analysisRun.steps.filter((step) => step.status === "completed").length} 步真实查询`
-            : "真实查询"}
-        </span>
+        <div className="answer-heading-actions">
+          <span className={`completed-chip ${partial ? "partial" : ""}`}>
+            {partial ? <Info size={15} /> : <CheckCircle size={15} weight="fill" />}
+            {turn.analysisRun?.steps.length
+              ? `${turn.analysisRun.steps.filter((step) => step.status === "completed").length} 步真实查询`
+              : "真实查询"}
+          </span>
+          {canAddToCanvas ? (
+            <button
+              className={`subtle-button canvas-add-button ${addedToCanvas ? "canvas-added" : ""}`}
+              disabled={addedToCanvas || addingToCanvas}
+              onClick={async () => {
+                setAddingToCanvas(true);
+                try {
+                  await onAddToCanvas(turn);
+                } finally {
+                  setAddingToCanvas(false);
+                }
+              }}
+            >
+              {addedToCanvas ? (
+                <><Check size={14} /> 已添加</>
+              ) : addingToCanvas ? (
+                "添加中…"
+              ) : (
+                <><Plus size={14} /> 添加到画布</>
+              )}
+            </button>
+          ) : null}
+        </div>
       </div>
       <p className="conclusion">{result.conclusion}</p>
       {result.kpis.length ? (
@@ -1036,38 +1066,14 @@ function ResultCard({
               <p className="chart-rationale">{result.chart.rationale}</p>
               {result.chart.note ? <p className="chart-note">{result.chart.note}</p> : null}
             </div>
-            <div className="result-card-actions">
-              {turn.resultIntent ? (
-                <button
-                  className={`subtle-button ${addedToCanvas ? "canvas-added" : ""}`}
-                  disabled={addedToCanvas || addingToCanvas}
-                  onClick={async () => {
-                    setAddingToCanvas(true);
-                    try {
-                      await onAddToCanvas(turn);
-                    } finally {
-                      setAddingToCanvas(false);
-                    }
-                  }}
-                >
-                  {addedToCanvas ? (
-                    <><Check size={14} /> 已添加</>
-                  ) : addingToCanvas ? (
-                    "添加中…"
-                  ) : (
-                    <><Plus size={14} /> 添加到画布</>
-                  )}
-                </button>
-              ) : null}
-              <button
-                className="subtle-button"
-                aria-expanded={tableOpen}
-                aria-controls={tableId}
-                onClick={() => setTableOpen((open) => !open)}
-              >
-                {tableOpen ? "收起数据" : "查看数据"}
-              </button>
-            </div>
+            <button
+              className="subtle-button"
+              aria-expanded={tableOpen}
+              aria-controls={tableId}
+              onClick={() => setTableOpen((open) => !open)}
+            >
+              {tableOpen ? "收起数据" : "查看数据"}
+            </button>
           </div>
           <Suspense fallback={<div className="chart-view chart-loading">正在绘制图表…</div>}>
             <ChartView
@@ -1284,6 +1290,8 @@ function CanvasWorkspace({
   onError: (message: string) => void;
 }) {
   const [runtime, setRuntime] = useState<Record<string, CanvasRuntimeState>>({});
+  const [draggedId, setDraggedId] = useState("");
+  const [dragOverId, setDragOverId] = useState("");
   const autoQueriedIds = useRef(new Set<string>());
 
   const refreshItem = useCallback(async (item: CanvasItem) => {
@@ -1369,6 +1377,27 @@ function CanvasWorkspace({
     }
   }
 
+  async function moveItemTo(sourceId: string, targetId: string) {
+    if (!sourceId || sourceId === targetId) return;
+    const sourceIndex = items.findIndex((item) => item.id === sourceId);
+    const targetIndex = items.findIndex((item) => item.id === targetId);
+    if (sourceIndex < 0 || targetIndex < 0) return;
+    const previous = items;
+    const ordered = [...items];
+    const [moving] = ordered.splice(sourceIndex, 1);
+    if (!moving) return;
+    ordered.splice(targetIndex, 0, moving);
+    const positioned = ordered.map((item, position) => ({ ...item, position }));
+    onItems(positioned);
+    try {
+      const saved = await api.reorderCanvasItems(positioned.map((item) => item.id));
+      onItems(saved.items);
+    } catch (reason) {
+      onItems(previous);
+      onError(asMessage(reason));
+    }
+  }
+
   async function removeItem(item: CanvasItem) {
     const previous = items;
     onItems(items.filter((current) => current.id !== item.id));
@@ -1419,7 +1448,10 @@ function CanvasWorkspace({
       </header>
 
       {items.length ? (
-        <section className="canvas-grid" aria-label="重点指标图表">
+        <section
+          className={`canvas-grid ${items.length === 1 ? "single" : ""}`}
+          aria-label="重点指标组件"
+        >
           {items.map((item, index) => (
             <CanvasChartCard
               key={item.id}
@@ -1431,6 +1463,53 @@ function CanvasWorkspace({
               onToggleWidth={() => void toggleWidth(item)}
               onMove={(direction) => void moveItem(index, direction)}
               onRemove={() => void removeItem(item)}
+              isDragging={draggedId === item.id}
+              isDragTarget={dragOverId === item.id && draggedId !== item.id}
+              onNativeDragStart={(event) => {
+                event.dataTransfer.effectAllowed = "move";
+                event.dataTransfer.setData("text/plain", item.id);
+                setDraggedId(item.id);
+              }}
+              onNativeDragOver={(event) => {
+                if (draggedId === item.id) return;
+                event.preventDefault();
+                event.dataTransfer.dropEffect = "move";
+                if (draggedId) setDragOverId(item.id);
+              }}
+              onNativeDrop={(event) => {
+                event.preventDefault();
+                const sourceId = event.dataTransfer.getData("text/plain") || draggedId;
+                setDraggedId("");
+                setDragOverId("");
+                if (sourceId) void moveItemTo(sourceId, item.id);
+              }}
+              onNativeDragEnd={() => {
+                setDraggedId("");
+                setDragOverId("");
+              }}
+              onPointerStart={(event) => {
+                event.currentTarget.setPointerCapture(event.pointerId);
+                setDraggedId(item.id);
+              }}
+              onPointerMove={(event) => {
+                if ((event.buttons & 1) === 0) return;
+                const targetId = canvasItemIdAtPoint(event.clientX, event.clientY);
+                setDragOverId(targetId && targetId !== item.id ? targetId : "");
+              }}
+              onPointerEnd={(event) => {
+                if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+                  event.currentTarget.releasePointerCapture(event.pointerId);
+                }
+                const targetId =
+                  canvasItemIdAtPoint(event.clientX, event.clientY) || dragOverId;
+                setDraggedId("");
+                setDragOverId("");
+                if (targetId) void moveItemTo(item.id, targetId);
+              }}
+              onPointerCancel={() => {
+                setDraggedId("");
+                setDragOverId("");
+              }}
             />
           ))}
           <button className="canvas-add-hint" onClick={onBack}>
@@ -1458,6 +1537,16 @@ function CanvasChartCard({
   onToggleWidth,
   onMove,
   onRemove,
+  isDragging,
+  isDragTarget,
+  onPointerStart,
+  onPointerMove,
+  onPointerEnd,
+  onPointerCancel,
+  onNativeDragStart,
+  onNativeDragOver,
+  onNativeDrop,
+  onNativeDragEnd,
 }: {
   item: CanvasItem;
   index: number;
@@ -1467,6 +1556,16 @@ function CanvasChartCard({
   onToggleWidth: () => void;
   onMove: (direction: -1 | 1) => void;
   onRemove: () => void;
+  isDragging: boolean;
+  isDragTarget: boolean;
+  onPointerStart: (event: ReactPointerEvent<HTMLSpanElement>) => void;
+  onPointerMove: (event: ReactPointerEvent<HTMLSpanElement>) => void;
+  onPointerEnd: (event: ReactPointerEvent<HTMLSpanElement>) => void;
+  onPointerCancel: () => void;
+  onNativeDragStart: (event: ReactDragEvent<HTMLSpanElement>) => void;
+  onNativeDragOver: (event: ReactDragEvent<HTMLElement>) => void;
+  onNativeDrop: (event: ReactDragEvent<HTMLElement>) => void;
+  onNativeDragEnd: () => void;
 }) {
   const response = runtime?.status === "ready" ? runtime.response : undefined;
   const chartOption = useMemo(
@@ -1480,9 +1579,18 @@ function CanvasChartCard({
         response.resolvedTimeRange.endExclusive,
       )
     : "";
+  const showsMetric = Boolean(
+    response && response.result.chart.type === "none" && response.result.kpis.length,
+  );
+  const metricPresentation = item.presentation === "metric" || showsMetric;
 
   return (
-    <article className={`canvas-card ${item.width === "wide" ? "wide" : ""}`}>
+    <article
+      className={`canvas-card ${item.width === "wide" ? "wide" : ""} ${metricPresentation ? "metric" : ""} ${isDragging ? "dragging" : ""} ${isDragTarget ? "drag-target" : ""}`}
+      data-canvas-item-id={item.id}
+      onDragOver={onNativeDragOver}
+      onDrop={onNativeDrop}
+    >
       <div className="canvas-card-header">
         <div>
           <span className="section-kicker">{relativeTimeLabel}</span>
@@ -1490,6 +1598,32 @@ function CanvasChartCard({
           {resolvedLabel ? <p>{resolvedLabel}</p> : null}
         </div>
         <div className="canvas-card-actions">
+          <span
+            className="icon-button canvas-drag-handle"
+            role="button"
+            tabIndex={0}
+            aria-label={`拖动${item.title}调整位置`}
+            title="拖动排序，也可使用方向键"
+            draggable
+            onDragStart={onNativeDragStart}
+            onDragEnd={onNativeDragEnd}
+            onPointerDown={onPointerStart}
+            onPointerMove={onPointerMove}
+            onPointerUp={onPointerEnd}
+            onPointerCancel={onPointerCancel}
+            onKeyDown={(event) => {
+              if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+                event.preventDefault();
+                onMove(-1);
+              }
+              if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+                event.preventDefault();
+                onMove(1);
+              }
+            }}
+          >
+            <DotsSixVertical size={18} />
+          </span>
           <button
             className="icon-button"
             aria-label={`刷新${item.title}`}
@@ -1499,14 +1633,16 @@ function CanvasChartCard({
           >
             <ArrowClockwise size={17} className={runtime?.status === "loading" ? "rotating" : ""} />
           </button>
-          <button
-            className="icon-button"
-            aria-label={item.width === "wide" ? "恢复标准宽度" : "横向展开"}
-            title={item.width === "wide" ? "恢复标准宽度" : "横向展开"}
-            onClick={onToggleWidth}
-          >
-            {item.width === "wide" ? <ArrowsInSimple size={17} /> : <ArrowsOutSimple size={17} />}
-          </button>
+          {total > 1 ? (
+            <button
+              className="icon-button"
+              aria-label={item.width === "wide" ? "恢复标准宽度" : "横向展开"}
+              title={item.width === "wide" ? "恢复标准宽度" : "横向展开"}
+              onClick={onToggleWidth}
+            >
+              {item.width === "wide" ? <ArrowsInSimple size={17} /> : <ArrowsOutSimple size={17} />}
+            </button>
+          ) : null}
           <details className="canvas-item-menu">
             <summary className="icon-button" aria-label="图表操作">
               <DotsThreeVertical size={18} />
@@ -1527,7 +1663,7 @@ function CanvasChartCard({
       </div>
       <div className="canvas-card-body">
         {!runtime || runtime.status === "loading" ? (
-          <CanvasChartSkeleton />
+          metricPresentation ? <CanvasMetricSkeleton /> : <CanvasChartSkeleton />
         ) : runtime.status === "error" ? (
           <div className="canvas-query-error">
             <Warning size={24} weight="duotone" />
@@ -1535,6 +1671,8 @@ function CanvasChartCard({
             <p>{runtime.message}</p>
             <button className="subtle-button" onClick={onRefresh}>重新查询</button>
           </div>
+        ) : showsMetric ? (
+          <CanvasMetricView result={runtime.response.result} />
         ) : chartOption ? (
           <Suspense fallback={<CanvasChartSkeleton />}>
             <ChartView
@@ -1558,6 +1696,38 @@ function CanvasChartCard({
         </footer>
       ) : null}
     </article>
+  );
+}
+
+function canvasItemIdAtPoint(clientX: number, clientY: number): string {
+  const card = document
+    .elementFromPoint(clientX, clientY)
+    ?.closest<HTMLElement>(".canvas-card");
+  return card?.dataset.canvasItemId ?? "";
+}
+
+function CanvasMetricView({ result }: { result: ResultArtifact }) {
+  return (
+    <div className={`canvas-metric-grid ${result.kpis.length === 1 ? "single" : ""}`}>
+      {result.kpis.map((kpi) => (
+        <div className="canvas-metric" key={kpi.label}>
+          <span>{kpi.label}</span>
+          <strong>{kpi.value}</strong>
+          {kpi.change ? <small>{kpi.change} 环比</small> : null}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function CanvasMetricSkeleton() {
+  return (
+    <div className="canvas-metric-skeleton" aria-label="正在查询指标">
+      <div>
+        <i />
+        <i />
+      </div>
+    </div>
   );
 }
 

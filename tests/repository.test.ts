@@ -98,6 +98,7 @@ describe("Repository schema reconciliation", () => {
         resultKind: "aggregate",
         title: "本月成交金额",
       },
+      presentation: "metric",
       width: "standard",
       position: 0,
       sourceConversationId: "conv_1",
@@ -114,6 +115,7 @@ describe("Repository schema reconciliation", () => {
         id: "canvas_gmv",
         title: "成交金额",
         width: "wide",
+        presentation: "metric",
         intent: item.intent,
       }),
     ]);

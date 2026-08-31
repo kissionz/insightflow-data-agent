@@ -1,6 +1,7 @@
 import type {
   CanvasItem,
   CanvasQueryResponse,
+  ResultArtifact,
 } from "../shared/types.js";
 import { QueryIrCompiler } from "./query-ir.js";
 import { Repository } from "./repository.js";
@@ -9,6 +10,14 @@ import type { QueryResult } from "./selectdb.js";
 import { guardReadOnlySql } from "./sql-guard.js";
 
 export const MAX_CONCURRENT_CANVAS_QUERIES = 5;
+
+export function canvasPresentationForResult(
+  result: ResultArtifact,
+): CanvasItem["presentation"] | null {
+  if (result.chart.type !== "none") return "chart";
+  if (result.kpis.length) return "metric";
+  return null;
+}
 
 type ExecuteLiveQuery = (
   sql: string,

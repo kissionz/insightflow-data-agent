@@ -15,7 +15,10 @@ import type {
   SafeDataSourceConfig,
 } from "../shared/types.js";
 import { DataAgent } from "./agent.js";
-import { CanvasQueryService } from "./canvas.js";
+import {
+  canvasPresentationForResult,
+  CanvasQueryService,
+} from "./canvas.js";
 import { loadConfig } from "./config.js";
 import { EventHub } from "./events.js";
 import { DataAgentHarness } from "./harness.js";
@@ -239,7 +242,10 @@ app.post<{ Body: { conversationId?: string; turnId?: string } }>(
     const conversation = repository.getConversation(conversationId);
     const turn = conversation?.turns.find((item) => item.id === turnId);
     if (!turn) return reply.code(404).send({ message: "查询结果不存在" });
-    if (!turn.resultIntent || !turn.result || turn.result.chart.type === "none") {
+    const presentation = turn.result
+      ? canvasPresentationForResult(turn.result)
+      : null;
+    if (!turn.resultIntent || !turn.result || !presentation) {
       return reply.code(409).send({ message: "当前结果无法添加到画布" });
     }
 
@@ -248,6 +254,7 @@ app.post<{ Body: { conversationId?: string; turnId?: string } }>(
       id: createId("canvas"),
       title: turn.result.chart.title,
       intent: structuredClone(turn.resultIntent),
+      presentation,
       width: "standard",
       position: repository.getCanvasItems().length,
       sourceConversationId: conversationId,

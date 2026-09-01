@@ -1215,7 +1215,202 @@ describe("QueryIrCompiler", () => {
       ),
     ).toThrow("半可加指标");
   });
+
+  it("allows composition expansion for detail queries and blocks unsafe aggregation", () => {
+    const ontology = structuredClone(testOntology);
+    ontology.relations[0] = {
+      ...ontology.relations[0]!,
+      type: "COMPOSITION",
+      direction: "BIDIRECTIONAL",
+      composition: {
+        childObjectId: "o_order",
+        parentObjectId: "o_customer",
+        ownership: "OWNED",
+        aggregationPolicy: "PRE_AGGREGATE_CHILD",
+      },
+    };
+    const compiler = new QueryIrCompiler();
+    const detail = compiler.compile(
+      {
+        rootObjectId: "o_customer",
+        measureIds: [],
+        dimensionPropertyIds: ["p_order_id"],
+        filters: [],
+        resultKind: "detail",
+        title: "客户订单明细",
+      },
+      ontology,
+      [ordersTable(), customerTable()],
+    );
+
+    expect(detail.sql).toContain("LEFT JOIN `retail`.`fact_orders`");
+    expect(() =>
+      compiler.compile(
+        {
+          rootObjectId: "o_customer",
+          measureIds: [],
+          dimensionPropertyIds: ["p_order_id"],
+          filters: [],
+          resultKind: "aggregate",
+          title: "错误的主到子聚合",
+        },
+        ontology,
+        [ordersTable(), customerTable()],
+      ),
+    ).toThrow("会放大 客户 的聚合行数");
+  });
+
+  it("rebases parent-root aggregation to the governed child fact grain", () => {
+    const ontology = structuredClone(testOntology);
+    ontology.relations[0] = {
+      ...ontology.relations[0]!,
+      type: "COMPOSITION",
+      direction: "BIDIRECTIONAL",
+      composition: {
+        childObjectId: "o_order",
+        parentObjectId: "o_customer",
+        ownership: "OWNED",
+        aggregationPolicy: "PRE_AGGREGATE_CHILD",
+      },
+    };
+    const compiled = new QueryIrCompiler().compile(
+      {
+        rootObjectId: "o_customer",
+        measureIds: ["m_gmv"],
+        dimensionPropertyIds: ["p_customer_level"],
+        filters: [],
+        resultKind: "aggregate",
+        title: "按会员等级汇总订单金额",
+      },
+      ontology,
+      [ordersTable(), customerTable()],
+    );
+
+    expect(compiled.ir.rootObjectId).toBe("o_order");
+    expect(compiled.sql).toContain("FROM `retail`.`fact_orders` AS t0");
+    expect(compiled.sql).toContain("LEFT JOIN `retail`.`dim_customers` AS t1");
+  });
+
+  it("compiles recursive hierarchy filters through a closure table", () => {
+    const ontology = ontologyWithRecursiveCustomerHierarchy();
+    const compiled = new QueryIrCompiler().compile(
+      {
+        rootObjectId: "o_order",
+        measureIds: ["m_gmv"],
+        dimensionPropertyIds: ["p_customer_level"],
+        filters: [],
+        hierarchyFilters: [{
+          hierarchyId: "hierarchy_customer_tree",
+          anchorValue: "100",
+          direction: "DESCENDANTS",
+          includeSelf: false,
+        }],
+        resultKind: "aggregate",
+        title: "客户组织后代订单金额",
+      },
+      ontology,
+      [ordersTable(), customerTable(), customerClosureTable()],
+    );
+
+    expect(compiled.sql).toContain("FROM `retail`.`customer_closure` AS hc1");
+    expect(compiled.sql).toContain("hc1.`descendant_id` = t1.`customer_id`");
+    expect(compiled.sql).toContain("hc1.`ancestor_id` = ?");
+    expect(compiled.sql).toContain("hc1.`depth` >= 1");
+    expect(compiled.parameters).toEqual(["100"]);
+    expect(compiled.ir.hierarchyFilters[0]).toMatchObject({
+      hierarchyId: "hierarchy_customer_tree",
+      closureObjectId: "o_customer_closure",
+    });
+  });
 });
+
+function ontologyWithRecursiveCustomerHierarchy() {
+  const ontology = structuredClone(testOntology);
+  const customer = ontology.objects.find((object) => object.id === "o_customer")!;
+  customer.properties.push({
+    ...customer.properties[0]!,
+    id: "p_customer_parent_id",
+    name: "parent_customer_id",
+    label: "上级客户ID",
+    sourceColumn: "parent_customer_id",
+    meaning: "ENTITY_REFERENCE",
+    unique: false,
+  });
+  ontology.objects.push({
+    ...structuredClone(customer),
+    id: "o_customer_closure",
+    name: "customer_closure",
+    label: "客户层级闭包",
+    sourceTableId: "t_customer_closure",
+    objectType: "RELATIONSHIP",
+    grain: "一行代表一组祖先后代路径",
+    grainPropertyIds: ["p_closure_ancestor"],
+    properties: [
+      {
+        ...customer.properties[0]!,
+        id: "p_closure_ancestor",
+        name: "ancestor_id",
+        label: "祖先ID",
+        sourceColumn: "ancestor_id",
+      },
+      {
+        ...customer.properties[0]!,
+        id: "p_closure_descendant",
+        name: "descendant_id",
+        label: "后代ID",
+        sourceColumn: "descendant_id",
+        meaning: "ENTITY_REFERENCE",
+        unique: false,
+      },
+      {
+        ...ontology.objects[0]!.properties[1]!,
+        id: "p_closure_depth",
+        name: "depth",
+        label: "深度",
+        sourceColumn: "depth",
+        dataType: "BIGINT",
+      },
+    ],
+  });
+  ontology.relations.push({
+    id: "r_customer_parent",
+    name: "客户父节点",
+    sourceObjectId: "o_customer",
+    targetObjectId: "o_customer",
+    type: "HIERARCHY",
+    cardinality: "MANY_TO_ONE",
+    joinExpression: "dim_customers.parent_customer_id = dim_customers.customer_id",
+    sourcePropertyId: "p_customer_parent_id",
+    targetPropertyId: "p_customer_id",
+    direction: "SOURCE_TO_TARGET",
+    required: false,
+    enabled: true,
+    fanoutRisk: "NONE",
+    status: "PUBLISHED",
+  });
+  ontology.dimensionHierarchies = [{
+    id: "hierarchy_customer_tree",
+    name: "customer_tree",
+    label: "客户组织树",
+    kind: "ADJACENCY_LIST",
+    levels: [],
+    adjacency: {
+      objectId: "o_customer",
+      nodeIdPropertyId: "p_customer_id",
+      parentIdPropertyId: "p_customer_parent_id",
+      labelPropertyId: "p_customer_level",
+      maxDepth: 12,
+      closure: {
+        objectId: "o_customer_closure",
+        ancestorPropertyId: "p_closure_ancestor",
+        descendantPropertyId: "p_closure_descendant",
+        depthPropertyId: "p_closure_depth",
+      },
+    },
+    status: "PUBLISHED",
+  }];
+  return ontology;
+}
 
 function ontologyWithTime() {
   const ontology = structuredClone(testOntology);
@@ -1280,5 +1475,19 @@ function customerTable(): PhysicalTable {
     columns: [],
     fingerprint: "dim_customers:v1",
     scannedAt: "2026-07-28T00:00:00.000Z",
+  };
+}
+
+function customerClosureTable(): PhysicalTable {
+  return {
+    id: "t_customer_closure",
+    catalog: "internal",
+    database: "retail",
+    name: "customer_closure",
+    type: "TABLE",
+    status: "MODELED",
+    columns: [],
+    fingerprint: "customer_closure:v1",
+    scannedAt: "2026-09-01T00:00:00.000Z",
   };
 }

@@ -146,29 +146,71 @@ const relationSchema = z.object({
   sourcePropertyId: z.string().min(1).optional(),
   targetPropertyId: z.string().min(1).optional(),
   direction: z.enum(["BIDIRECTIONAL", "SOURCE_TO_TARGET", "TARGET_TO_SOURCE"]),
+  composition: z
+    .object({
+      parentObjectId: z.string().min(1),
+      childObjectId: z.string().min(1),
+      ownership: z.enum(["OWNED", "SHARED"]),
+      aggregationPolicy: z.enum(["PRE_AGGREGATE_CHILD", "EXISTS_ONLY"]),
+    })
+    .optional(),
   required: z.boolean(),
   enabled: z.boolean(),
   fanoutRisk: z.enum(["NONE", "LOW", "HIGH"]),
   status: entityStatusSchema,
 });
 
-export const dimensionHierarchyEditSchema = z.object({
-  hierarchy: z.object({
+const dimensionHierarchySchema = z
+  .object({
     id: z.string().min(1),
     name: z.string().trim().min(1).max(120),
     label: z.string().trim().min(1).max(120),
     description: z.string().max(2_000).optional(),
-    levels: z
-      .array(
-        z.object({
-          objectId: z.string().min(1),
-          propertyId: z.string().min(1),
-        }),
-      )
-      .min(2)
-      .max(20),
+    kind: z.enum(["FIXED_LEVELS", "ADJACENCY_LIST"]).optional(),
+    levels: z.array(z.object({
+      objectId: z.string().min(1),
+      propertyId: z.string().min(1),
+    })).max(20),
+    adjacency: z.object({
+      objectId: z.string().min(1),
+      nodeIdPropertyId: z.string().min(1),
+      parentIdPropertyId: z.string().min(1),
+      labelPropertyId: z.string().min(1),
+      maxDepth: z.number().int().min(1).max(100),
+      closure: z.object({
+        objectId: z.string().min(1),
+        ancestorPropertyId: z.string().min(1),
+        descendantPropertyId: z.string().min(1),
+        depthPropertyId: z.string().min(1),
+      }).optional(),
+    }).optional(),
     status: entityStatusSchema,
-  }),
+  })
+  .superRefine((hierarchy, context) => {
+    if ((hierarchy.kind ?? "FIXED_LEVELS") === "FIXED_LEVELS") {
+      if (hierarchy.levels.length < 2) {
+        context.addIssue({
+          code: z.ZodIssueCode.too_small,
+          minimum: 2,
+          inclusive: true,
+          origin: "array",
+          path: ["levels"],
+          message: "固定维度层级至少需要两个层级",
+        });
+      }
+      return;
+    }
+    if (!hierarchy.adjacency) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["adjacency"],
+        message: "递归维度层级缺少父子字段配置",
+      });
+    }
+  });
+
+export const dimensionHierarchyEditSchema = z.object({
+  hierarchy: dimensionHierarchySchema,
 });
 
 export const objectEditSchema = z.object({
@@ -192,11 +234,15 @@ export function createDraftFromPublished(
     objects: draft.objects.map((object) => ({ ...object, status: "DRAFT" })),
     relations: draft.relations.map((relation) => ({
       ...relation,
+      composition:
+        relation.type === "COMPOSITION"
+          ? relation.composition ?? defaultComposition(relation)
+          : undefined,
       status: "DRAFT",
     })),
     metrics: draft.metrics.map((metric) => ({ ...metric, status: "DRAFT" })),
     dimensionHierarchies: (draft.dimensionHierarchies ?? []).map(
-      (hierarchy) => ({ ...hierarchy, status: "DRAFT" }),
+      (hierarchy) => normalizeDimensionHierarchy(hierarchy, "DRAFT"),
     ),
   };
 }
@@ -400,8 +446,10 @@ export function upsertDimensionHierarchyInDraft(
 ): OntologySnapshot {
   const normalized = {
     ...hierarchy,
+    kind: hierarchy.kind ?? "FIXED_LEVELS" as const,
     status: "DRAFT" as const,
     levels: hierarchy.levels.map((level) => ({ ...level })),
+    adjacency: hierarchy.adjacency ? structuredClone(hierarchy.adjacency) : undefined,
   };
   const current = draft.dimensionHierarchies ?? [];
   return {
@@ -452,7 +500,9 @@ export function removeObjectFromDraft(
       ),
       dimensionHierarchies: (next.dimensionHierarchies ?? []).filter(
         (hierarchy) =>
-          !hierarchy.levels.some((level) => level.objectId === objectId),
+          !hierarchy.levels.some((level) => level.objectId === objectId) &&
+          hierarchy.adjacency?.objectId !== objectId &&
+          hierarchy.adjacency?.closure?.objectId !== objectId,
       ),
     },
   };
@@ -909,7 +959,54 @@ export function validateOntology(
         entityId: relation.id,
       });
     }
+    if (relation.type === "COMPOSITION") {
+      if (relation.sourceObjectId === relation.targetObjectId) {
+        issues.push(
+          error(
+            "COMPOSITION_SELF_REFERENCE",
+            `主子关系 ${relation.name} 不能指向同一个对象`,
+            source.id,
+            relation.id,
+          ),
+        );
+      }
+      if (!relation.composition) {
+        issues.push(
+          error(
+            "COMPOSITION_SEMANTICS_REQUIRED",
+            `主子关系 ${relation.name} 缺少主对象、子对象和聚合策略`,
+            source.id,
+            relation.id,
+          ),
+        );
+      } else {
+        if (
+          relation.composition.childObjectId !== relation.sourceObjectId ||
+          relation.composition.parentObjectId !== relation.targetObjectId
+        ) {
+          issues.push(
+            error(
+              "COMPOSITION_ENDPOINT_MISMATCH",
+              `主子关系 ${relation.name} 必须由子对象关联到主对象`,
+              source.id,
+              relation.id,
+            ),
+          );
+        }
+        if (!["MANY_TO_ONE", "ONE_TO_ONE"].includes(relation.cardinality)) {
+          issues.push(
+            error(
+              "COMPOSITION_CARDINALITY_INVALID",
+              `主子关系 ${relation.name} 只能配置为多对一或一对一`,
+              source.id,
+              relation.id,
+            ),
+          );
+        }
+      }
+    }
   }
+  validateCompositionGraph(snapshot, issues);
   for (const hierarchy of snapshot.dimensionHierarchies ?? []) {
     if (!hierarchy.name.trim() || !hierarchy.label.trim()) {
       issues.push(
@@ -920,6 +1017,10 @@ export function validateOntology(
           hierarchy.id,
         ),
       );
+    }
+    if ((hierarchy.kind ?? "FIXED_LEVELS") === "ADJACENCY_LIST") {
+      validateAdjacencyHierarchy(snapshot, hierarchy, issues);
+      continue;
     }
     if (hierarchy.levels.length < 2) {
       issues.push(
@@ -980,11 +1081,13 @@ export function validateOntology(
         (relation) =>
           relation.enabled &&
           relation.fanoutRisk !== "HIGH" &&
-          relation.cardinality !== "MANY_TO_MANY" &&
+          relation.direction === "BIDIRECTIONAL" &&
           ((relation.sourceObjectId === child.objectId &&
-            relation.targetObjectId === parent.objectId) ||
+            relation.targetObjectId === parent.objectId &&
+            ["MANY_TO_ONE", "ONE_TO_ONE"].includes(relation.cardinality)) ||
             (relation.sourceObjectId === parent.objectId &&
-              relation.targetObjectId === child.objectId)),
+              relation.targetObjectId === child.objectId &&
+              ["ONE_TO_MANY", "ONE_TO_ONE"].includes(relation.cardinality))),
       );
       if (!safeRelation) {
         issues.push(
@@ -1001,6 +1104,176 @@ export function validateOntology(
   return { valid: !issues.some((issue) => issue.level === "ERROR"), issues };
 }
 
+function normalizeDimensionHierarchy(
+  hierarchy: DimensionHierarchy,
+  status: DimensionHierarchy["status"],
+): DimensionHierarchy {
+  return {
+    ...hierarchy,
+    kind: hierarchy.kind ?? "FIXED_LEVELS",
+    status,
+    levels: hierarchy.levels.map((level) => ({ ...level })),
+    adjacency: hierarchy.adjacency
+      ? structuredClone(hierarchy.adjacency)
+      : undefined,
+  };
+}
+
+function validateAdjacencyHierarchy(
+  snapshot: OntologySnapshot,
+  hierarchy: DimensionHierarchy,
+  issues: OntologyValidationIssue[],
+): void {
+  const adjacency = hierarchy.adjacency;
+  if (!adjacency) {
+    issues.push(error(
+      "DIMENSION_HIERARCHY_ADJACENCY_REQUIRED",
+      `递归层级 ${hierarchy.label} 缺少父子字段配置`,
+      undefined,
+      hierarchy.id,
+    ));
+    return;
+  }
+  const object = snapshot.objects.find((candidate) => candidate.id === adjacency.objectId);
+  const node = object?.properties.find((property) => property.id === adjacency.nodeIdPropertyId);
+  const parent = object?.properties.find((property) => property.id === adjacency.parentIdPropertyId);
+  const label = object?.properties.find((property) => property.id === adjacency.labelPropertyId);
+  if (!object || !node || !parent || !label) {
+    issues.push(error(
+      "DIMENSION_HIERARCHY_ADJACENCY_INVALID",
+      `递归层级 ${hierarchy.label} 引用了不存在的节点对象或属性`,
+      adjacency.objectId,
+      hierarchy.id,
+    ));
+    return;
+  }
+  if (node.id === parent.id || node.meaning !== "ID" || parent.meaning !== "ENTITY_REFERENCE") {
+    issues.push(error(
+      "DIMENSION_HIERARCHY_ADJACENCY_KEYS_INVALID",
+      `递归层级 ${hierarchy.label} 必须使用不同的 ID 与关联实体字段表示节点和父节点`,
+      object.id,
+      hierarchy.id,
+    ));
+  }
+  if (node.dataType.toLowerCase() !== parent.dataType.toLowerCase()) {
+    issues.push(error(
+      "DIMENSION_HIERARCHY_ADJACENCY_TYPE_MISMATCH",
+      `递归层级 ${hierarchy.label} 的节点 ID 与父节点 ID 数据类型必须一致`,
+      object.id,
+      hierarchy.id,
+    ));
+  }
+  if ([node, parent, label].some((property) => property.visibility !== "ANALYTICAL" || property.sensitive)) {
+    issues.push(error(
+      "DIMENSION_HIERARCHY_ADJACENCY_NOT_ANALYTICAL",
+      `递归层级 ${hierarchy.label} 的节点、父节点和展示属性必须可分析且非敏感`,
+      object.id,
+      hierarchy.id,
+    ));
+  }
+  const selfRelation = snapshot.relations.some((relation) =>
+    relation.enabled &&
+    relation.type === "HIERARCHY" &&
+    relation.sourceObjectId === object.id &&
+    relation.targetObjectId === object.id &&
+    relation.sourcePropertyId === parent.id &&
+    relation.targetPropertyId === node.id &&
+    relation.direction !== "TARGET_TO_SOURCE",
+  );
+  if (!selfRelation) {
+    issues.push(error(
+      "DIMENSION_HIERARCHY_SELF_RELATION_REQUIRED",
+      `递归层级 ${hierarchy.label} 需要一条从父节点字段指向节点 ID 的启用层级关系`,
+      object.id,
+      hierarchy.id,
+    ));
+  }
+  const closure = adjacency.closure;
+  if (!closure) return;
+  const closureObject = snapshot.objects.find((candidate) => candidate.id === closure.objectId);
+  const ancestor = closureObject?.properties.find((property) => property.id === closure.ancestorPropertyId);
+  const descendant = closureObject?.properties.find((property) => property.id === closure.descendantPropertyId);
+  const depth = closureObject?.properties.find((property) => property.id === closure.depthPropertyId);
+  if (!closureObject || !ancestor || !descendant || !depth) {
+    issues.push(error(
+      "DIMENSION_HIERARCHY_CLOSURE_INVALID",
+      `递归层级 ${hierarchy.label} 的闭包表配置引用了不存在的对象或属性`,
+      closure.objectId,
+      hierarchy.id,
+    ));
+    return;
+  }
+  if (
+    ancestor.dataType.toLowerCase() !== node.dataType.toLowerCase() ||
+    descendant.dataType.toLowerCase() !== node.dataType.toLowerCase() ||
+    depth.meaning !== "NUMBER"
+  ) {
+    issues.push(error(
+      "DIMENSION_HIERARCHY_CLOSURE_TYPE_INVALID",
+      `递归层级 ${hierarchy.label} 的闭包表祖先/后代字段须匹配节点 ID，深度字段须为数字`,
+      closureObject.id,
+      hierarchy.id,
+    ));
+  }
+  if ([ancestor, descendant, depth].some((property) => property.visibility !== "ANALYTICAL" || property.sensitive)) {
+    issues.push(error(
+      "DIMENSION_HIERARCHY_CLOSURE_NOT_ANALYTICAL",
+      `递归层级 ${hierarchy.label} 的闭包表字段必须可分析且非敏感`,
+      closureObject.id,
+      hierarchy.id,
+    ));
+  }
+}
+
+function defaultComposition(
+  relation: Pick<OntologyRelation, "sourceObjectId" | "targetObjectId">,
+): NonNullable<OntologyRelation["composition"]> {
+  return {
+    childObjectId: relation.sourceObjectId,
+    parentObjectId: relation.targetObjectId,
+    ownership: "OWNED",
+    aggregationPolicy: "PRE_AGGREGATE_CHILD",
+  };
+}
+
+function validateCompositionGraph(
+  snapshot: OntologySnapshot,
+  issues: OntologyValidationIssue[],
+): void {
+  const childrenByParent = new Map<string, string[]>();
+  for (const relation of snapshot.relations) {
+    if (relation.type !== "COMPOSITION" || !relation.enabled) continue;
+    const semantics = relation.composition ?? defaultComposition(relation);
+    const children = childrenByParent.get(semantics.parentObjectId) ?? [];
+    children.push(semantics.childObjectId);
+    childrenByParent.set(semantics.parentObjectId, children);
+  }
+  const visited = new Set<string>();
+  const active = new Set<string>();
+  const visit = (objectId: string): boolean => {
+    if (active.has(objectId)) return true;
+    if (visited.has(objectId)) return false;
+    active.add(objectId);
+    for (const childId of childrenByParent.get(objectId) ?? []) {
+      if (visit(childId)) return true;
+    }
+    active.delete(objectId);
+    visited.add(objectId);
+    return false;
+  };
+  for (const object of snapshot.objects) {
+    if (!visit(object.id)) continue;
+    issues.push(
+      error(
+        "COMPOSITION_CYCLE",
+        "主子关系不能形成循环归属",
+        object.id,
+      ),
+    );
+    break;
+  }
+}
+
 export function publishDraft(draft: OntologySnapshot): OntologySnapshot {
   const published = structuredClone(draft);
   return {
@@ -1014,7 +1287,7 @@ export function publishDraft(draft: OntologySnapshot): OntologySnapshot {
     })),
     metrics: published.metrics.map((metric) => ({ ...metric, status: "PUBLISHED" })),
     dimensionHierarchies: (published.dimensionHierarchies ?? []).map(
-      (hierarchy) => ({ ...hierarchy, status: "PUBLISHED" }),
+      (hierarchy) => normalizeDimensionHierarchy(hierarchy, "PUBLISHED"),
     ),
   };
 }

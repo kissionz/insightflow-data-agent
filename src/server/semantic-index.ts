@@ -18,6 +18,28 @@ export interface SemanticMatch {
   propertyPriority: number;
 }
 
+export interface HierarchyStep {
+  hierarchyId: string;
+  hierarchyLabel: string;
+  fromLevel: number;
+  targetLevel: number;
+  objectId: string;
+  propertyId: string;
+}
+
+export interface RecursiveHierarchyMatch {
+  hierarchyId: string;
+  hierarchyLabel: string;
+  objectId: string;
+  nodeIdPropertyId: string;
+  parentIdPropertyId: string;
+  labelPropertyId: string;
+  maxDepth: number;
+  closure?: NonNullable<
+    NonNullable<OntologySnapshot["dimensionHierarchies"]>[number]["adjacency"]
+  >["closure"];
+}
+
 export class SemanticIndex {
   private readonly terms = new Map<string, SemanticMatch[]>();
   private readonly adjacency = new Map<string, Array<{ objectId: string; relationId: string }>>();
@@ -80,6 +102,48 @@ export class SemanticIndex {
       }
     }
     return [];
+  }
+
+  findHierarchySteps(
+    propertyId: string,
+    operation: "ROLL_UP" | "DRILL_DOWN",
+  ): HierarchyStep[] {
+    const offset = operation === "ROLL_UP" ? -1 : 1;
+    return (this.snapshot.dimensionHierarchies ?? []).flatMap((hierarchy) => {
+      if ((hierarchy.kind ?? "FIXED_LEVELS") !== "FIXED_LEVELS") return [];
+      const fromLevel = hierarchy.levels.findIndex(
+        (level) => level.propertyId === propertyId,
+      );
+      const targetLevel = fromLevel + offset;
+      const target = hierarchy.levels[targetLevel];
+      return fromLevel >= 0 && target
+        ? [
+            {
+              hierarchyId: hierarchy.id,
+              hierarchyLabel: hierarchy.label,
+              fromLevel,
+              targetLevel,
+              objectId: target.objectId,
+              propertyId: target.propertyId,
+            },
+          ]
+        : [];
+    });
+  }
+
+  findRecursiveHierarchy(hierarchyId: string): RecursiveHierarchyMatch | undefined {
+    const hierarchy = (this.snapshot.dimensionHierarchies ?? []).find(
+      (candidate) =>
+        candidate.id === hierarchyId &&
+        candidate.kind === "ADJACENCY_LIST" &&
+        candidate.adjacency,
+    );
+    if (!hierarchy?.adjacency) return undefined;
+    return {
+      hierarchyId: hierarchy.id,
+      hierarchyLabel: hierarchy.label,
+      ...hierarchy.adjacency,
+    };
   }
 
   private indexObject(object: OntologyObject): void {
@@ -157,13 +221,16 @@ export class SemanticIndex {
 
   private indexRelation(relation: OntologyRelation): void {
     if (!relation.enabled) return;
-    const source = this.adjacency.get(relation.sourceObjectId) ?? [];
-    source.push({ objectId: relation.targetObjectId, relationId: relation.id });
-    this.adjacency.set(relation.sourceObjectId, source);
-
-    const target = this.adjacency.get(relation.targetObjectId) ?? [];
-    target.push({ objectId: relation.sourceObjectId, relationId: relation.id });
-    this.adjacency.set(relation.targetObjectId, target);
+    if (relation.direction !== "TARGET_TO_SOURCE") {
+      const source = this.adjacency.get(relation.sourceObjectId) ?? [];
+      source.push({ objectId: relation.targetObjectId, relationId: relation.id });
+      this.adjacency.set(relation.sourceObjectId, source);
+    }
+    if (relation.direction !== "SOURCE_TO_TARGET") {
+      const target = this.adjacency.get(relation.targetObjectId) ?? [];
+      target.push({ objectId: relation.sourceObjectId, relationId: relation.id });
+      this.adjacency.set(relation.targetObjectId, target);
+    }
   }
 }
 

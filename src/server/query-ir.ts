@@ -3,6 +3,7 @@ import type {
   AnalysisFilterExpression,
   AnalysisIntent,
   DerivedMeasureCalculation,
+  HierarchyAnalysisFilter,
   Metric,
   OntologyObject,
   OntologyProperty,
@@ -15,7 +16,10 @@ import type {
   TimeGrain,
   WindowCalculation,
 } from "../shared/types.js";
-import { SemanticIndex } from "./semantic-index.js";
+import {
+  SemanticIndex,
+  type RecursiveHierarchyMatch,
+} from "./semantic-index.js";
 
 export interface CompiledQuery {
   ir: QueryIR;
@@ -52,6 +56,18 @@ export class QueryIrCompiler {
     const dimensions = intent.dimensionPropertyIds.map((id) =>
       requireProperty(propertyOwners, id, "分析维度"),
     );
+    const semanticIndex = new SemanticIndex(ontology);
+    const hierarchyFilters = (intent.hierarchyFilters ?? []).map((filter) => {
+      const hierarchy = semanticIndex.findRecursiveHierarchy(filter.hierarchyId);
+      if (!hierarchy) throw new Error(`递归层级不存在或尚未发布：${filter.hierarchyId}`);
+      if (!hierarchy.closure) {
+        throw new Error(`递归层级 ${hierarchy.hierarchyLabel} 未配置闭包表，不能执行祖先/后代过滤`);
+      }
+      if (!filter.anchorValue.trim()) {
+        throw new Error(`递归层级 ${hierarchy.hierarchyLabel} 的锚点节点不能为空`);
+      }
+      return { ...filter, hierarchy };
+    });
     const sourceFilters = intent.filterExpression
       ? flattenFilterExpression(intent.filterExpression)
       : intent.filters;
@@ -65,11 +81,20 @@ export class QueryIrCompiler {
     const aggregateFilters = intent.aggregateFilterExpression
       ? flattenAggregateFilterExpression(intent.aggregateFilterExpression)
       : intent.aggregateFilters ?? [];
-    const inferredRootId =
+    const requestedRootId =
       intent.rootObjectId ??
       measures[0]?.objectId ??
       dimensions[0]?.object.id ??
-      filters[0]?.binding.object.id;
+      filters[0]?.binding.object.id ??
+      hierarchyFilters[0]?.hierarchy.objectId;
+    const inferredRootId = requestedRootId
+      ? resolveCompositionAggregateRoot(
+          requestedRootId,
+          measures,
+          semanticIndex,
+          intent.resultKind,
+        )
+      : undefined;
     if (!inferredRootId) throw new Error("查询计划缺少主业务对象");
     const root = objectById.get(inferredRootId);
     if (!root) throw new Error(`主业务对象不存在：${inferredRootId}`);
@@ -94,9 +119,9 @@ export class QueryIrCompiler {
       ...filters
         .filter((filter) => filter.kind !== "BOUND_VALUE")
         .map((filter) => filter.binding.object.id),
+      ...hierarchyFilters.map((filter) => filter.hierarchy.objectId),
       ...(timeBinding ? [timeBinding.object.id] : []),
     ]);
-    const semanticIndex = new SemanticIndex(ontology);
     const outerRelationIds: string[] = [];
     const orderedObjects: OntologyObject[] = [root];
     for (const objectId of requiredObjectIds) {
@@ -143,6 +168,7 @@ export class QueryIrCompiler {
       intent.timeGrain?.unit,
       outerRelationIds,
       ontology,
+      intent.resultKind,
     );
 
     const selectParts: string[] = [];
@@ -269,6 +295,17 @@ export class QueryIrCompiler {
         ),
       );
       filterRelationIds.set(filter.valueBindingId, path.map((relation) => relation.id));
+    }
+    for (const filter of hierarchyFilters) {
+      whereParts.push(
+        compileHierarchyFilter(
+          filter,
+          aliases,
+          objectById,
+          tableById,
+          parameters,
+        ),
+      );
     }
     if (intent.filterExpression) {
       let filterIndex = 0;
@@ -427,6 +464,15 @@ export class QueryIrCompiler {
             }
           : filter,
       ),
+      hierarchyFilters: hierarchyFilters.map((filter) => ({
+        hierarchyId: filter.hierarchyId,
+        anchorValue: filter.anchorValue,
+        direction: filter.direction,
+        includeSelf: filter.includeSelf ?? true,
+        objectId: filter.hierarchy.objectId,
+        nodeIdPropertyId: filter.hierarchy.nodeIdPropertyId,
+        closureObjectId: filter.hierarchy.closure!.objectId,
+      })),
       filterExpression: intent.filterExpression,
       aggregateFilters,
       aggregateFilterExpression: intent.aggregateFilterExpression,
@@ -482,7 +528,10 @@ export class QueryIrCompiler {
       {
         label: "业务对象",
         value: root.label,
-        source: "本体对象",
+        source:
+          requestedRootId && requestedRootId !== root.id
+            ? `组合关系安全下沉（原主对象 ${objectById.get(requestedRootId)?.label ?? requestedRootId}）`
+            : "本体对象",
         entityId: root.id,
       },
       ...measureBindings.map(({ metric, source }) => ({
@@ -550,6 +599,12 @@ export class QueryIrCompiler {
             : "属性值绑定",
         entityId: binding.property.id,
       })),
+      ...hierarchyFilters.map((filter) => ({
+        label: "递归层级筛选",
+        value: `${filter.hierarchy.hierarchyLabel} · ${filter.direction === "DESCENDANTS" ? "后代" : "祖先"} · ${filter.anchorValue}`,
+        source: `闭包表参数化 EXISTS · ${filter.includeSelf === false ? "不含自身" : "包含自身"}`,
+        entityId: filter.hierarchyId,
+      })),
       ...aggregateFilters.map((filter) => ({
         label: "聚合后筛选",
         value: `${aggregateFilterEntityLabel(filter.entityId, intent, measureByReference)} ${filterOperatorLabel(filter.operator)} ${formatValue(filter.value)}`,
@@ -589,7 +644,7 @@ export class QueryIrCompiler {
         (intent.windowCalculations?.length ?? 0) +
         (intent.groupSelections?.length ?? 0) +
         (intent.periodConditions?.length ?? 0)
-      } 个计算 · ${filters.length + aggregateFilters.length + (resolvedTime ? 1 : 0)} 个条件`,
+      } 个计算 · ${filters.length + hierarchyFilters.length + aggregateFilters.length + (resolvedTime ? 1 : 0)} 个条件`,
     };
   }
 }
@@ -1058,6 +1113,35 @@ function formatNumericLiteral(value: number): string {
   return String(value);
 }
 
+function resolveCompositionAggregateRoot(
+  requestedRootId: string,
+  measures: Metric[],
+  semanticIndex: SemanticIndex,
+  resultKind: AnalysisIntent["resultKind"],
+): string {
+  if (resultKind !== "aggregate" || !measures.length) return requestedRootId;
+  const measureObjectIds = new Set(measures.map((measure) => measure.objectId));
+  if (measureObjectIds.size !== 1) return requestedRootId;
+  const measureObjectId = [...measureObjectIds][0]!;
+  if (measureObjectId === requestedRootId) return requestedRootId;
+  const path = semanticIndex.findRelationPath(measureObjectId, requestedRootId);
+  if (!path.length) return requestedRootId;
+  let currentId = measureObjectId;
+  for (const relation of path) {
+    const semantics = relation.composition;
+    if (
+      relation.type !== "COMPOSITION" ||
+      !semantics ||
+      semantics.aggregationPolicy !== "PRE_AGGREGATE_CHILD" ||
+      semantics.childObjectId !== currentId
+    ) {
+      return requestedRootId;
+    }
+    currentId = semantics.parentObjectId;
+  }
+  return currentId === requestedRootId ? measureObjectId : requestedRootId;
+}
+
 function validateAggregationSafety(
   root: OntologyObject,
   measures: Metric[],
@@ -1065,6 +1149,7 @@ function validateAggregationSafety(
   timeGrain: TimeGrain | undefined,
   relationIds: string[],
   ontology: OntologySnapshot,
+  resultKind: AnalysisIntent["resultKind"],
 ): void {
   const metricById = new Map(
     ontology.metrics.map((metric) => [metric.id, metric]),
@@ -1131,6 +1216,23 @@ function validateAggregationSafety(
       (fromSource && relation.cardinality === "ONE_TO_MANY") ||
       (fromTarget && relation.cardinality === "MANY_TO_ONE");
     if (expands) {
+      if (relation.type === "COMPOSITION") {
+        const policy = relation.composition?.aggregationPolicy ?? "PRE_AGGREGATE_CHILD";
+        if (policy === "EXISTS_ONLY") {
+          throw new Error(
+            `主子关系 ${relation.name} 仅允许用于 EXISTS 筛选，不能展开子对象`,
+          );
+        }
+        if (resultKind === "detail") {
+          joined.add(
+            fromSource ? relation.targetObjectId : relation.sourceObjectId,
+          );
+          continue;
+        }
+        throw new Error(
+          `主子关系 ${relation.name} 会放大 ${root.label} 的聚合行数；请改用子对象指标并按主对象维度汇总`,
+        );
+      }
       throw new Error(
         `关系 ${relation.name} 会放大 ${root.label} 的行数，IR 已阻止可能的重复聚合`,
       );
@@ -2146,6 +2248,68 @@ function validateRelationPath(path: OntologyRelation[]): void {
       throw new Error(`关系 ${relation.name} 缺少可编译的关联属性`);
     }
   }
+}
+
+function compileHierarchyFilter(
+  filter: HierarchyAnalysisFilter & { hierarchy: RecursiveHierarchyMatch },
+  aliases: Map<string, string>,
+  objectById: Map<string, OntologyObject>,
+  tableById: Map<string, PhysicalTable>,
+  parameters: unknown[],
+): string {
+  const { hierarchy } = filter;
+  const closure = hierarchy.closure;
+  if (!closure) {
+    throw new Error(`递归层级 ${hierarchy.hierarchyLabel} 未配置闭包表`);
+  }
+  const nodeObject = objectById.get(hierarchy.objectId);
+  const closureObject = objectById.get(closure.objectId);
+  const nodeAlias = aliases.get(hierarchy.objectId);
+  const nodeProperty = nodeObject?.properties.find(
+    (property) => property.id === hierarchy.nodeIdPropertyId,
+  );
+  const ancestorProperty = closureObject?.properties.find(
+    (property) => property.id === closure.ancestorPropertyId,
+  );
+  const descendantProperty = closureObject?.properties.find(
+    (property) => property.id === closure.descendantPropertyId,
+  );
+  const depthProperty = closureObject?.properties.find(
+    (property) => property.id === closure.depthPropertyId,
+  );
+  const closureTable = closureObject
+    ? tableById.get(closureObject.sourceTableId)
+    : undefined;
+  if (
+    !nodeObject ||
+    !closureObject ||
+    !nodeAlias ||
+    !nodeProperty ||
+    !ancestorProperty ||
+    !descendantProperty ||
+    !depthProperty ||
+    !closureTable
+  ) {
+    throw new Error(`递归层级 ${hierarchy.hierarchyLabel} 的闭包表配置不可用`);
+  }
+  parameters.push(filter.anchorValue);
+  const closureAlias = `hc${parameters.length}`;
+  const nodeColumn = qualifiedColumn(nodeAlias, nodeProperty);
+  const ancestorColumn = qualifiedColumn(closureAlias, ancestorProperty);
+  const descendantColumn = qualifiedColumn(closureAlias, descendantProperty);
+  const depthColumn = qualifiedColumn(closureAlias, depthProperty);
+  const endpointCondition = filter.direction === "DESCENDANTS"
+    ? `${descendantColumn} = ${nodeColumn}\n    AND ${ancestorColumn} = ?`
+    : `${ancestorColumn} = ${nodeColumn}\n    AND ${descendantColumn} = ?`;
+  const minimumDepth = filter.includeSelf === false ? 1 : 0;
+  return [
+    "EXISTS (",
+    `  SELECT 1 FROM ${qualifiedTable(closureTable)} AS ${closureAlias}`,
+    `  WHERE ${endpointCondition}`,
+    `    AND ${depthColumn} >= ${minimumDepth}`,
+    `    AND ${depthColumn} <= ${hierarchy.maxDepth}`,
+    ")",
+  ].join("\n");
 }
 
 function compileRelatedValueExists(

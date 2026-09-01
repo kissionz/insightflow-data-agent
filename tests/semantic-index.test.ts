@@ -30,6 +30,77 @@ describe("SemanticIndex", () => {
     ]);
   });
 
+  it("respects configured relation traversal direction", () => {
+    const ontology = structuredClone(testOntology);
+    ontology.relations[0]!.direction = "SOURCE_TO_TARGET";
+    const directed = new SemanticIndex(ontology);
+
+    expect(
+      directed.findRelationPath("o_order", "o_customer").map((relation) => relation.id),
+    ).toEqual(["r_order_customer"]);
+    expect(directed.findRelationPath("o_customer", "o_order")).toEqual([]);
+  });
+
+  it("resolves deterministic roll-up and drill-down hierarchy steps", () => {
+    const ontology = structuredClone(testOntology);
+    ontology.dimensionHierarchies = [
+      {
+        id: "hierarchy_customer",
+        name: "customer",
+        label: "客户分析层级",
+        levels: [
+          { objectId: "o_customer", propertyId: "p_customer_level" },
+          { objectId: "o_customer", propertyId: "p_customer_id" },
+        ],
+        status: "PUBLISHED",
+      },
+    ];
+    const hierarchical = new SemanticIndex(ontology);
+
+    expect(hierarchical.findHierarchySteps("p_customer_level", "DRILL_DOWN"))
+      .toContainEqual(
+        expect.objectContaining({
+          hierarchyId: "hierarchy_customer",
+          propertyId: "p_customer_id",
+          fromLevel: 0,
+          targetLevel: 1,
+        }),
+      );
+    expect(hierarchical.findHierarchySteps("p_customer_id", "ROLL_UP"))
+      .toContainEqual(
+        expect.objectContaining({ propertyId: "p_customer_level" }),
+      );
+  });
+
+  it("resolves recursive hierarchy metadata without treating it as fixed levels", () => {
+    const ontology = structuredClone(testOntology);
+    ontology.dimensionHierarchies = [{
+      id: "hierarchy_customer_tree",
+      name: "customer_tree",
+      label: "客户组织树",
+      kind: "ADJACENCY_LIST",
+      levels: [],
+      adjacency: {
+        objectId: "o_customer",
+        nodeIdPropertyId: "p_customer_id",
+        parentIdPropertyId: "p_customer_parent_id",
+        labelPropertyId: "p_customer_level",
+        maxDepth: 20,
+      },
+      status: "PUBLISHED",
+    }];
+    const hierarchical = new SemanticIndex(ontology);
+
+    expect(hierarchical.findRecursiveHierarchy("hierarchy_customer_tree"))
+      .toMatchObject({
+        objectId: "o_customer",
+        nodeIdPropertyId: "p_customer_id",
+        maxDepth: 20,
+      });
+    expect(hierarchical.findHierarchySteps("p_customer_id", "ROLL_UP"))
+      .toEqual([]);
+  });
+
   it("does not index detail-only or hidden properties", () => {
     const ontology = structuredClone(testOntology);
     ontology.objects[0].properties[1] = {

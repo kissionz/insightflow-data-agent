@@ -52,6 +52,7 @@ import type {
   CanvasQueryResponse,
   Conversation,
   DataSourceInput,
+  DimensionHierarchy,
   Metric,
   OntologyObject,
   OntologyRelation,
@@ -1876,11 +1877,16 @@ function OntologyPage({
   const [validation, setValidation] = useState<OntologyValidationResult | null>(null);
   const [pendingDeleteId, setPendingDeleteId] = useState("");
   const [deletingId, setDeletingId] = useState("");
-  const [catalogMode, setCatalogMode] = useState<"objects" | "metrics">("objects");
+  const [catalogMode, setCatalogMode] = useState<
+    "objects" | "metrics" | "hierarchies"
+  >("objects");
   const working = ontologyDraft ?? ontology;
   const [focusedId, setFocusedId] = useState(working.objects[0]?.id ?? "");
   const [focusedMetricId, setFocusedMetricId] = useState(
     working.metrics[0]?.id ?? "",
+  );
+  const [focusedHierarchyId, setFocusedHierarchyId] = useState(
+    working.dimensionHierarchies?.[0]?.id ?? "",
   );
   const available = tables.filter((table) => table.status === "UNMODELED");
   const drafting = Boolean(ontologyDraft);
@@ -1892,6 +1898,12 @@ function OntologyPage({
     working.metrics.find((metric) => metric.id === focusedMetricId) ??
     working.metrics[0] ??
     null;
+  const focusedHierarchy =
+    working.dimensionHierarchies?.find(
+      (hierarchy) => hierarchy.id === focusedHierarchyId,
+    ) ??
+    working.dimensionHierarchies?.[0] ??
+    null;
   useEffect(() => {
     if (!focusedObject && working.objects[0]) {
       setFocusedId(working.objects[0].id);
@@ -1902,6 +1914,11 @@ function OntologyPage({
       setFocusedMetricId(working.metrics[0].id);
     }
   }, [focusedMetric, working.metrics]);
+  useEffect(() => {
+    if (!focusedHierarchy && working.dimensionHierarchies?.[0]) {
+      setFocusedHierarchyId(working.dimensionHierarchies[0].id);
+    }
+  }, [focusedHierarchy, working.dimensionHierarchies]);
   async function draft() {
     try {
       const result = await api.createDrafts(selected);
@@ -2055,12 +2072,54 @@ function OntologyPage({
       onError(asMessage(reason));
     }
   }
+  async function addCatalogHierarchy() {
+    const candidates = working.objects.flatMap((object) =>
+      object.properties
+        .filter(
+          (property) =>
+            property.visibility === "ANALYTICAL" &&
+            !property.sensitive &&
+            !["NUMBER", "TIME", "BOOLEAN", "ENTITY_REFERENCE"].includes(
+              property.meaning,
+            ),
+        )
+        .map((property) => ({ objectId: object.id, propertyId: property.id })),
+    );
+    if (candidates.length < 2) {
+      onError("至少需要两个可分析且非敏感的维度属性才能创建层级");
+      return;
+    }
+    const hierarchy: DimensionHierarchy = {
+      id: createClientId("hierarchy"),
+      name: `hierarchy_${(working.dimensionHierarchies?.length ?? 0) + 1}`,
+      label: "新维度层级",
+      description: "",
+      kind: "FIXED_LEVELS",
+      levels: candidates.slice(0, 2),
+      status: "DRAFT",
+    };
+    try {
+      const result = await api.saveDimensionHierarchy(hierarchy);
+      onState((previous) =>
+        previous ? { ...previous, ontologyDraft: result.ontology } : previous,
+      );
+      setValidation(result.validation);
+      setFocusedHierarchyId(hierarchy.id);
+    } catch (reason) {
+      onError(asMessage(reason));
+    }
+  }
   return (
     <div className="management-content ontology-management-content">
       <div className="stats-row">
         <StatCard label="业务对象" value={working.objects.length} icon={CirclesFour} />
         <StatCard label="对象关系" value={working.relations.length} icon={GitBranch} />
         <StatCard label="业务指标" value={working.metrics.length} icon={ChartBar} />
+        <StatCard
+          label="维度层级"
+          value={working.dimensionHierarchies?.length ?? 0}
+          icon={GitBranch}
+        />
         <StatCard label="当前版本" value={`v${ontology.version}`} icon={SealCheck} />
       </div>
       <div className={`ontology-grid ${drafting ? "editing" : ""}`}>
@@ -2068,7 +2127,13 @@ function OntologyPage({
           <div className="panel-heading">
             <div>
               <span className="section-kicker">业务语义</span>
-              <h2>{catalogMode === "objects" ? "对象目录" : "指标中心"}</h2>
+              <h2>
+                {catalogMode === "objects"
+                  ? "对象目录"
+                  : catalogMode === "metrics"
+                    ? "指标中心"
+                    : "维度层级"}
+              </h2>
             </div>
             <span className={`status-pill ${drafting ? "warning" : "success"}`}>
               {drafting ? "草稿待发布" : "已发布"}
@@ -2086,6 +2151,12 @@ function OntologyPage({
               onClick={() => setCatalogMode("metrics")}
             >
               <ChartBar size={15} /> 指标
+            </button>
+            <button
+              className={catalogMode === "hierarchies" ? "active" : ""}
+              onClick={() => setCatalogMode("hierarchies")}
+            >
+              <GitBranch size={15} /> 层级
             </button>
           </div>
           {catalogMode === "objects" ? (working.objects.length ? (
@@ -2149,7 +2220,7 @@ function OntologyPage({
               <strong>还没有本体对象</strong>
               <p>先到数据管理扫描 Schema，再勾选待建模表生成草稿。</p>
             </div>
-          )) : (
+          )) : catalogMode === "metrics" ? (
             <>
               {drafting && (
                 <div className="metric-catalog-actions">
@@ -2200,30 +2271,89 @@ function OntologyPage({
                 </div>
               )}
             </>
+          ) : (
+            <>
+              {drafting && (
+                <div className="metric-catalog-actions">
+                  <button
+                    className="subtle-button"
+                    onClick={() => void addCatalogHierarchy()}
+                  >
+                    <Plus size={14} /> 新建层级
+                  </button>
+                </div>
+              )}
+              {working.dimensionHierarchies?.length ? (
+                working.dimensionHierarchies.map((hierarchy) => (
+                  <button
+                    key={hierarchy.id}
+                    className={`ontology-object ${
+                      focusedHierarchy?.id === hierarchy.id ? "selected" : ""
+                    }`}
+                    onClick={() => setFocusedHierarchyId(hierarchy.id)}
+                  >
+                    <span className="object-icon">
+                      <GitBranch size={18} />
+                    </span>
+                    <span>
+                      <strong>{hierarchy.label}</strong>
+                      <small>
+                        {(hierarchy.kind ?? "FIXED_LEVELS") === "ADJACENCY_LIST"
+                          ? "递归父子"
+                          : `${hierarchy.levels.length} 级`} · {hierarchy.name}
+                      </small>
+                    </span>
+                    <CaretRight size={16} />
+                  </button>
+                ))
+              ) : (
+                <div className="ontology-empty">
+                  <GitBranch size={24} />
+                  <strong>还没有维度层级</strong>
+                  <p>进入草稿编辑后定义可上卷和下钻的维度顺序。</p>
+                </div>
+              )}
+            </>
           )}
         </section>
         <section className="panel object-inspector">
           <div className="panel-heading">
             <div>
               <span className="section-kicker">
-                {catalogMode === "objects" ? "对象定义" : "指标定义"}
+                {catalogMode === "objects"
+                  ? "对象定义"
+                  : catalogMode === "metrics"
+                    ? "指标定义"
+                    : "层级定义"}
               </span>
               <h2>
                 {catalogMode === "objects"
                   ? focusedObject?.label || "对象详情"
-                  : focusedMetric?.label || "指标详情"}
+                  : catalogMode === "metrics"
+                    ? focusedMetric?.label || "指标详情"
+                    : focusedHierarchy?.label || "层级详情"}
               </h2>
             </div>
-            {(catalogMode === "objects" ? focusedObject : focusedMetric) && (
+            {(catalogMode === "objects"
+              ? focusedObject
+              : catalogMode === "metrics"
+                ? focusedMetric
+                : focusedHierarchy) && (
               <span className={`status-pill ${
-                (catalogMode === "objects" ? focusedObject?.status : focusedMetric?.status) === "DRAFT"
+                (catalogMode === "objects"
+                  ? focusedObject?.status
+                  : catalogMode === "metrics"
+                    ? focusedMetric?.status
+                    : focusedHierarchy?.status) === "DRAFT"
                   ? "warning"
                   : "success"
               }`}>
                 {ontologyStatusLabel(
                   (catalogMode === "objects"
                     ? focusedObject?.status
-                    : focusedMetric?.status) ?? "PUBLISHED",
+                    : catalogMode === "metrics"
+                      ? focusedMetric?.status
+                      : focusedHierarchy?.status) ?? "PUBLISHED",
                 )}
               </span>
             )}
@@ -2250,7 +2380,7 @@ function OntologyPage({
               <strong>等待 Schema 建模</strong>
               <p>对象生成后可在这里检查来源表、属性、指标和关系。</p>
             </div>
-          )) : focusedMetric ? (
+          )) : catalogMode === "metrics" ? (focusedMetric ? (
             <MetricCatalogInspector
               key={`${working.version}-${focusedMetric.id}-${focusedMetric.expression}`}
               metric={focusedMetric}
@@ -2276,6 +2406,33 @@ function OntologyPage({
               <ChartBar size={28} />
               <strong>等待指标定义</strong>
               <p>基础指标引用对象属性，复合指标引用同一事实对象的其他指标。</p>
+            </div>
+          )) : focusedHierarchy ? (
+            <HierarchyCatalogInspector
+              key={`${working.version}-${focusedHierarchy.id}-${focusedHierarchy.levels.map((level) => level.propertyId).join("-")}`}
+              hierarchy={focusedHierarchy}
+              ontology={working}
+              editable={drafting}
+              onSaved={(updated, result) => {
+                onState((previous) =>
+                  previous ? { ...previous, ontologyDraft: updated } : previous,
+                );
+                setValidation(result);
+              }}
+              onDeleted={(updated, result) => {
+                onState((previous) =>
+                  previous ? { ...previous, ontologyDraft: updated } : previous,
+                );
+                setValidation(result);
+                setFocusedHierarchyId(updated.dimensionHierarchies?.[0]?.id ?? "");
+              }}
+              onError={onError}
+            />
+          ) : (
+            <div className="inspector-empty">
+              <GitBranch size={28} />
+              <strong>等待层级定义</strong>
+              <p>层级用于确定维度的上卷、下钻和每组排名顺序。</p>
             </div>
           )}
         </section>
@@ -2356,6 +2513,451 @@ function OntologyPage({
             </div>
           )}
         </section>
+      </div>
+    </div>
+  );
+}
+
+function HierarchyCatalogInspector({
+  hierarchy,
+  ontology,
+  editable,
+  onSaved,
+  onDeleted,
+  onError,
+}: {
+  hierarchy: DimensionHierarchy;
+  ontology: OntologySnapshot;
+  editable: boolean;
+  onSaved: (
+    ontology: OntologySnapshot,
+    validation: OntologyValidationResult,
+  ) => void;
+  onDeleted: (
+    ontology: OntologySnapshot,
+    validation: OntologyValidationResult,
+  ) => void;
+  onError: (message: string) => void;
+}) {
+  const [draftHierarchy, setDraftHierarchy] = useState(() =>
+    structuredClone(hierarchy),
+  );
+  const [saving, setSaving] = useState(false);
+  function change(patch: Partial<DimensionHierarchy>) {
+    setDraftHierarchy((current) => ({ ...current, ...patch }));
+  }
+  function analyticalProperties(objectId: string) {
+    return (
+      ontology.objects
+        .find((object) => object.id === objectId)
+        ?.properties.filter(
+          (property) =>
+            property.visibility === "ANALYTICAL" && !property.sensitive,
+        ) ?? []
+    );
+  }
+  function defaultAdjacency(objectId: string): NonNullable<DimensionHierarchy["adjacency"]> {
+    const properties = analyticalProperties(objectId);
+    return {
+      objectId,
+      nodeIdPropertyId:
+        properties.find((property) => property.meaning === "ID")?.id ??
+        properties[0]?.id ??
+        "",
+      parentIdPropertyId:
+        properties.find((property) => property.meaning === "ENTITY_REFERENCE")?.id ??
+        properties[1]?.id ??
+        "",
+      labelPropertyId:
+        properties.find((property) => ["NAME", "CATEGORY", "CODE"].includes(property.meaning))?.id ??
+        properties[0]?.id ??
+        "",
+      maxDepth: 20,
+    };
+  }
+  function changeKind(kind: "FIXED_LEVELS" | "ADJACENCY_LIST") {
+    if (kind === "FIXED_LEVELS") {
+      const levels = draftHierarchy.levels.length >= 2
+        ? draftHierarchy.levels
+        : ontology.objects
+            .flatMap((object) =>
+              analyticalProperties(object.id)
+                .filter((property) =>
+                  !["NUMBER", "TIME", "BOOLEAN", "ENTITY_REFERENCE"].includes(property.meaning),
+                )
+                .map((property) => ({ objectId: object.id, propertyId: property.id })),
+            )
+            .slice(0, 2);
+      change({ kind, adjacency: undefined, levels });
+      return;
+    }
+    const candidate = ontology.objects.find((object) => {
+      const properties = analyticalProperties(object.id);
+      return properties.some((property) => property.meaning === "ID") &&
+        properties.some((property) => property.meaning === "ENTITY_REFERENCE");
+    }) ?? ontology.objects[0];
+    change({
+      kind,
+      levels: [],
+      adjacency: candidate ? defaultAdjacency(candidate.id) : undefined,
+    });
+  }
+  function changeAdjacency(
+    patch: Partial<NonNullable<DimensionHierarchy["adjacency"]>>,
+  ) {
+    if (!draftHierarchy.adjacency) return;
+    change({ adjacency: { ...draftHierarchy.adjacency, ...patch } });
+  }
+  function changeClosure(
+    patch: Partial<NonNullable<NonNullable<DimensionHierarchy["adjacency"]>["closure"]>>,
+  ) {
+    const adjacency = draftHierarchy.adjacency;
+    if (!adjacency?.closure) return;
+    changeAdjacency({ closure: { ...adjacency.closure, ...patch } });
+  }
+  function changeLevel(
+    index: number,
+    patch: Partial<DimensionHierarchy["levels"][number]>,
+  ) {
+    change({
+      levels: draftHierarchy.levels.map((level, levelIndex) =>
+        levelIndex === index ? { ...level, ...patch } : level,
+      ),
+    });
+  }
+  function moveLevel(index: number, offset: -1 | 1) {
+    const targetIndex = index + offset;
+    if (targetIndex < 0 || targetIndex >= draftHierarchy.levels.length) return;
+    const levels = [...draftHierarchy.levels];
+    [levels[index], levels[targetIndex]] = [levels[targetIndex]!, levels[index]!];
+    change({ levels });
+  }
+  function addLevel() {
+    const fallback = ontology.objects
+      .flatMap((object) =>
+        analyticalProperties(object.id).map((property) => ({
+          objectId: object.id,
+          propertyId: property.id,
+        })),
+      )
+      .find(
+        (candidate) =>
+          !draftHierarchy.levels.some(
+            (level) => level.propertyId === candidate.propertyId,
+          ),
+      );
+    if (!fallback) {
+      onError("没有更多可用于层级的分析属性");
+      return;
+    }
+    change({ levels: [...draftHierarchy.levels, fallback] });
+  }
+  async function save() {
+    setSaving(true);
+    try {
+      const result = await api.saveDimensionHierarchy({
+        ...draftHierarchy,
+        status: "DRAFT",
+      });
+      onSaved(result.ontology, result.validation);
+    } catch (reason) {
+      onError(asMessage(reason));
+    } finally {
+      setSaving(false);
+    }
+  }
+  async function remove() {
+    setSaving(true);
+    try {
+      const result = await api.deleteDimensionHierarchy(draftHierarchy.id);
+      onDeleted(result.ontology, result.validation);
+    } catch (reason) {
+      onError(asMessage(reason));
+    } finally {
+      setSaving(false);
+    }
+  }
+  if (!editable) {
+    const adjacency = draftHierarchy.adjacency;
+    const adjacencyObject = adjacency
+      ? ontology.objects.find((candidate) => candidate.id === adjacency.objectId)
+      : undefined;
+    return (
+      <div className="object-detail hierarchy-detail">
+        <p className="object-description">
+          {draftHierarchy.description || "暂无层级说明"}
+        </p>
+        {(draftHierarchy.kind ?? "FIXED_LEVELS") === "ADJACENCY_LIST" && adjacency ? (
+          <div className="hierarchy-recursive-summary">
+            <div><span>节点对象</span><strong>{adjacencyObject?.label ?? adjacency.objectId}</strong></div>
+            <div><span>节点字段</span><strong>{adjacencyObject?.properties.find((property) => property.id === adjacency.nodeIdPropertyId)?.label ?? adjacency.nodeIdPropertyId}</strong></div>
+            <div><span>父节点字段</span><strong>{adjacencyObject?.properties.find((property) => property.id === adjacency.parentIdPropertyId)?.label ?? adjacency.parentIdPropertyId}</strong></div>
+            <div><span>查询能力</span><strong>{adjacency.closure ? "祖先 / 后代过滤" : "递归语义"}</strong></div>
+          </div>
+        ) : (
+          <div className="hierarchy-readonly-path">
+            {draftHierarchy.levels.map((level, index) => {
+            const object = ontology.objects.find(
+              (candidate) => candidate.id === level.objectId,
+            );
+            const property = object?.properties.find(
+              (candidate) => candidate.id === level.propertyId,
+            );
+            return (
+              <div key={`${level.objectId}-${level.propertyId}`}>
+                <span>{index + 1}</span>
+                <strong>{property?.label ?? level.propertyId}</strong>
+                <small>{object?.label ?? level.objectId}</small>
+              </div>
+            );
+            })}
+          </div>
+        )}
+      </div>
+    );
+  }
+  return (
+    <div className="ontology-editor hierarchy-catalog-editor">
+      <div className="editor-toolbar">
+        <div>
+          <strong>{(draftHierarchy.kind ?? "FIXED_LEVELS") === "ADJACENCY_LIST" ? "递归父子层级" : "固定维度层级"}</strong>
+          <small>{(draftHierarchy.kind ?? "FIXED_LEVELS") === "ADJACENCY_LIST" ? "用节点 ID 与父节点 ID 表达任意深度的组织树" : "从最上层到最明细层排列，用于上卷、下钻和每组排名"}</small>
+        </div>
+        <div className="editor-actions">
+          <button
+            className="subtle-button danger-text"
+            disabled={saving}
+            onClick={() => void remove()}
+          >
+            <Trash size={14} /> 删除
+          </button>
+          <button
+            className="primary-button"
+            disabled={saving}
+            onClick={() => void save()}
+          >
+            <FloppyDisk size={15} /> {saving ? "保存中" : "保存层级"}
+          </button>
+        </div>
+      </div>
+      <div className="editor-section">
+        <div className="form-grid ontology-form-grid hierarchy-meta-grid">
+          <EditorField label="层级名称">
+            <input
+              value={draftHierarchy.label}
+              onChange={(event) => change({ label: event.target.value })}
+            />
+          </EditorField>
+          <EditorField label="层级标识">
+            <input
+              value={draftHierarchy.name}
+              onChange={(event) => change({ name: event.target.value })}
+            />
+          </EditorField>
+          <EditorField label="层级类型">
+            <select
+              value={draftHierarchy.kind ?? "FIXED_LEVELS"}
+              onChange={(event) =>
+                changeKind(event.target.value as "FIXED_LEVELS" | "ADJACENCY_LIST")
+              }
+            >
+              <option value="FIXED_LEVELS">固定层级</option>
+              <option value="ADJACENCY_LIST">递归父子层级</option>
+            </select>
+          </EditorField>
+          <EditorField label="层级说明" wide>
+            <textarea
+              rows={2}
+              value={draftHierarchy.description ?? ""}
+              onChange={(event) => change({ description: event.target.value })}
+            />
+          </EditorField>
+        </div>
+        {(draftHierarchy.kind ?? "FIXED_LEVELS") === "FIXED_LEVELS" ? <>
+          <div className="hierarchy-level-heading">
+          <div>
+            <strong>层级顺序</strong>
+            <small>相邻跨对象层级必须存在安全的非多对多关系</small>
+          </div>
+          <button className="subtle-button" onClick={addLevel}>
+            <Plus size={14} /> 增加一级
+          </button>
+          </div>
+          <div className="hierarchy-level-list">
+          {draftHierarchy.levels.map((level, index) => (
+            <div className="hierarchy-level-row" key={`${index}-${level.objectId}-${level.propertyId}`}>
+              <span className="hierarchy-level-index">{index + 1}</span>
+              <label>
+                <span>{index === 0 ? "最上层对象" : "对象"}</span>
+                <select
+                  value={level.objectId}
+                  onChange={(event) => {
+                    const objectId = event.target.value;
+                    changeLevel(index, {
+                      objectId,
+                      propertyId: analyticalProperties(objectId)[0]?.id ?? "",
+                    });
+                  }}
+                >
+                  {ontology.objects.map((object) => (
+                    <option key={object.id} value={object.id}>{object.label}</option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                <span>维度属性</span>
+                <select
+                  value={level.propertyId}
+                  onChange={(event) =>
+                    changeLevel(index, { propertyId: event.target.value })
+                  }
+                >
+                  {analyticalProperties(level.objectId).map((property) => (
+                    <option key={property.id} value={property.id}>{property.label}</option>
+                  ))}
+                </select>
+              </label>
+              <div className="hierarchy-level-actions">
+                <button
+                  className="icon-button"
+                  disabled={index === 0}
+                  aria-label={`将第 ${index + 1} 级上移`}
+                  title="上移"
+                  onClick={() => moveLevel(index, -1)}
+                >
+                  <ArrowUp size={15} />
+                </button>
+                <button
+                  className="icon-button"
+                  disabled={index === draftHierarchy.levels.length - 1}
+                  aria-label={`将第 ${index + 1} 级下移`}
+                  title="下移"
+                  onClick={() => moveLevel(index, 1)}
+                >
+                  <ArrowDown size={15} />
+                </button>
+                <button
+                  className="icon-button danger-text"
+                  disabled={draftHierarchy.levels.length <= 2}
+                  aria-label={`移除第 ${index + 1} 级`}
+                  title="移除层级"
+                  onClick={() =>
+                    change({
+                      levels: draftHierarchy.levels.filter(
+                        (_, levelIndex) => levelIndex !== index,
+                      ),
+                    })
+                  }
+                >
+                  <Trash size={15} />
+                </button>
+              </div>
+            </div>
+          ))}
+          </div>
+        </> : draftHierarchy.adjacency ? (
+          <div className="hierarchy-recursive-editor">
+            <div className="hierarchy-level-heading">
+              <div>
+                <strong>父子字段</strong>
+                <small>节点 ID 与父节点 ID 类型必须一致，并配置同对象自关联层级关系</small>
+              </div>
+            </div>
+            <div className="form-grid ontology-form-grid hierarchy-recursive-grid">
+              <EditorField label="节点对象">
+                <select
+                  value={draftHierarchy.adjacency.objectId}
+                  onChange={(event) => change({ adjacency: defaultAdjacency(event.target.value) })}
+                >
+                  {ontology.objects.map((object) => <option key={object.id} value={object.id}>{object.label}</option>)}
+                </select>
+              </EditorField>
+              <EditorField label="节点 ID">
+                <select
+                  value={draftHierarchy.adjacency.nodeIdPropertyId}
+                  onChange={(event) => changeAdjacency({ nodeIdPropertyId: event.target.value })}
+                >
+                  {analyticalProperties(draftHierarchy.adjacency.objectId).map((property) => <option key={property.id} value={property.id}>{property.label}</option>)}
+                </select>
+              </EditorField>
+              <EditorField label="父节点 ID">
+                <select
+                  value={draftHierarchy.adjacency.parentIdPropertyId}
+                  onChange={(event) => changeAdjacency({ parentIdPropertyId: event.target.value })}
+                >
+                  {analyticalProperties(draftHierarchy.adjacency.objectId).map((property) => <option key={property.id} value={property.id}>{property.label}</option>)}
+                </select>
+              </EditorField>
+              <EditorField label="展示名称">
+                <select
+                  value={draftHierarchy.adjacency.labelPropertyId}
+                  onChange={(event) => changeAdjacency({ labelPropertyId: event.target.value })}
+                >
+                  {analyticalProperties(draftHierarchy.adjacency.objectId).map((property) => <option key={property.id} value={property.id}>{property.label}</option>)}
+                </select>
+              </EditorField>
+              <EditorField label="最大深度">
+                <input
+                  type="number"
+                  min={1}
+                  max={100}
+                  value={draftHierarchy.adjacency.maxDepth}
+                  onChange={(event) => changeAdjacency({ maxDepth: Number(event.target.value) })}
+                />
+              </EditorField>
+            </div>
+            <label className="hierarchy-closure-toggle">
+              <input
+                type="checkbox"
+                checked={Boolean(draftHierarchy.adjacency.closure)}
+                onChange={(event) => {
+                  if (!event.target.checked) {
+                    changeAdjacency({ closure: undefined });
+                    return;
+                  }
+                  const object = ontology.objects[0];
+                  const properties = object ? analyticalProperties(object.id) : [];
+                  changeAdjacency({
+                    closure: object ? {
+                      objectId: object.id,
+                      ancestorPropertyId: properties[0]?.id ?? "",
+                      descendantPropertyId: properties[1]?.id ?? properties[0]?.id ?? "",
+                      depthPropertyId: properties.find((property) => property.meaning === "NUMBER")?.id ?? properties[0]?.id ?? "",
+                    } : undefined,
+                  });
+                }}
+              />
+              <span><strong>启用闭包表查询</strong><small>支持参数化的全部祖先 / 后代过滤</small></span>
+            </label>
+            {draftHierarchy.adjacency.closure ? (
+              <div className="form-grid ontology-form-grid hierarchy-recursive-grid hierarchy-closure-grid">
+                <EditorField label="闭包对象">
+                  <select
+                    value={draftHierarchy.adjacency.closure.objectId}
+                    onChange={(event) => {
+                      const properties = analyticalProperties(event.target.value);
+                      changeAdjacency({ closure: {
+                        objectId: event.target.value,
+                        ancestorPropertyId: properties[0]?.id ?? "",
+                        descendantPropertyId: properties[1]?.id ?? properties[0]?.id ?? "",
+                        depthPropertyId: properties.find((property) => property.meaning === "NUMBER")?.id ?? properties[0]?.id ?? "",
+                      }});
+                    }}
+                  >
+                    {ontology.objects.map((object) => <option key={object.id} value={object.id}>{object.label}</option>)}
+                  </select>
+                </EditorField>
+                {(["ancestorPropertyId", "descendantPropertyId", "depthPropertyId"] as const).map((field, index) => (
+                  <EditorField key={field} label={["祖先 ID", "后代 ID", "深度"][index]!}>
+                    <select value={draftHierarchy.adjacency!.closure![field]} onChange={(event) => changeClosure({ [field]: event.target.value })}>
+                      {analyticalProperties(draftHierarchy.adjacency!.closure!.objectId).map((property) => <option key={property.id} value={property.id}>{property.label}</option>)}
+                    </select>
+                  </EditorField>
+                ))}
+              </div>
+            ) : null}
+          </div>
+        ) : null}
       </div>
     </div>
   );
@@ -4124,7 +4726,7 @@ function RelationEditor({
             onChange={(event) => onChange({ name: event.target.value })}
           />
         </EditorField>
-        <EditorField label="源对象">
+        <EditorField label={relation.type === "COMPOSITION" ? "子对象" : "源对象"}>
           <select
             value={relation.sourceObjectId}
             onChange={(event) => {
@@ -4135,6 +4737,13 @@ function RelationEditor({
               onChange({
                 sourceObjectId: event.target.value,
                 sourcePropertyId: nextProperty?.id,
+                composition:
+                  relation.type === "COMPOSITION"
+                    ? {
+                        ...(relation.composition ?? defaultCompositionSemantics(relation)),
+                        childObjectId: event.target.value,
+                      }
+                    : undefined,
                 joinExpression: expression(
                   nextSource,
                   target,
@@ -4149,7 +4758,7 @@ function RelationEditor({
             ))}
           </select>
         </EditorField>
-        <EditorField label="源字段">
+        <EditorField label={relation.type === "COMPOSITION" ? "子对象外键" : "源字段"}>
           <select
             value={relation.sourcePropertyId ?? ""}
             onChange={(event) =>
@@ -4169,7 +4778,7 @@ function RelationEditor({
             ))}
           </select>
         </EditorField>
-        <EditorField label="目标对象">
+        <EditorField label={relation.type === "COMPOSITION" ? "主对象" : "目标对象"}>
           <select
             value={relation.targetObjectId}
             onChange={(event) => {
@@ -4183,6 +4792,13 @@ function RelationEditor({
               onChange({
                 targetObjectId: event.target.value,
                 targetPropertyId: nextProperty?.id,
+                composition:
+                  relation.type === "COMPOSITION"
+                    ? {
+                        ...(relation.composition ?? defaultCompositionSemantics(relation)),
+                        parentObjectId: event.target.value,
+                      }
+                    : undefined,
                 joinExpression: expression(
                   source,
                   nextTarget,
@@ -4197,7 +4813,7 @@ function RelationEditor({
             ))}
           </select>
         </EditorField>
-        <EditorField label="目标字段">
+        <EditorField label={relation.type === "COMPOSITION" ? "主对象 ID" : "目标字段"}>
           <select
             value={relation.targetPropertyId ?? ""}
             onChange={(event) =>
@@ -4229,23 +4845,82 @@ function RelationEditor({
             }
           >
             <option value="ONE_TO_ONE">一对一</option>
-            <option value="ONE_TO_MANY">一对多</option>
+            {relation.type !== "COMPOSITION" && <option value="ONE_TO_MANY">一对多</option>}
             <option value="MANY_TO_ONE">多对一</option>
-            <option value="MANY_TO_MANY">多对多</option>
+            {relation.type !== "COMPOSITION" && <option value="MANY_TO_MANY">多对多</option>}
           </select>
         </EditorField>
         <EditorField label="关系类型">
           <select
             value={relation.type}
-            onChange={(event) =>
-              onChange({ type: event.target.value as OntologyRelation["type"] })
-            }
+            onChange={(event) => {
+              const type = event.target.value as OntologyRelation["type"];
+              onChange({
+                type,
+                cardinality:
+                  type === "COMPOSITION" &&
+                  !["MANY_TO_ONE", "ONE_TO_ONE"].includes(relation.cardinality)
+                    ? "MANY_TO_ONE"
+                    : relation.cardinality,
+                composition:
+                  type === "COMPOSITION"
+                    ? relation.composition ?? defaultCompositionSemantics(relation)
+                    : undefined,
+              });
+            }}
           >
             {RELATION_TYPES.map((type) => (
               <option key={type} value={type}>{relationTypeLabel(type)}</option>
             ))}
           </select>
         </EditorField>
+        {relation.type === "COMPOSITION" && (
+          <>
+            <EditorField label="归属方式">
+              <select
+                value={relation.composition?.ownership ?? "OWNED"}
+                onChange={(event) =>
+                  onChange({
+                    composition: {
+                      ...(relation.composition ?? defaultCompositionSemantics(relation)),
+                      ownership: event.target.value as NonNullable<
+                        OntologyRelation["composition"]
+                      >["ownership"],
+                    },
+                  })
+                }
+              >
+                <option value="OWNED">独占子对象</option>
+                <option value="SHARED">共享子对象</option>
+              </select>
+            </EditorField>
+            <EditorField label="聚合策略">
+              <select
+                value={
+                  relation.composition?.aggregationPolicy ??
+                  "PRE_AGGREGATE_CHILD"
+                }
+                onChange={(event) =>
+                  onChange({
+                    composition: {
+                      ...(relation.composition ?? defaultCompositionSemantics(relation)),
+                      aggregationPolicy: event.target.value as NonNullable<
+                        OntologyRelation["composition"]
+                      >["aggregationPolicy"],
+                    },
+                  })
+                }
+              >
+                <option value="PRE_AGGREGATE_CHILD">子表先按主 ID 聚合</option>
+                <option value="EXISTS_ONLY">仅用于 EXISTS 筛选</option>
+              </select>
+            </EditorField>
+            <div className="editor-help wide">
+              <Info size={16} />
+              主子关系固定由子对象外键指向主对象 ID；从主对象访问子对象时会按聚合策略控制扇出。
+            </div>
+          </>
+        )}
         <EditorField label="查询方向">
           <select
             value={relation.direction}
@@ -4256,8 +4931,12 @@ function RelationEditor({
             }
           >
             <option value="BIDIRECTIONAL">双向</option>
-            <option value="SOURCE_TO_TARGET">源到目标</option>
-            <option value="TARGET_TO_SOURCE">目标到源</option>
+            <option value="SOURCE_TO_TARGET">
+              {relation.type === "COMPOSITION" ? "仅子到主" : "源到目标"}
+            </option>
+            <option value="TARGET_TO_SOURCE">
+              {relation.type === "COMPOSITION" ? "仅主到子" : "目标到源"}
+            </option>
           </select>
         </EditorField>
         <EditorField label="Join 表达式" wide>
@@ -4950,6 +5629,17 @@ function relationJoinExpression(
   );
   if (!sourceProperty || !targetProperty) return "";
   return `${sourceTable?.name ?? sourceObject.name}.${sourceProperty.sourceColumn} = ${targetTable?.name ?? targetObject.name}.${targetProperty.sourceColumn}`;
+}
+
+function defaultCompositionSemantics(
+  relation: Pick<OntologyRelation, "sourceObjectId" | "targetObjectId">,
+): NonNullable<OntologyRelation["composition"]> {
+  return {
+    childObjectId: relation.sourceObjectId,
+    parentObjectId: relation.targetObjectId,
+    ownership: "OWNED",
+    aggregationPolicy: "PRE_AGGREGATE_CHILD",
+  };
 }
 
 function propertyVisibilityLabel(

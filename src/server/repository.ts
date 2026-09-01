@@ -878,6 +878,15 @@ function normalizeOntology(input: OntologySnapshot): OntologySnapshot {
     relations: snapshot.relations.map((relation) => ({
       ...relation,
       direction: relation.direction ?? "BIDIRECTIONAL",
+      composition:
+        relation.type === "COMPOSITION"
+          ? relation.composition ?? {
+              childObjectId: relation.sourceObjectId,
+              parentObjectId: relation.targetObjectId,
+              ownership: "OWNED",
+              aggregationPolicy: "PRE_AGGREGATE_CHILD",
+            }
+          : undefined,
       required: relation.required ?? false,
       enabled: relation.enabled ?? true,
     })),
@@ -886,7 +895,13 @@ function normalizeOntology(input: OntologySnapshot): OntologySnapshot {
       metricType: metric.metricType ?? "BASE",
       definitionMode: metric.definitionMode ?? "SQL",
     })),
-    dimensionHierarchies: snapshot.dimensionHierarchies ?? [],
+    dimensionHierarchies: (snapshot.dimensionHierarchies ?? []).map(
+      (hierarchy) => ({
+        ...hierarchy,
+        kind: hierarchy.kind ?? "FIXED_LEVELS",
+        levels: hierarchy.levels ?? [],
+      }),
+    ),
   };
 }
 

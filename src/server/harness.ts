@@ -23,6 +23,7 @@ import type {
   DiagnosticMetricEvaluation,
   AnalysisRunStep,
   Conversation,
+  DimensionHierarchy,
   Metric,
   OntologyObject,
   OntologySnapshot,
@@ -911,22 +912,14 @@ export class DataAgentHarness {
                 (level) =>
                   relevantIds.has(level.objectId) ||
                   relevantPropertyIds.has(level.propertyId),
-              ),
+              ) ||
+              (hierarchy.adjacency
+                ? relevantIds.has(hierarchy.adjacency.objectId) ||
+                  relevantPropertyIds.has(hierarchy.adjacency.nodeIdPropertyId) ||
+                  relevantPropertyIds.has(hierarchy.adjacency.labelPropertyId)
+                : false),
             )
-            .map((hierarchy) => ({
-              id: hierarchy.id,
-              label: hierarchy.label,
-              levels: hierarchy.levels.map((level) => ({
-                objectId: level.objectId,
-                propertyId: level.propertyId,
-                objectLabel:
-                  ontology.objects.find((object) => object.id === level.objectId)
-                    ?.label ?? level.objectId,
-                propertyLabel:
-                  findPropertyBinding(ontology, level.propertyId)?.property
-                    .label ?? level.propertyId,
-              })),
-            })),
+            .map((hierarchy) => modelVisibleDimensionHierarchy(hierarchy, ontology)),
           unpublishedMetricLabels,
           instructions: [
             "matches 是词形候选，不代表具体业务值的字段归属",
@@ -1686,6 +1679,25 @@ export class DataAgentHarness {
               ],
             },
           },
+          hierarchy_filters: {
+            type: "array",
+            description:
+              "递归层级过滤。anchor_value 必须是用户明确提供或受控绑定得到的节点 ID；仅支持配置了闭包表的已发布递归层级。",
+            items: {
+              type: "object",
+              additionalProperties: false,
+              properties: {
+                hierarchy_id: { type: "string" },
+                anchor_value: { type: "string" },
+                direction: {
+                  type: "string",
+                  enum: ["DESCENDANTS", "ANCESTORS"],
+                },
+                include_self: { type: "boolean" },
+              },
+              required: ["hierarchy_id", "anchor_value", "direction"],
+            },
+          },
           filter_expression: {
             ...analysisFilterExpressionSchema(4),
             description:
@@ -2028,6 +2040,7 @@ export class DataAgentHarness {
         ],
         anyOf: [
           { required: ["filters"] },
+          { required: ["hierarchy_filters"] },
           { required: ["filter_expression"] },
           { required: ["aggregate_filters"] },
           { required: ["aggregate_filter_expression"] },
@@ -3862,6 +3875,9 @@ function normalizeAnalysisIntent(
   const rawPeriodConditions = Array.isArray(args.period_conditions)
     ? args.period_conditions
     : [];
+  const rawHierarchyFilters = Array.isArray(args.hierarchy_filters)
+    ? args.hierarchy_filters
+    : [];
   return {
     rootObjectId: args.root_object_id
       ? String(args.root_object_id)
@@ -3873,6 +3889,18 @@ function normalizeAnalysisIntent(
       ? args.dimension_property_ids.map(String)
       : [],
     filters,
+    hierarchyFilters: rawHierarchyFilters.map((raw) => {
+      const filter = raw as Record<string, unknown>;
+      return {
+        hierarchyId: String(filter.hierarchy_id ?? ""),
+        anchorValue: String(filter.anchor_value ?? ""),
+        direction:
+          filter.direction === "ANCESTORS"
+            ? "ANCESTORS" as const
+            : "DESCENDANTS" as const,
+        includeSelf: filter.include_self !== false,
+      };
+    }),
     filterExpression,
     aggregateFilters,
     aggregateFilterExpression,
@@ -4477,6 +4505,49 @@ function effectiveGrainLabels(object: OntologyObject): string[] {
     .filter((label): label is string => Boolean(label));
 }
 
+function modelVisibleDimensionHierarchy(
+  hierarchy: DimensionHierarchy,
+  ontology: OntologySnapshot,
+): Record<string, unknown> {
+  if ((hierarchy.kind ?? "FIXED_LEVELS") === "ADJACENCY_LIST" && hierarchy.adjacency) {
+    const adjacency = hierarchy.adjacency;
+    const object = ontology.objects.find((candidate) => candidate.id === adjacency.objectId);
+    return {
+      id: hierarchy.id,
+      label: hierarchy.label,
+      kind: "ADJACENCY_LIST",
+      objectId: adjacency.objectId,
+      objectLabel: object?.label ?? adjacency.objectId,
+      nodeIdPropertyId: adjacency.nodeIdPropertyId,
+      parentIdPropertyId: adjacency.parentIdPropertyId,
+      labelPropertyId: adjacency.labelPropertyId,
+      maxDepth: adjacency.maxDepth,
+      closureAvailable: Boolean(adjacency.closure),
+      supportedOperations: adjacency.closure
+        ? ["FILTER_DESCENDANTS", "FILTER_ANCESTORS"]
+        : ["ROLL_UP", "DRILL_DOWN"],
+    };
+  }
+  return {
+    id: hierarchy.id,
+    label: hierarchy.label,
+    kind: "FIXED_LEVELS",
+    levels: hierarchy.levels.map((level, index) => ({
+      objectId: level.objectId,
+      propertyId: level.propertyId,
+      level: index,
+      parentPropertyId: hierarchy.levels[index - 1]?.propertyId,
+      childPropertyId: hierarchy.levels[index + 1]?.propertyId,
+      objectLabel:
+        ontology.objects.find((object) => object.id === level.objectId)?.label ??
+        level.objectId,
+      propertyLabel:
+        findPropertyBinding(ontology, level.propertyId)?.property.label ??
+        level.propertyId,
+    })),
+  };
+}
+
 function findPropertyBinding(
   ontology: OntologySnapshot,
   propertyId: string,
@@ -4668,22 +4739,10 @@ function buildAnalysisSpace(
     dimensions: rankedDimensions.slice(0, 32),
     dimensionHierarchies: (ontology.dimensionHierarchies ?? [])
       .filter((hierarchy) =>
-        hierarchy.levels.some((level) => level.objectId === root.id),
+        hierarchy.levels.some((level) => level.objectId === root.id) ||
+        hierarchy.adjacency?.objectId === root.id,
       )
-      .map((hierarchy) => ({
-        id: hierarchy.id,
-        label: hierarchy.label,
-        levels: hierarchy.levels.map((level) => ({
-          objectId: level.objectId,
-          propertyId: level.propertyId,
-          objectLabel:
-            ontology.objects.find((object) => object.id === level.objectId)
-              ?.label ?? level.objectId,
-          propertyLabel:
-            findPropertyBinding(ontology, level.propertyId)?.property.label ??
-            level.propertyId,
-        })),
-      })),
+      .map((hierarchy) => modelVisibleDimensionHierarchy(hierarchy, ontology)),
   };
 }
 

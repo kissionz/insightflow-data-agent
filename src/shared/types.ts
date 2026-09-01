@@ -402,6 +402,7 @@ export interface AnalysisIntent {
   measureIds: string[];
   dimensionPropertyIds: string[];
   filters: AnalysisFilter[];
+  hierarchyFilters?: HierarchyAnalysisFilter[];
   filterExpression?: AnalysisFilterExpression;
   aggregateFilters?: AggregateAnalysisFilter[];
   aggregateFilterExpression?: AggregateFilterExpression;
@@ -447,6 +448,13 @@ export interface QueryIR {
         strategy: "DIRECT" | "EXISTS";
         relationIds: string[];
       })
+  >;
+  hierarchyFilters: Array<
+    HierarchyAnalysisFilter & {
+      objectId: string;
+      nodeIdPropertyId: string;
+      closureObjectId: string;
+    }
   >;
   filterExpression?: AnalysisFilterExpression;
   aggregateFilters: AggregateAnalysisFilter[];
@@ -764,6 +772,12 @@ export interface OntologyRelation {
   sourcePropertyId?: string;
   targetPropertyId?: string;
   direction: "BIDIRECTIONAL" | "SOURCE_TO_TARGET" | "TARGET_TO_SOURCE";
+  composition?: {
+    parentObjectId: string;
+    childObjectId: string;
+    ownership: "OWNED" | "SHARED";
+    aggregationPolicy: "PRE_AGGREGATE_CHILD" | "EXISTS_ONLY";
+  };
   required: boolean;
   enabled: boolean;
   fanoutRisk: "NONE" | "LOW" | "HIGH";
@@ -775,11 +789,32 @@ export interface DimensionHierarchy {
   name: string;
   label: string;
   description?: string;
+  kind?: "FIXED_LEVELS" | "ADJACENCY_LIST";
   levels: Array<{
     objectId: string;
     propertyId: string;
   }>;
+  adjacency?: {
+    objectId: string;
+    nodeIdPropertyId: string;
+    parentIdPropertyId: string;
+    labelPropertyId: string;
+    maxDepth: number;
+    closure?: {
+      objectId: string;
+      ancestorPropertyId: string;
+      descendantPropertyId: string;
+      depthPropertyId: string;
+    };
+  };
   status: OntologyEntityStatus;
+}
+
+export interface HierarchyAnalysisFilter {
+  hierarchyId: string;
+  anchorValue: string;
+  direction: "DESCENDANTS" | "ANCESTORS";
+  includeSelf?: boolean;
 }
 
 export interface Metric {

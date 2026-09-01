@@ -2246,7 +2246,7 @@ tbody tr:hover {
 
 .stats-row {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(5, 1fr);
   gap: 10px;
   margin-bottom: 14px;
 }
@@ -2378,7 +2378,7 @@ tbody tr:hover {
 
 .catalog-switch {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(3, 1fr);
   gap: 4px;
   margin: 8px;
   border-radius: 8px;
@@ -2969,6 +2969,211 @@ tbody tr:hover {
   padding: 9px 11px;
   font-size: 11px;
   line-height: 1.5;
+}
+
+.editor-help.wide {
+  grid-column: 1 / -1;
+  margin-bottom: 0;
+}
+
+.hierarchy-meta-grid {
+  margin-bottom: 22px;
+}
+
+.hierarchy-level-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.hierarchy-level-heading > div {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.hierarchy-level-heading strong {
+  font-size: 13px;
+}
+
+.hierarchy-level-heading small {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.hierarchy-level-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.hierarchy-level-row {
+  display: grid;
+  grid-template-columns: 32px minmax(140px, 0.8fr) minmax(180px, 1.2fr) auto;
+  align-items: end;
+  gap: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fbfcfe;
+  padding: 10px;
+}
+
+.hierarchy-level-row label {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.hierarchy-level-row label > span {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.hierarchy-level-row select {
+  width: 100%;
+  min-height: 34px;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  background: white;
+  padding: 6px 9px;
+  font-size: 12px;
+}
+
+.hierarchy-level-index {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  align-self: center;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--blue-soft);
+  color: var(--blue);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.hierarchy-level-actions {
+  display: flex;
+  gap: 5px;
+}
+
+.hierarchy-level-actions .icon-button {
+  width: 32px;
+  height: 32px;
+}
+
+.hierarchy-level-actions .icon-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.38;
+}
+
+.hierarchy-readonly-path {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  padding: 18px 0;
+}
+
+.hierarchy-readonly-path > div {
+  position: relative;
+  display: flex;
+  min-width: 120px;
+  flex: 1;
+  flex-direction: column;
+  gap: 3px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #fbfcfe;
+  padding: 12px;
+}
+
+.hierarchy-readonly-path > div:not(:last-child)::after {
+  position: absolute;
+  top: 50%;
+  right: -10px;
+  color: var(--muted-2);
+  content: "→";
+  transform: translateY(-50%);
+}
+
+.hierarchy-readonly-path span,
+.hierarchy-readonly-path small {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.hierarchy-readonly-path strong {
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.hierarchy-recursive-summary {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 18px;
+}
+
+.hierarchy-recursive-summary > div {
+  display: grid;
+  gap: 5px;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--canvas);
+}
+
+.hierarchy-recursive-summary span,
+.hierarchy-recursive-summary small,
+.hierarchy-closure-toggle small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.hierarchy-recursive-editor {
+  display: grid;
+  gap: 16px;
+}
+
+.hierarchy-recursive-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.hierarchy-closure-toggle {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--canvas);
+  cursor: pointer;
+}
+
+.hierarchy-closure-toggle input {
+  margin-top: 3px;
+}
+
+.hierarchy-closure-toggle span {
+  display: grid;
+  gap: 3px;
+}
+
+.hierarchy-closure-grid {
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+
+@media (max-width: 900px) {
+  .hierarchy-recursive-summary,
+  .form-grid.ontology-form-grid.hierarchy-recursive-grid {
+    grid-template-columns: 1fr;
+  }
 }
 
 .property-editor {

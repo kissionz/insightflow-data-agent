@@ -97,6 +97,107 @@ describe("ontology lifecycle", () => {
     ).toBe(true);
   });
 
+  it("validates recursive adjacency hierarchies and their self relation", () => {
+    const draft = createDraftFromPublished(testOntology);
+    const customer = draft.objects.find((object) => object.id === "o_customer")!;
+    customer.properties.push({
+      ...customer.properties[0]!,
+      id: "p_customer_parent_id",
+      name: "parent_customer_id",
+      label: "上级客户ID",
+      sourceColumn: "parent_customer_id",
+      meaning: "ENTITY_REFERENCE",
+      unique: false,
+    });
+    draft.dimensionHierarchies = [{
+      id: "hierarchy_customer_tree",
+      name: "customer_tree",
+      label: "客户组织树",
+      kind: "ADJACENCY_LIST",
+      levels: [],
+      adjacency: {
+        objectId: "o_customer",
+        nodeIdPropertyId: "p_customer_id",
+        parentIdPropertyId: "p_customer_parent_id",
+        labelPropertyId: "p_customer_level",
+        maxDepth: 20,
+      },
+      status: "DRAFT",
+    }];
+    const tables = draft.objects.map((object) => ({
+      id: object.sourceTableId,
+      catalog: "internal",
+      database: "retail",
+      name: object.name,
+      type: "TABLE" as const,
+      status: "MODELED" as const,
+      columns: [],
+      fingerprint: "v1",
+      scannedAt: new Date().toISOString(),
+    }));
+
+    const missingRelation = validateOntology(draft, tables);
+    expect(missingRelation.issues.some(
+      (issue) => issue.code === "DIMENSION_HIERARCHY_SELF_RELATION_REQUIRED",
+    )).toBe(true);
+
+    draft.relations.push({
+      id: "r_customer_parent",
+      name: "客户父节点",
+      sourceObjectId: "o_customer",
+      targetObjectId: "o_customer",
+      type: "HIERARCHY",
+      cardinality: "MANY_TO_ONE",
+      joinExpression: "dim_customers.parent_customer_id = dim_customers.customer_id",
+      sourcePropertyId: "p_customer_parent_id",
+      targetPropertyId: "p_customer_id",
+      direction: "SOURCE_TO_TARGET",
+      required: false,
+      enabled: true,
+      fanoutRisk: "NONE",
+      status: "DRAFT",
+    });
+    const valid = validateOntology(draft, tables);
+    expect(valid.issues.some((issue) => issue.code.startsWith("DIMENSION_HIERARCHY_")))
+      .toBe(false);
+  });
+
+  it("normalizes and validates composition semantics", () => {
+    const published = structuredClone(testOntology);
+    published.relations[0]!.type = "COMPOSITION";
+    published.relations[0]!.composition = undefined;
+    const draft = createDraftFromPublished(published);
+
+    expect(draft.relations[0]!.composition).toEqual({
+      childObjectId: "o_order",
+      parentObjectId: "o_customer",
+      ownership: "OWNED",
+      aggregationPolicy: "PRE_AGGREGATE_CHILD",
+    });
+
+    draft.relations[0]!.cardinality = "ONE_TO_MANY";
+    const result = validateOntology(
+      draft,
+      draft.objects.map((object) => ({
+        id: object.sourceTableId,
+        catalog: "internal",
+        database: "retail",
+        name: object.name,
+        type: "TABLE",
+        status: "MODELED",
+        columns: [],
+        fingerprint: "v1",
+        scannedAt: new Date().toISOString(),
+      })),
+    );
+
+    expect(
+      result.issues.some(
+        (issue) => issue.code === "COMPOSITION_CARDINALITY_INVALID",
+      ),
+    ).toBe(true);
+  });
+
   it("upserts and removes dimension hierarchies inside a draft", () => {
     const draft = createDraftFromPublished(testOntology);
     const updated = upsertDimensionHierarchyInDraft(draft, {

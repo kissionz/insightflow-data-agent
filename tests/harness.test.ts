@@ -1848,6 +1848,144 @@ describe("DataAgentHarness", () => {
     repository.close();
   });
 
+  it.each([
+    {
+      name: "极端整体波动",
+      expectedStatus: "DATA_QUALITY_SUSPECTED",
+      expectedReason: "暂停业务归因",
+      overview: {
+        成交金额: 20,
+        成交金额基期值: 100,
+        成交金额变化额: -80,
+        成交金额变化率: -0.8,
+      },
+      grouped: [
+        { 渠道: "A", 成交金额: 10, 成交金额基期值: 90, 成交金额变化额: -80, 成交金额变化率: -0.8889 },
+        { 渠道: "B", 成交金额: 10, 成交金额基期值: 10, 成交金额变化额: 0, 成交金额变化率: 0 },
+      ],
+    },
+    {
+      name: "未标化结构迁移",
+      expectedStatus: "NON_COMPARABLE_PERIODS",
+      expectedReason: "不可直接进行业务归因",
+      overview: {
+        成交金额: 300,
+        成交金额基期值: 1000,
+        成交金额变化额: -700,
+        成交金额变化率: -0.7,
+      },
+      grouped: [
+        { 渠道: "标准A", 成交金额: 180, 成交金额基期值: 100, 成交金额变化额: 80, 成交金额变化率: 0.8 },
+        { 渠道: "标准B", 成交金额: 120, 成交金额基期值: 100, 成交金额变化额: 20, 成交金额变化率: 0.2 },
+        { 渠道: "未标化数据", 成交金额: 0, 成交金额基期值: 800, 成交金额变化额: -800, 成交金额变化率: -1 },
+      ],
+    },
+  ])("在$name时熔断无效贡献归因", async ({
+    expectedStatus,
+    expectedReason,
+    overview,
+    grouped,
+  }) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-harness-"));
+    roots.push(root);
+    const repository = new Repository(
+      path.join(root, ".montane/data-agent/ontology.sqlite"),
+    );
+    const ontology = ontologyWithGrossMargin();
+    ontology.objects.find((object) => object.id === "o_order")!.properties.push(
+      diagnosticProperty("p_channel", "channel", "渠道"),
+    );
+    repository.saveOntology(ontology);
+    repository.upsertScannedTables([{
+      id: "t_orders",
+      catalog: "internal",
+      database: "retail",
+      name: "fact_orders",
+      type: "TABLE",
+      status: "MODELED",
+      columns: [],
+      fingerprint: `fact_orders:rationality-${expectedStatus}`,
+      scannedAt: "2026-08-31T00:00:00.000Z",
+    }]);
+    repository.saveDataSource({
+      ...repository.getDataSource(),
+      configured: true,
+      host: "selectdb.test",
+      port: 9030,
+      username: "reader",
+      database: "retail",
+      catalog: "internal",
+      tls: false,
+      passwordStored: true,
+    });
+    const conversation = createConversation();
+    repository.saveConversation(conversation);
+    const queries: string[] = [];
+    const evaluations: Array<{
+      status?: string;
+      reason?: string;
+      nextCandidateRefs?: string[];
+      rationalitySignals?: string[];
+    }> = [];
+    const harness = new DataAgentHarness(
+      root,
+      repository,
+      async (sql) => {
+        queries.push(sql);
+        const diagnostic = sql.includes("AS `渠道`");
+        return {
+          columns: diagnostic
+            ? ["渠道", "成交金额", "成交金额基期值", "成交金额变化额", "成交金额变化率"]
+            : ["成交金额", "成交金额基期值", "成交金额变化额", "成交金额变化率"],
+          rows: diagnostic ? grouped : [overview],
+          durationMs: 8,
+          truncated: false,
+        };
+      },
+      () => runtimeFor(new RationalityGuardDiagnosticMontaneModel()),
+    );
+
+    const output = await harness.run(
+      conversation,
+      {
+        id: `turn_rationality_${expectedStatus}`,
+        conversationId: conversation.id,
+        question: "为什么订单成交金额下降",
+        status: "planning",
+        createdAt: new Date().toISOString(),
+        ontologyVersion: ontology.version,
+        trace: [],
+      },
+      {
+        onTextDelta() {},
+        onTextEnd() {},
+        onToolStatus(_call, status, result) {
+          if (status !== "succeeded") return;
+          const evaluation = (result?.data as {
+            diagnosticEvaluation?: typeof evaluations[number];
+          } | undefined)?.diagnosticEvaluation;
+          if (evaluation?.status) evaluations.push(evaluation);
+        },
+      },
+    );
+
+    expect(queries).toHaveLength(2);
+    expect(evaluations).toHaveLength(1);
+    expect(evaluations[0]).toMatchObject({
+      status: expectedStatus,
+      nextCandidateRefs: [],
+    });
+    expect(evaluations[0]?.reason).toContain(expectedReason);
+    expect(evaluations[0]?.rationalitySignals?.length).toBeGreaterThan(0);
+    expect(output.responseKind).toBe("analysis");
+    expect(output.acceptanceContract?.status).toBe("SATISFIED");
+    expect(output.acceptanceContract?.criteria.find(
+      (criterion) => criterion.kind === "DRIVERS",
+    )?.summary).toContain(expectedReason);
+    await harness.close();
+    repository.close();
+  });
+
   it("synthesizes one governed plan for multiple metrics, a value binding, and同比", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "insightflow-harness-"));
     roots.push(root);
@@ -2515,6 +2653,76 @@ class EstablishedDiagnosticMontaneModel implements ModelClient {
       toolCalls: [{ id: `call_${id}`, name, args }],
       stopReason: "tool_use",
     };
+  }
+}
+
+class RationalityGuardDiagnosticMontaneModel implements ModelClient {
+  readonly capabilities = {
+    contextWindow: 32_000,
+    maxOutputTokens: 2_000,
+    supportsStreaming: true,
+    supportsToolUse: true,
+    supportsImages: false,
+  };
+  private step = 0;
+
+  async complete(options: {
+    messages: AgentMessage[];
+    tools: Array<Record<string, unknown>>;
+    onTextDelta?: (delta: string) => void;
+  }): Promise<AgentResponse> {
+    this.step += 1;
+    if (this.step === 1) {
+      return toolResponse("rationality_frame", "SubmitQuestionFrame", {
+        original_question: "为什么订单成交金额下降",
+        intent_kind: "DIAGNOSTIC_ANALYSIS",
+        metric_terms: ["成交金额"],
+        time_terms: [],
+        time_range: { kind: "NONE" },
+        time_grain: "NONE",
+        object_terms: ["订单"],
+        business_value_terms: [],
+        grouping_terms: [],
+        calculation_terms: ["下降", "原因"],
+        presentation: { kind: "AUTO" },
+      });
+    }
+    if (this.step === 2) {
+      return toolResponse("rationality_ontology", "OntologySearch", {
+        query: "为什么订单成交金额下降",
+      });
+    }
+    if (this.step === 3) {
+      return toolResponse("rationality_space", "DiscoverAnalysisSpace", {
+        objective: "为什么订单成交金额下降",
+        object_ids: ["o_order"],
+      });
+    }
+    if (this.step === 4) {
+      return toolResponse(
+        "rationality_overview",
+        "ExecuteAnalysisPlan",
+        evidenceRequest({ title: "成交金额现象确认" }),
+      );
+    }
+    if (this.step === 5) {
+      const planTool = options.tools.find(
+        (tool) => tool.name === "ExecuteAnalysisPlan",
+      );
+      const dimensionRef = firstDimensionRefFromTool(planTool);
+      return toolResponse(
+        "rationality_driver",
+        "ExecuteAnalysisPlan",
+        evidenceRequest({
+          dimensionRefs: dimensionRef ? [dimensionRef] : [],
+          title: "候选维度合理性验证",
+          role: "DIAGNOSTIC",
+        }),
+      );
+    }
+    const finalText = "检测到数据可信度或期间可比性风险，已暂停业务归因。";
+    options.onTextDelta?.(finalText);
+    return { finalText, stopReason: "end_turn" };
   }
 }
 

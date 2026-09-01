@@ -744,23 +744,44 @@ function AnalysisRunTrace({ run }: { run: AnalysisRun }) {
               {step.diagnosticEvaluation ? (
                 <details className="analysis-step-evidence">
                   <summary>
-                    归因评分：
+                    {["DATA_QUALITY_SUSPECTED", "NON_COMPARABLE_PERIODS"].includes(
+                      step.diagnosticEvaluation.status,
+                    )
+                      ? "合理性检查："
+                      : "归因评分："}
                     {step.diagnosticEvaluation.status === "ESTABLISHED"
                       ? "因素成立"
+                      : step.diagnosticEvaluation.status === "DATA_QUALITY_SUSPECTED"
+                        ? "数据可信度风险"
+                        : step.diagnosticEvaluation.status === "NON_COMPARABLE_PERIODS"
+                          ? "期间口径不可比"
                       : step.diagnosticEvaluation.status === "NO_DOMINANT_DRIVER_WITHIN_BUDGET"
                         ? "预算内无主导因素"
                         : "解释力不足"}
                   </summary>
                   <p>{step.diagnosticEvaluation.reason}</p>
                   <span>
-                    强度 {(step.diagnosticEvaluation.driverStrength * 100).toFixed(1)}%
-                    {step.diagnosticEvaluation.top1ContributionShare != null
-                      ? ` · Top1 贡献 ${(step.diagnosticEvaluation.top1ContributionShare * 100).toFixed(1)}%`
-                      : ""}
-                    {step.diagnosticEvaluation.top1ContributionLift != null
-                      ? ` · 贡献提升 ${step.diagnosticEvaluation.top1ContributionLift.toFixed(2)}x`
-                      : ""}
+                    {["DATA_QUALITY_SUSPECTED", "NON_COMPARABLE_PERIODS"].includes(
+                      step.diagnosticEvaluation.status,
+                    )
+                      ? "贡献评分已暂停"
+                      : `强度 ${(step.diagnosticEvaluation.driverStrength * 100).toFixed(1)}%${
+                        step.diagnosticEvaluation.top1ContributionShare != null
+                          ? ` · Top1 贡献 ${(step.diagnosticEvaluation.top1ContributionShare * 100).toFixed(1)}%`
+                          : ""
+                      }${
+                        step.diagnosticEvaluation.top1ContributionLift != null
+                          ? ` · 贡献提升 ${step.diagnosticEvaluation.top1ContributionLift.toFixed(2)}x`
+                          : ""
+                      }`}
                   </span>
+                  {step.diagnosticEvaluation.rationalitySignals?.length ? (
+                    <ul>
+                      {step.diagnosticEvaluation.rationalitySignals.map((signal) => (
+                        <li key={signal}>{signal}</li>
+                      ))}
+                    </ul>
+                  ) : null}
                 </details>
               ) : null}
               {step.ir || step.rows?.length ? (

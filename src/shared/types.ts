@@ -166,6 +166,8 @@ export interface DiagnosticEvaluation {
     | "ESTABLISHED"
     | "INSUFFICIENT_EXPLANATORY_POWER"
     | "INELIGIBLE"
+    | "DATA_QUALITY_SUSPECTED"
+    | "NON_COMPARABLE_PERIODS"
     | "NO_DOMINANT_DRIVER_WITHIN_BUDGET";
   reason: string;
   rowCount: number;
@@ -176,6 +178,12 @@ export interface DiagnosticEvaluation {
   top1ToTop2Ratio?: number;
   top1ContributionLift?: number;
   maxGrowthRateDeviation?: number;
+  overallGrowthRate?: number;
+  exceptionalMemberContributionShare?: number;
+  exceptionalBaselineShare?: number;
+  exceptionalCurrentShare?: number;
+  comparableGrowthRate?: number;
+  rationalitySignals: string[];
   driverStrength: number;
   dominantMembers: DiagnosticContribution[];
   evaluatedMeasureCount: number;
@@ -189,7 +197,9 @@ export interface DiagnosticMetricEvaluation {
   status:
     | "ESTABLISHED"
     | "INSUFFICIENT_EXPLANATORY_POWER"
-    | "INELIGIBLE";
+    | "INELIGIBLE"
+    | "DATA_QUALITY_SUSPECTED"
+    | "NON_COMPARABLE_PERIODS";
   reason: string;
   rowCount: number;
   reconciliationRate?: number;
@@ -199,6 +209,12 @@ export interface DiagnosticMetricEvaluation {
   top1ToTop2Ratio?: number;
   top1ContributionLift?: number;
   maxGrowthRateDeviation?: number;
+  overallGrowthRate?: number;
+  exceptionalMemberContributionShare?: number;
+  exceptionalBaselineShare?: number;
+  exceptionalCurrentShare?: number;
+  comparableGrowthRate?: number;
+  rationalitySignals: string[];
   driverStrength: number;
   dominantMembers: DiagnosticContribution[];
 }

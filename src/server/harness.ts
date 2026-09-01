@@ -45,6 +45,9 @@ const DATA_AGENT_MAX_MODEL_TURNS = 14;
 const DATA_AGENT_MAX_SUCCESSFUL_QUERIES = 4;
 const DATA_AGENT_MAX_CONSECUTIVE_PLANNING_FAILURES = 3;
 const DATA_AGENT_MAX_DIAGNOSTIC_MEASURES = 3;
+const DIAGNOSTIC_EXTREME_CHANGE_THRESHOLD = 0.7;
+const DIAGNOSTIC_EXCEPTIONAL_CONTRIBUTION_THRESHOLD = 0.6;
+const DIAGNOSTIC_EXCEPTIONAL_SHARE_SHIFT_THRESHOLD = 0.1;
 
 const DATA_AGENT_SYSTEM_PROMPT = `
 你是 InsightFlow Data Agent，运行在 Montane Harness 中。
@@ -66,8 +69,8 @@ const DATA_AGENT_SYSTEM_PROMPT = `
 9. ExecuteAnalysisPlan 是唯一查询入口。服务端 Plan Synthesizer 把紧凑请求确定性展开成强类型 IR，校验关系、粒度、可加性、筛选逻辑和窗口计算，再编译参数化 Doris SQL 并执行。
 9.1 SubmitQuestionFrame 返回 acceptanceContract。所有分析类型共用同一个受控查询循环和四条成功查询预算；意图不能把明确问数限制为一条查询，也不能强制探索分析执行多条查询。
 9.2 服务端根据请求结构、已有查询和待验收项自动生成 analysis_step，并自动关联本次查询能够关闭的验收缺口。模型不构造步骤说明或验收句柄；后续查询必须由上一查询返回的真实数据驱动，并选择能够补充现有证据的不同指标、维度、粒度或高级计算。
-9.3 每次 ExecuteAnalysisPlan 返回受控查询数据和更新后的 acceptanceContract。非归因分析由服务端优先补齐可用核心指标、同比和月度趋势，不要求机械执行结构分组。归因分析单次最多选择三个相关指标，服务端分别按贡献集中度、基期份额抬升、增速分化和结果对账统一加权评分，并优先返回通过硬门槛且得分最高的指标证据；模型不得凭最大枚举值自行宣布原因成立。
-9.4 归因分析应严格按 diagnosticCandidates/nextCandidateRefs 的顺序一次验证一个维度；只有 diagnosticEvaluation.status=ESTABLISHED 才能表述为主要因素。若解释力不足则继续下一个候选，直到成立或预算耗尽；NO_DOMINANT_DRIVER_WITHIN_BUDGET 是合法结论，不得强行归因。
+9.3 每次 ExecuteAnalysisPlan 返回受控查询数据和更新后的 acceptanceContract。非归因分析由服务端优先补齐可用核心指标、同比和月度趋势，不要求机械执行结构分组。归因分析单次最多选择三个相关指标，服务端先执行变化合理性与期间可比性检查，再按贡献集中度、基期份额抬升、增速分化和结果对账统一加权评分，并优先返回通过硬门槛且得分最高的指标证据；模型不得凭最大枚举值自行宣布原因成立。
+9.4 归因分析应严格按 diagnosticCandidates/nextCandidateRefs 的顺序一次验证一个维度；只有 diagnosticEvaluation.status=ESTABLISHED 才能表述为主要因素。若解释力不足则继续下一个候选，直到成立或预算耗尽；DATA_QUALITY_SUSPECTED、NON_COMPARABLE_PERIODS 与 NO_DOMINANT_DRIVER_WITHIN_BUDGET 都是合法终态，前两者必须停止业务归因并明确提示数据可信度或口径可比性风险。
 9.5 只有全部必需验收项为 SATISFIED 或 NOT_APPLICABLE 才能宣称完成；预算耗尽、没有进展或主动停止但仍有缺口时，必须明确为部分完成。不得重复相同计划，不得跨事实对象。连续规划失败最多三次；收到 ANALYSIS_RETRY_LIMIT_REACHED 后必须停止调用工具并说明缺口。
 10. 不得猜测或创造 O*/M*/D*/B*/A* 句柄、数据库值或关系。临时计算只可使用 C1、C2 等本请求内句柄，输入必须引用本轮工具真实返回的 M*/D* 或前序 C*。
 11. 最终使用中文给出简洁、可验证的结论，只能引用 ExecuteAnalysisPlan 返回的数据。
@@ -2681,6 +2684,9 @@ function modelVisibleAnalysisResult(
       : {};
   const acceptance = state.acceptanceContract;
   const diagnosticEvaluation = capture?.diagnosticEvaluation;
+  const rationalityTerminal = diagnosticEvaluation
+    ? isDiagnosticRationalityTerminal(diagnosticEvaluation.status)
+    : false;
   return {
     status: "success",
     result: {
@@ -2704,12 +2710,26 @@ function modelVisibleAnalysisResult(
           status: diagnosticEvaluation.status,
           reason: diagnosticEvaluation.reason,
           driverStrength: diagnosticEvaluation.driverStrength,
-          top1ContributionShare:
-            diagnosticEvaluation.top1ContributionShare,
-          top1ContributionLift: diagnosticEvaluation.top1ContributionLift,
+          top1ContributionShare: rationalityTerminal
+            ? undefined
+            : diagnosticEvaluation.top1ContributionShare,
+          top1ContributionLift: rationalityTerminal
+            ? undefined
+            : diagnosticEvaluation.top1ContributionLift,
           maxGrowthRateDeviation:
             diagnosticEvaluation.maxGrowthRateDeviation,
-          dominantMembers: diagnosticEvaluation.dominantMembers,
+          overallGrowthRate: diagnosticEvaluation.overallGrowthRate,
+          exceptionalMemberContributionShare:
+            diagnosticEvaluation.exceptionalMemberContributionShare,
+          exceptionalBaselineShare:
+            diagnosticEvaluation.exceptionalBaselineShare,
+          exceptionalCurrentShare:
+            diagnosticEvaluation.exceptionalCurrentShare,
+          comparableGrowthRate: diagnosticEvaluation.comparableGrowthRate,
+          rationalitySignals: diagnosticEvaluation.rationalitySignals,
+          dominantMembers: rationalityTerminal
+            ? []
+            : diagnosticEvaluation.dominantMembers,
           evaluatedMeasureCount:
             diagnosticEvaluation.evaluatedMeasureCount,
           metricEvaluations: diagnosticEvaluation.metricEvaluations.map(
@@ -2718,6 +2738,8 @@ function modelVisibleAnalysisResult(
               status: evaluation.status,
               reason: evaluation.reason,
               driverStrength: evaluation.driverStrength,
+              overallGrowthRate: evaluation.overallGrowthRate,
+              rationalitySignals: evaluation.rationalitySignals,
             }),
           ),
           nextCandidateRefs: diagnosticEvaluation.nextCandidateRefs,
@@ -2734,7 +2756,10 @@ function modelVisibleAnalysisResult(
         DATA_AGENT_MAX_SUCCESSFUL_QUERIES - state.captures.length,
     },
     nextAction:
-      diagnosticEvaluation?.status === "INSUFFICIENT_EXPLANATORY_POWER" ||
+      diagnosticEvaluation &&
+        isDiagnosticRationalityTerminal(diagnosticEvaluation.status)
+        ? "FINALIZE_WITH_DATA_QUALITY_WARNING"
+        : diagnosticEvaluation?.status === "INSUFFICIENT_EXPLANATORY_POWER" ||
         diagnosticEvaluation?.status === "INELIGIBLE"
         ? diagnosticEvaluation.nextCandidateRefs.length
           ? "QUERY_NEXT_DIAGNOSTIC_CANDIDATE"
@@ -5459,8 +5484,19 @@ function evaluateDiagnosticEvidence(
   const established = metricEvaluations.filter(
     (evaluation) => evaluation.status === "ESTABLISHED",
   );
-  const selected = [...(established.length ? established : metricEvaluations)]
+  const rationalityBlocked = metricEvaluations.filter((evaluation) =>
+    isDiagnosticRationalityTerminal(evaluation.status)
+  );
+  const selected = [...(
+    rationalityBlocked.length
+      ? rationalityBlocked
+      : established.length
+        ? established
+        : metricEvaluations
+  )]
     .sort((left, right) =>
+      diagnosticRationalityPriority(right.status) -
+        diagnosticRationalityPriority(left.status) ||
       right.driverStrength - left.driverStrength ||
       (right.relativeMateriality ?? 0) - (left.relativeMateriality ?? 0)
     )[0];
@@ -5486,7 +5522,9 @@ function evaluateDiagnosticEvidence(
     });
   const budgetExhausted =
     state.captures.length + 1 >= DATA_AGENT_MAX_SUCCESSFUL_QUERIES;
+  const rationalityTerminal = isDiagnosticRationalityTerminal(selected.status);
   const noDominantDriver =
+    !rationalityTerminal &&
     selected.status !== "ESTABLISHED" &&
     (budgetExhausted || !nextCandidateRefs.length);
   return {
@@ -5501,8 +5539,39 @@ function evaluateDiagnosticEvidence(
       : selected.reason,
     evaluatedMeasureCount: metricEvaluations.length,
     metricEvaluations,
-    nextCandidateRefs: noDominantDriver ? [] : nextCandidateRefs,
+    nextCandidateRefs:
+      noDominantDriver || rationalityTerminal ? [] : nextCandidateRefs,
   };
+}
+
+function isDiagnosticRationalityTerminal(status: string): boolean {
+  return ["DATA_QUALITY_SUSPECTED", "NON_COMPARABLE_PERIODS"].includes(status);
+}
+
+function diagnosticRationalityPriority(status: string): number {
+  if (status === "NON_COMPARABLE_PERIODS") return 2;
+  if (status === "DATA_QUALITY_SUSPECTED") return 1;
+  return 0;
+}
+
+function isExceptionalDiagnosticMember(member: string): boolean {
+  const normalized = member
+    .trim()
+    .toLocaleLowerCase("zh-CN")
+    .replace(/[\s_-]+/g, "");
+  return /^(?:未标化|未标准化|未映射|未归类|未分类)(?:数据|部分|其他)?$/.test(
+    normalized,
+  ) || [
+    "未知",
+    "空值",
+    "无",
+    "unknown",
+    "unmapped",
+    "unstandardized",
+    "notmapped",
+    "notstandardized",
+    "null",
+  ].includes(normalized);
 }
 
 function scoreDiagnosticMetricEvidence(
@@ -5549,6 +5618,7 @@ function scoreDiagnosticMetricEvidence(
     status: "INELIGIBLE",
     reason,
     rowCount: grouped.size,
+    rationalitySignals: [],
     driverStrength: 0,
     dominantMembers: [],
   });
@@ -5636,7 +5706,79 @@ function scoreDiagnosticMetricEvidence(
           Math.max(Math.abs(overviewDelta), 1e-9),
       );
   const reconciled = reconciliationRate == null || reconciliationRate >= 0.95;
+  const exceptionalContributions = contributions.filter((item) =>
+    isExceptionalDiagnosticMember(item.member)
+  );
+  const comparableContributions = contributions.filter((item) =>
+    !isExceptionalDiagnosticMember(item.member)
+  );
+  const exceptionalDelta = exceptionalContributions.reduce(
+    (sum, item) => sum + item.delta,
+    0,
+  );
+  const comparableDelta = comparableContributions.reduce(
+    (sum, item) => sum + item.delta,
+    0,
+  );
+  const comparablePrevious = comparableContributions.reduce(
+    (sum, item) => sum + item.previousValue,
+    0,
+  );
+  const exceptionalMemberContributionShare = exceptionalContributions.reduce(
+    (sum, item) => sum + item.alignedContributionShare,
+    0,
+  );
+  const exceptionalBaselineShare = exceptionalContributions.reduce(
+    (sum, item) => sum + item.baselineShare,
+    0,
+  );
+  const totalCurrent = contributions.reduce(
+    (sum, item) => sum + Math.abs(item.currentValue),
+    0,
+  );
+  const exceptionalCurrentShare = totalCurrent > 0
+    ? exceptionalContributions.reduce(
+        (sum, item) => sum + Math.abs(item.currentValue),
+        0,
+      ) / totalCurrent
+    : 0;
+  const exceptionalShareShift = Math.abs(
+    exceptionalCurrentShare - exceptionalBaselineShare,
+  );
+  const comparableGrowthRate = comparablePrevious !== 0
+    ? comparableDelta / Math.abs(comparablePrevious)
+    : undefined;
+  const exceptionalOpposesComparable =
+    exceptionalDelta !== 0 &&
+    comparableDelta !== 0 &&
+    Math.sign(exceptionalDelta) !== Math.sign(comparableDelta);
+  const nonComparablePeriods =
+    exceptionalContributions.length > 0 &&
+    comparableContributions.length > 0 &&
+    exceptionalOpposesComparable &&
+    exceptionalMemberContributionShare >=
+      DIAGNOSTIC_EXCEPTIONAL_CONTRIBUTION_THRESHOLD &&
+    exceptionalShareShift >= DIAGNOSTIC_EXCEPTIONAL_SHARE_SHIFT_THRESHOLD;
+  const extremeOverallChange =
+    Math.abs(overallGrowth) >= DIAGNOSTIC_EXTREME_CHANGE_THRESHOLD;
+  const rationalitySignals: string[] = [];
+  if (extremeOverallChange) {
+    rationalitySignals.push(
+      `整体变化率${(overallGrowth * 100).toFixed(1)}%超过${(DIAGNOSTIC_EXTREME_CHANGE_THRESHOLD * 100).toFixed(0)}%合理性阈值`,
+    );
+  }
+  if (nonComparablePeriods) {
+    rationalitySignals.push(
+      `特殊成员贡献${(exceptionalMemberContributionShare * 100).toFixed(1)}%，份额迁移${(exceptionalShareShift * 100).toFixed(1)}个百分点，且与已标化子集方向相反`,
+    );
+  }
+  const rationalityStatus = nonComparablePeriods
+    ? "NON_COMPARABLE_PERIODS" as const
+    : extremeOverallChange
+      ? "DATA_QUALITY_SUSPECTED" as const
+      : undefined;
   const established =
+    !rationalityStatus &&
     top1ContributionShare >= 0.5 &&
     ((top1.contributionLift ?? 0) >= 1.25 || maxGrowthRateDeviation >= 0.05) &&
     reconciled &&
@@ -5651,15 +5793,20 @@ function scoreDiagnosticMetricEvidence(
         (reconciled ? 0.1 : 0),
     ),
   );
+  const reason = rationalityStatus === "NON_COMPARABLE_PERIODS"
+    ? `指标“${measureLabel}”存在未标化或未映射数据的结构迁移：特殊成员主导总变化，而可比子集${comparableGrowthRate == null ? "缺少有效基期" : `${comparableGrowthRate >= 0 ? "增长" : "下降"}${Math.abs(comparableGrowthRate * 100).toFixed(1)}%`}；当前期间不可直接进行业务归因`
+    : rationalityStatus === "DATA_QUALITY_SUSPECTED"
+      ? `指标“${measureLabel}”整体变化${(overallGrowth * 100).toFixed(1)}%，超过合理性阈值；在补充数据完整性或历史趋势验证前暂停业务归因`
+      : established
+        ? `指标“${measureLabel}”中${top1.member}贡献占比为${(top1ContributionShare * 100).toFixed(1)}%，统一加权得分${(driverStrength * 100).toFixed(1)}分`
+        : `指标“${measureLabel}”未同时满足贡献集中、相对基期抬升和增速分化条件`;
   return {
     measureId,
     measureLabel,
-    status: established
+    status: rationalityStatus ?? (established
       ? "ESTABLISHED"
-      : "INSUFFICIENT_EXPLANATORY_POWER",
-    reason: established
-      ? `指标“${measureLabel}”中${top1.member}贡献占比为${(top1ContributionShare * 100).toFixed(1)}%，统一加权得分${(driverStrength * 100).toFixed(1)}分`
-      : `指标“${measureLabel}”未同时满足贡献集中、相对基期抬升和增速分化条件`,
+      : "INSUFFICIENT_EXPLANATORY_POWER"),
+    reason,
     rowCount: grouped.size,
     reconciliationRate,
     relativeMateriality,
@@ -5668,7 +5815,22 @@ function scoreDiagnosticMetricEvidence(
     top1ToTop2Ratio,
     top1ContributionLift: top1.contributionLift,
     maxGrowthRateDeviation,
-    driverStrength,
+    overallGrowthRate: overallGrowth,
+    exceptionalMemberContributionShare:
+      exceptionalContributions.length > 0
+        ? exceptionalMemberContributionShare
+        : undefined,
+    exceptionalBaselineShare:
+      exceptionalContributions.length > 0
+        ? exceptionalBaselineShare
+        : undefined,
+    exceptionalCurrentShare:
+      exceptionalContributions.length > 0
+        ? exceptionalCurrentShare
+        : undefined,
+    comparableGrowthRate,
+    rationalitySignals,
+    driverStrength: rationalityStatus ? 0 : driverStrength,
     dominantMembers: contributions.slice(0, 3),
   };
 }
@@ -5747,6 +5909,8 @@ function satisfyAcceptanceCriteria(
       if (
         ![
           "ESTABLISHED",
+          "DATA_QUALITY_SUSPECTED",
+          "NON_COMPARABLE_PERIODS",
           "NO_DOMINANT_DRIVER_WITHIN_BUDGET",
         ].includes(diagnosticEvaluation.status)
       ) {

@@ -15,6 +15,7 @@ import type {
 import { afterEach, describe, expect, it } from "vitest";
 import type { Conversation, Turn } from "../src/shared/types.js";
 import {
+  buildSystemPrompt,
   DataAgentHarness,
   resolveContextualMonthReferences,
 } from "../src/server/harness.js";
@@ -29,10 +30,7 @@ afterEach(() => {
 
 describe("DataAgentHarness", () => {
   it("defaults a bare month to the current business year", () => {
-    const currentYear = Number(new Intl.DateTimeFormat("en-US", {
-      year: "numeric",
-      timeZone: "Asia/Shanghai",
-    }).format(new Date()));
+    const businessNow = new Date("2026-01-14T16:30:00.000Z");
     const frame = resolveContextualMonthReferences(
       {
         originalQuestion: "7月份销售额为什么下降",
@@ -49,13 +47,27 @@ describe("DataAgentHarness", () => {
       createConversation(),
       "turn_current",
       "Asia/Shanghai",
+      businessNow,
     );
-    expect(frame.timeTerms).toEqual([`${currentYear}年7月`]);
+    expect(frame.timeTerms).toEqual(["2026年7月"]);
     expect(frame.timeRange).toMatchObject({
       kind: "ABSOLUTE_MONTH",
-      year: currentYear,
+      year: 2026,
       month: 7,
     });
+  });
+
+  it("injects the date-only business clock into the system prompt", () => {
+    const prompt = buildSystemPrompt(
+      "",
+      "Asia/Shanghai",
+      new Date("2026-08-31T16:30:45.000Z"),
+    );
+
+    expect(prompt).toContain("业务时区：Asia/Shanghai");
+    expect(prompt).toContain("当前业务日期：2026-09-01");
+    expect(prompt).toContain("CURRENT_YEAR、CURRENT_MONTH、TODAY");
+    expect(prompt).not.toContain("16:30:45");
   });
 
   it("reports missing CLI configuration without asking InsightFlow for an API key", async () => {
@@ -649,6 +661,7 @@ describe("DataAgentHarness", () => {
         };
       },
       () => runtimeFor(new MonthlyPlanningMontaneModel()),
+      () => new Date("2026-09-01T02:00:00.000Z"),
     );
 
     const output = await harness.run(
@@ -672,8 +685,7 @@ describe("DataAgentHarness", () => {
     expect(output.responseKind).toBe("analysis");
     expect(queries[0]).toContain("DATE_TRUNC(t0.`paid_at`, 'month')");
     expect(queries[0]).not.toContain("GROUP BY t0.`paid_at`");
-    const currentYear = new Date().getFullYear();
-    expect(parameters[0]?.[0]).toBe(`${currentYear}-01-01 00:00:00`);
+    expect(parameters[0]?.[0]).toBe("2026-01-01 00:00:00");
     expect(parameters[0]).not.toContain("今年、每个月");
     await harness.close();
     repository.close();

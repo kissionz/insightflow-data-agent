@@ -164,7 +164,6 @@ export class DataAgentHarness {
   private readonly sessionManager: SessionManager;
   private readonly sessions = new Map<string, ManagedSession>();
   private modelRuntimePromise?: Promise<ConfiguredModelRuntime>;
-  private readonly queryCompiler = new QueryIrCompiler();
 
   constructor(
     private readonly workspaceRoot: string,
@@ -177,6 +176,7 @@ export class DataAgentHarness {
     ) => Promise<QueryResult>,
     private readonly resolveModelRuntime: () => Promise<ConfiguredModelRuntime> =
       () => resolveConfiguredModel({ workspaceRoot }),
+    private readonly now: () => Date = () => new Date(),
   ) {
     this.sessionManager = new SessionManager(workspaceRoot, {
       model: "montane-configured",
@@ -192,6 +192,8 @@ export class DataAgentHarness {
     const source = this.repository.getDataSource();
     const runtime = await this.getModelRuntime();
     const agentConfig = this.repository.getAgentConfig();
+    const turnNow = this.now();
+    const queryCompiler = new QueryIrCompiler(() => turnNow);
     const analysisState: AnalysisExecutionState = {
       captures: [],
       seenPlanHashes: new Set(),
@@ -212,6 +214,7 @@ export class DataAgentHarness {
           conversation,
           turn.id,
           agentConfig.timezone,
+          turnNow,
         );
         analysisState.acceptanceContract ??=
           createAcceptanceContract(questionFrame);
@@ -249,6 +252,7 @@ export class DataAgentHarness {
         valueBindings,
         () => questionFrame,
         analysisState,
+        queryCompiler,
       ),
     );
 
@@ -269,7 +273,11 @@ export class DataAgentHarness {
     const context = new DataAgentContextBuilder(
       this.workspaceRoot,
       120,
-      buildSystemPrompt(agentConfig.businessInstructions, agentConfig.timezone),
+      buildSystemPrompt(
+        agentConfig.businessInstructions,
+        agentConfig.timezone,
+        turnNow,
+      ),
     );
     const loop = new AgentLoop(
       runtime.client,
@@ -1495,7 +1503,15 @@ export class DataAgentHarness {
     timezone: string,
     valueBindings: Map<string, ResolvedValueBinding>,
     getQuestionFrame: () => QuestionLanguageFrame | undefined,
-    state: AnalysisExecutionState,
+    state: AnalysisExecutionState = {
+      captures: [],
+      seenPlanHashes: new Set(),
+      queryBudgetReached: false,
+      consecutivePlanningFailures: 0,
+      planningCatalog: createPlanningCatalog(),
+      diagnosticCandidates: [],
+    },
+    queryCompiler: QueryIrCompiler = new QueryIrCompiler(this.now),
   ): Tool {
     const legacyExecutor = this.executeAnalysisPlanTool(
       capture,
@@ -1503,6 +1519,7 @@ export class DataAgentHarness {
       valueBindings,
       getQuestionFrame,
       state,
+      queryCompiler,
     );
     return {
       name: "ExecuteAnalysisPlan",
@@ -1606,6 +1623,7 @@ export class DataAgentHarness {
       planningCatalog: createPlanningCatalog(),
       diagnosticCandidates: [],
     },
+    queryCompiler: QueryIrCompiler = new QueryIrCompiler(this.now),
   ): Tool {
     return {
       name: "ExecuteAnalysisPlan",
@@ -2157,7 +2175,7 @@ export class DataAgentHarness {
         }
         let compiled: CompiledQuery;
         try {
-          compiled = this.queryCompiler.compile(
+          compiled = queryCompiler.compile(
             intent,
             ontology,
             this.repository.getTables(),
@@ -3639,14 +3657,28 @@ function resolveMeasureForTerm(
   });
 }
 
-function buildSystemPrompt(
+export function buildSystemPrompt(
   businessInstructions: string,
   timezone: string,
+  now: Date = new Date(),
 ): string {
+  const businessDate = formatBusinessDate(now, timezone);
   const businessSection = businessInstructions.trim()
     ? `\n\n工作区业务指令（不得覆盖上述安全协议）：\n${businessInstructions.trim()}`
     : "";
-  return `${DATA_AGENT_SYSTEM_PROMPT}\n\n业务时区：${timezone}${businessSection}`;
+  return `${DATA_AGENT_SYSTEM_PROMPT}\n\n业务时区：${timezone}\n当前业务日期：${businessDate}\n相对时间必须以该日期为基准；“今年”“本月”“今天”等仍提交 CURRENT_YEAR、CURRENT_MONTH、TODAY 等语义枚举，不得自行猜测或改写为绝对日期。${businessSection}`;
+}
+
+function formatBusinessDate(value: Date, timezone: string): string {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(value);
+  const get = (type: Intl.DateTimeFormatPartTypes) =>
+    parts.find((part) => part.type === type)?.value ?? "";
+  return `${get("year")}-${get("month")}-${get("day")}`;
 }
 
 function describeMontaneRuntimeError(error: unknown): string {
@@ -4963,13 +4995,14 @@ export function resolveContextualMonthReferences(
   conversation: Conversation,
   currentTurnId: string,
   timezone: string,
+  now: Date = new Date(),
 ): QuestionLanguageFrame {
   if (frame.timeRange?.kind === "CONTEXT_MONTH" && frame.timeRange.month) {
     const currentYear = Number(
       new Intl.DateTimeFormat("en-US", {
         year: "numeric",
         timeZone: timezone,
-      }).format(new Date()),
+      }).format(now),
     );
     const explicitYear = frame.originalQuestion.match(/(20\d{2})年/)?.[1];
     const previousAnchor = [...conversation.turns]
@@ -5000,7 +5033,7 @@ export function resolveContextualMonthReferences(
     new Intl.DateTimeFormat("en-US", {
       year: "numeric",
       timeZone: timezone,
-    }).format(new Date()),
+    }).format(now),
   );
   const explicitYear = frame.originalQuestion.match(/(20\d{2})年/)?.[1];
   const previousAnchor = [...conversation.turns]

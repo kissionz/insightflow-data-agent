@@ -35,7 +35,11 @@ import type {
 } from "../shared/types.js";
 import { createId } from "./id.js";
 import { Repository } from "./repository.js";
-import { QueryIrCompiler, type CompiledQuery } from "./query-ir.js";
+import {
+  preferNameDisplayDimensions,
+  QueryIrCompiler,
+  type CompiledQuery,
+} from "./query-ir.js";
 import { createLiveResult } from "./result-artifact.js";
 import { SemanticIndex } from "./semantic-index.js";
 import type { QueryResult } from "./selectdb.js";
@@ -1169,6 +1173,7 @@ export class DataAgentHarness {
             state.diagnosticCandidates = buildDiagnosticCandidates(
               spaces[0],
               state,
+              ontology,
             );
           }
         }
@@ -2163,7 +2168,9 @@ export class DataAgentHarness {
             },
           };
         }
-        const planHash = stableAnalysisPlanHash(intent);
+        const planHash = stableAnalysisPlanHash(
+          preferNameDisplayDimensions(intent, ontology),
+        );
         if (state.seenPlanHashes.has(planHash)) {
           return {
             ok: false,
@@ -2202,6 +2209,7 @@ export class DataAgentHarness {
             },
           };
         }
+        intent = preferNameDisplayDimensions(intent, ontology);
         const analysisStep = normalizeAnalysisStep(
           rawAnalysisStep,
           intent.title,
@@ -4873,22 +4881,41 @@ function rankAnalysisDimensions(
 function buildDiagnosticCandidates(
   rawSpace: Record<string, unknown> | undefined,
   state: AnalysisExecutionState,
+  ontology: OntologySnapshot,
 ): DiagnosticCandidate[] {
   const dimensions = Array.isArray(rawSpace?.dimensions)
     ? rawSpace.dimensions as Array<Record<string, unknown>>
     : [];
-  return dimensions.map((dimension) => ({
-    dimensionId: String(dimension.id),
-    label: String(dimension.label),
-    objectLabel: String(dimension.objectLabel ?? "当前对象"),
-    score: Number(dimension.diagnosticScore ?? 0),
-    reasons: Array.isArray(dimension.diagnosticReasons)
-      ? dimension.diagnosticReasons.map(String)
-      : ["通用诊断候选"],
-    status: state.diagnosticCandidates.find(
-      (candidate) => candidate.dimensionId === String(dimension.id),
-    )?.status ?? "PENDING",
-  }));
+  const candidates = dimensions.map((dimension) => {
+    const originalId = String(dimension.id);
+    const preferredId = preferNameDisplayDimensions(
+      {
+        measureIds: [],
+        dimensionPropertyIds: [originalId],
+        filters: [],
+        resultKind: "aggregate",
+        title: "诊断维度展示",
+      },
+      ontology,
+    ).dimensionPropertyIds[0] ?? originalId;
+    const binding = findPropertyBinding(ontology, preferredId);
+    return {
+      dimensionId: preferredId,
+      label: binding?.property.label ?? String(dimension.label),
+      objectLabel:
+        binding?.object.label ?? String(dimension.objectLabel ?? "当前对象"),
+      score: Number(dimension.diagnosticScore ?? 0),
+      reasons: Array.isArray(dimension.diagnosticReasons)
+        ? dimension.diagnosticReasons.map(String)
+        : ["通用诊断候选"],
+      status: state.diagnosticCandidates.find(
+        (candidate) => candidate.dimensionId === preferredId,
+      )?.status ?? "PENDING" as const,
+    };
+  });
+  return [...new Map(
+    candidates.map((candidate) => [candidate.dimensionId, candidate]),
+  ).values()];
 }
 
 function describeDiagnosticCandidates(
@@ -5022,6 +5049,38 @@ export function resolveContextualMonthReferences(
   timezone: string,
   now: Date = new Date(),
 ): QuestionLanguageFrame {
+  const explicitTimeInQuestion =
+    /(20\d{2}年|今年|本年|去年|前年|本月|上月|本周|上周|本季|上季|今天|昨日|昨天|\d{1,2}月(?:份)?|\d{4}-\d{1,2}-\d{1,2})/.test(
+      frame.originalQuestion,
+    );
+  if (!explicitTimeInQuestion) {
+    const previousTimeRange = [...conversation.turns]
+      .reverse()
+      .filter((turn) => turn.id !== currentTurnId)
+      .map((turn) => turn.resultIntent?.timeRange)
+      .find((range): range is NonNullable<AnalysisIntent["timeRange"]> =>
+        Boolean(range?.kind),
+      );
+    if (previousTimeRange?.kind) {
+      const inheritedRange: StructuredTimeRange = {
+        kind: previousTimeRange.kind,
+        originalText: previousTimeRange.expression,
+        ...(previousTimeRange.year ? { year: previousTimeRange.year } : {}),
+        ...(previousTimeRange.month ? { month: previousTimeRange.month } : {}),
+        ...(previousTimeRange.count ? { count: previousTimeRange.count } : {}),
+        ...(previousTimeRange.unit ? { unit: previousTimeRange.unit } : {}),
+        ...(previousTimeRange.start ? { start: previousTimeRange.start } : {}),
+        ...(previousTimeRange.endExclusive
+          ? { endExclusive: previousTimeRange.endExclusive }
+          : {}),
+      };
+      return {
+        ...frame,
+        timeTerms: [previousTimeRange.expression],
+        timeRange: inheritedRange,
+      };
+    }
+  }
   if (frame.timeRange?.kind === "CONTEXT_MONTH" && frame.timeRange.month) {
     const currentYear = Number(
       new Intl.DateTimeFormat("en-US", {

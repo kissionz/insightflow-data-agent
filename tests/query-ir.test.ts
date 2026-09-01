@@ -4,6 +4,49 @@ import { QueryIrCompiler } from "../src/server/query-ir.js";
 import { testOntology } from "./fixtures.js";
 
 describe("QueryIrCompiler", () => {
+  it("uses related name properties as the global display dimension with ID fallback", () => {
+    const ontology = structuredClone(testOntology);
+    ontology.objects[2]!.properties.push({
+      id: "p_store_name",
+      name: "store_name",
+      label: "门店名称",
+      description: "门店对外展示名称",
+      dataType: "VARCHAR",
+      sourceColumn: "store_name",
+      sensitive: false,
+      meaning: "NAME",
+      unique: false,
+      valueSearchable: true,
+      visibility: "ANALYTICAL",
+      synonyms: ["店铺名称"],
+      defaultDisplay: true,
+      exportable: true,
+      bindingPriority: 80,
+    });
+    const compiled = new QueryIrCompiler().compile(
+      {
+        rootObjectId: "o_order",
+        measureIds: ["m_gmv"],
+        dimensionPropertyIds: ["p_store_id"],
+        filters: [],
+        resultKind: "aggregate",
+        title: "按门店查看成交金额",
+      },
+      ontology,
+      [ordersTable(), storeTable()],
+    );
+
+    expect(compiled.ir.dimensionPropertyIds).toEqual(["p_store_name"]);
+    expect(compiled.sql).toContain(
+      "LEFT JOIN `retail`.`dim_stores` AS t1 ON t0.`store_id` = t1.`store_id`",
+    );
+    expect(compiled.sql).toContain(
+      "COALESCE(NULLIF(t1.`store_name`, ''), CAST(t0.`store_id` AS STRING)) AS `门店名称`",
+    );
+    expect(compiled.sql).toContain("GROUP BY COALESCE(NULLIF(t1.`store_name`, ''), CAST(t0.`store_id` AS STRING)), t0.`store_id`");
+    expect(compiled.sql).not.toContain("AS `门店ID`");
+  });
+
   it("compiles governed IDs and canonical time into parameterized Doris SQL", () => {
     const ontology = structuredClone(testOntology);
     const order = ontology.objects[0];

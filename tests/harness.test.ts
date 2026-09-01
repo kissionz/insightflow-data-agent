@@ -57,6 +57,59 @@ describe("DataAgentHarness", () => {
     });
   });
 
+  it("inherits the previous governed time range when a follow-up has no time words", () => {
+    const conversation = createConversation();
+    conversation.turns.push({
+      id: "turn_previous_july",
+      conversationId: conversation.id,
+      question: "今年7月份销售额为什么下降",
+      answer: "已完成7月分析",
+      status: "completed",
+      createdAt: "2026-09-01T08:00:00.000Z",
+      ontologyVersion: 1,
+      trace: [],
+      resultIntent: {
+        rootObjectId: "o_order",
+        measureIds: ["m_gmv"],
+        dimensionPropertyIds: ["p_store_id"],
+        filters: [],
+        timeRange: {
+          expression: "今年7月份",
+          kind: "ABSOLUTE_MONTH",
+          year: 2026,
+          month: 7,
+        },
+        resultKind: "aggregate",
+        title: "7月销售额归因",
+      },
+    });
+    const frame = resolveContextualMonthReferences(
+      {
+        originalQuestion: "达人的名称",
+        intentKind: "DIRECT_QUERY",
+        metricTerms: ["销售额"],
+        timeTerms: ["今年7月份"],
+        timeRange: { kind: "CURRENT_MONTH", originalText: "今年7月份" },
+        objectTerms: ["达人"],
+        businessValueTerms: [],
+        groupingTerms: ["达人"],
+        calculationTerms: [],
+        presentation: { kind: "RANKING" },
+      },
+      conversation,
+      "turn_follow_up",
+      "Asia/Shanghai",
+      new Date("2026-09-01T02:00:00.000Z"),
+    );
+
+    expect(frame.timeTerms).toEqual(["今年7月份"]);
+    expect(frame.timeRange).toMatchObject({
+      kind: "ABSOLUTE_MONTH",
+      year: 2026,
+      month: 7,
+    });
+  });
+
   it("injects the date-only business clock into the system prompt", () => {
     const prompt = buildSystemPrompt(
       "",

@@ -34,6 +34,126 @@ export interface CompiledQuery {
   planSummary: string;
 }
 
+export function preferNameDisplayDimensions(
+  intent: AnalysisIntent,
+  ontology: OntologySnapshot,
+): AnalysisIntent {
+  const resolutions = intent.dimensionPropertyIds.map((propertyId) => ({
+    requestedPropertyId: propertyId,
+    displayPropertyId:
+      resolvePreferredDisplayProperty(ontology, propertyId)?.id ?? propertyId,
+  }));
+  const replacements = new Map(
+    resolutions.map((resolution) => [
+      resolution.requestedPropertyId,
+      resolution.displayPropertyId,
+    ]),
+  );
+  const remap = (propertyId: string) => replacements.get(propertyId) ?? propertyId;
+  const dimensionPropertyIds = [
+    ...new Set(resolutions.map((resolution) => resolution.displayPropertyId)),
+  ];
+  return {
+    ...intent,
+    dimensionPropertyIds,
+    windowCalculations: intent.windowCalculations?.map((calculation) => ({
+      ...calculation,
+      partitionByPropertyIds: calculation.partitionByPropertyIds.map(remap),
+      orderBy: calculation.orderBy && calculation.orderBy.entityId !== "__time__"
+        ? {
+            ...calculation.orderBy,
+            entityId: remap(calculation.orderBy.entityId),
+          }
+        : calculation.orderBy,
+    })),
+    groupSelections: intent.groupSelections?.map((selection) => ({
+      ...selection,
+      partitionByPropertyIds: selection.partitionByPropertyIds.map(remap),
+      orderByEntityId: remap(selection.orderByEntityId),
+    })),
+    periodConditions: intent.periodConditions?.map((condition) => ({
+      ...condition,
+      groupByPropertyIds: condition.groupByPropertyIds.map(remap),
+    })),
+    sort: intent.sort?.map((sort) => ({
+      ...sort,
+      entityId: remap(sort.entityId),
+    })),
+  };
+}
+
+function resolvePreferredDisplayProperty(
+  ontology: OntologySnapshot,
+  propertyId: string,
+): OntologyProperty | undefined {
+  const owners = ontology.objects.flatMap((object) =>
+    object.properties.map((property) => ({ object, property })),
+  );
+  const selected = owners.find((binding) => binding.property.id === propertyId);
+  if (!selected || isNameDisplayProperty(selected.property)) {
+    return selected?.property;
+  }
+  const identityLike =
+    selected.property.meaning === "ID" ||
+    selected.property.meaning === "CODE" ||
+    selected.property.meaning === "ENTITY_REFERENCE" ||
+    selected.property.unique ||
+    selected.object.grainPropertyIds.includes(selected.property.id);
+  if (!identityLike) return selected.property;
+
+  const candidateObjectIds = new Set<string>();
+  for (const relation of ontology.relations) {
+    if (relation.sourcePropertyId === propertyId) {
+      candidateObjectIds.add(relation.targetObjectId);
+    }
+    if (relation.targetPropertyId === propertyId) {
+      candidateObjectIds.add(relation.sourceObjectId);
+    }
+  }
+  candidateObjectIds.add(selected.object.id);
+  const entityStem = displayEntityStem(selected.property.label);
+  const candidates = owners
+    .filter(
+      (binding) =>
+        candidateObjectIds.has(binding.object.id) &&
+        binding.property.visibility === "ANALYTICAL" &&
+        !binding.property.sensitive &&
+        isNameDisplayProperty(binding.property),
+    )
+    .sort((left, right) =>
+      displayNameScore(right.property, entityStem) -
+        displayNameScore(left.property, entityStem) ||
+      left.property.label.localeCompare(right.property.label, "zh-CN"),
+    );
+  return candidates[0]?.property ?? selected.property;
+}
+
+function isNameDisplayProperty(property: OntologyProperty): boolean {
+  return (
+    property.meaning === "NAME" ||
+    /名称|姓名|名字|(^|_)(?:name|title|label)(?:_|$)/i.test(
+      `${property.label} ${property.name}`,
+    )
+  );
+}
+
+function displayEntityStem(label: string): string {
+  return label
+    .replace(/\s*(?:ID|UID|编码|代码|编号|标识)$/i, "")
+    .trim();
+}
+
+function displayNameScore(property: OntologyProperty, entityStem: string): number {
+  const exactEntityName = entityStem && property.label === `${entityStem}名称`;
+  return (
+    (exactEntityName ? 500 : 0) +
+    (property.meaning === "NAME" ? 200 : 0) +
+    (property.defaultDisplay ? 80 : 0) +
+    property.bindingPriority -
+    (/重点|主名称|别名/.test(property.label) ? 40 : 0)
+  );
+}
+
 export class QueryIrCompiler {
   constructor(private readonly now: () => Date = () => new Date()) {}
 
@@ -43,6 +163,8 @@ export class QueryIrCompiler {
     tables: PhysicalTable[],
     timezone = "Asia/Shanghai",
   ): CompiledQuery {
+    const originalDimensionIds = [...intent.dimensionPropertyIds];
+    intent = preferNameDisplayDimensions(intent, ontology);
     const objectById = new Map(ontology.objects.map((object) => [object.id, object]));
     const metricById = new Map(ontology.metrics.map((metric) => [metric.id, metric]));
     const tableById = new Map(tables.map((table) => [table.id, table]));
@@ -56,6 +178,16 @@ export class QueryIrCompiler {
     const dimensions = intent.dimensionPropertyIds.map((id) =>
       requireProperty(propertyOwners, id, "分析维度"),
     );
+    const displayFallbacks = new Map<string, { object: OntologyObject; property: OntologyProperty }>();
+    for (const requestedPropertyId of originalDimensionIds) {
+      const requested = requireProperty(propertyOwners, requestedPropertyId, "分析维度");
+      const displayPropertyId =
+        resolvePreferredDisplayProperty(ontology, requestedPropertyId)?.id ??
+        requestedPropertyId;
+      if (displayPropertyId !== requestedPropertyId) {
+        displayFallbacks.set(displayPropertyId, requested);
+      }
+    }
     const semanticIndex = new SemanticIndex(ontology);
     const hierarchyFilters = (intent.hierarchyFilters ?? []).map((filter) => {
       const hierarchy = semanticIndex.findRecursiveHierarchy(filter.hierarchyId);
@@ -116,6 +248,7 @@ export class QueryIrCompiler {
       root.id,
       ...measures.map((metric) => metric.objectId),
       ...dimensions.map((binding) => binding.object.id),
+      ...[...displayFallbacks.values()].map((binding) => binding.object.id),
       ...filters
         .filter((filter) => filter.kind !== "BOUND_VALUE")
         .map((filter) => filter.binding.object.id),
@@ -174,12 +307,17 @@ export class QueryIrCompiler {
     const selectParts: string[] = [];
     const groupParts: string[] = [];
     for (const binding of dimensions) {
-      const expression = qualifiedColumn(
-        aliases.get(binding.object.id)!,
-        binding.property,
+      const expression = compileDisplayDimensionExpression(
+        binding,
+        displayFallbacks.get(binding.property.id),
+        aliases,
       );
       selectParts.push(`${expression} AS ${quoteIdentifier(binding.property.label)}`);
       groupParts.push(expression);
+      const fallback = displayFallbacks.get(binding.property.id);
+      if (fallback) {
+        groupParts.push(qualifiedColumn(aliases.get(fallback.object.id)!, fallback.property));
+      }
     }
     if (intent.timeGrain && timeBinding) {
       const expression = compileTimeBucket(
@@ -408,6 +546,7 @@ export class QueryIrCompiler {
       ? compileLayeredAnalysis({
           intent,
           dimensions,
+          displayFallbacks,
           measures,
           measureByReference,
           metricById,
@@ -1260,6 +1399,10 @@ function timeGrainLabel(grain: TimeGrain): string {
 interface LayeredAnalysisContext {
   intent: AnalysisIntent;
   dimensions: Array<{ object: OntologyObject; property: OntologyProperty }>;
+  displayFallbacks: Map<
+    string,
+    { object: OntologyObject; property: OntologyProperty }
+  >;
   measures: Metric[];
   measureByReference: Map<string, Metric>;
   metricById: Map<string, Metric>;
@@ -1280,6 +1423,7 @@ function compileLayeredAnalysis(context: LayeredAnalysisContext): string {
   const {
     intent,
     dimensions,
+    displayFallbacks,
     measures,
     measureByReference,
     metricById,
@@ -1295,18 +1439,31 @@ function compileLayeredAnalysis(context: LayeredAnalysisContext): string {
     limit,
   } = context;
   const dimensionAliases = new Map<string, string>();
+  const dimensionIdentityAliases = new Map<string, string>();
   const measureAliases = new Map<string, string>();
   const baseSelect: string[] = [];
   const baseGroups: string[] = [];
   dimensions.forEach((binding, index) => {
     const alias = `__d${index}`;
     dimensionAliases.set(binding.property.id, alias);
-    const expression = qualifiedColumn(
-      aliases.get(binding.object.id)!,
-      binding.property,
+    const fallback = displayFallbacks.get(binding.property.id);
+    const expression = compileDisplayDimensionExpression(
+      binding,
+      fallback,
+      aliases,
     );
     baseSelect.push(`${expression} AS ${quoteIdentifier(alias)}`);
     baseGroups.push(expression);
+    if (fallback) {
+      const identityAlias = `__dk${index}`;
+      const identityExpression = qualifiedColumn(
+        aliases.get(fallback.object.id)!,
+        fallback.property,
+      );
+      dimensionIdentityAliases.set(binding.property.id, identityAlias);
+      baseSelect.push(`${identityExpression} AS ${quoteIdentifier(identityAlias)}`);
+      baseGroups.push(identityExpression);
+    }
   });
   if (intent.timeGrain && timeBinding) {
     const expression = compileTimeBucket(
@@ -1336,9 +1493,12 @@ function compileLayeredAnalysis(context: LayeredAnalysisContext): string {
       calculation.label,
     );
     const metricAlias = measureAliases.get(metric.id)!;
-    const dimensionConditions = [...dimensionAliases.values()].map(
-      (alias) => `${previousAlias}.${quoteIdentifier(alias)} <=> c.${quoteIdentifier(alias)}`,
-    );
+    const dimensionConditions = dimensions.map((binding) => {
+      const alias =
+        dimensionIdentityAliases.get(binding.property.id) ??
+        dimensionAliases.get(binding.property.id)!;
+      return `${previousAlias}.${quoteIdentifier(alias)} <=> c.${quoteIdentifier(alias)}`;
+    });
     const interval = timeComparisonInterval(
       calculation.comparison,
       intent.timeGrain!.unit,
@@ -1403,7 +1563,13 @@ function compileLayeredAnalysis(context: LayeredAnalysisContext): string {
         calculation,
         measureByReference,
         measureAliases,
-        dimensionAliases,
+        new Map(
+          dimensions.map((binding) => [
+            binding.property.id,
+            dimensionIdentityAliases.get(binding.property.id) ??
+              dimensionAliases.get(binding.property.id)!,
+          ]),
+        ),
         intent,
       )} AS ${quoteIdentifier(calculation.label)}`,
     );
@@ -2918,6 +3084,23 @@ function zonedWeekday(value: Date, timezone: string): number {
 
 function qualifiedColumn(alias: string, property: OntologyProperty): string {
   return `${alias}.${quoteIdentifier(property.sourceColumn)}`;
+}
+
+function compileDisplayDimensionExpression(
+  display: { object: OntologyObject; property: OntologyProperty },
+  fallback: { object: OntologyObject; property: OntologyProperty } | undefined,
+  aliases: Map<string, string>,
+): string {
+  const displayColumn = qualifiedColumn(
+    aliases.get(display.object.id)!,
+    display.property,
+  );
+  if (!fallback) return displayColumn;
+  const fallbackColumn = qualifiedColumn(
+    aliases.get(fallback.object.id)!,
+    fallback.property,
+  );
+  return `COALESCE(NULLIF(${displayColumn}, ''), CAST(${fallbackColumn} AS STRING))`;
 }
 
 function qualifiedTable(table: PhysicalTable): string {

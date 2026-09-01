@@ -2712,7 +2712,12 @@ tbody tr:hover {
 }
 
 .draft-panel {
+  display: flex;
+  height: max(320px, var(--ontology-panel-height));
+  min-height: 0;
   align-self: start;
+  flex-direction: column;
+  overflow: hidden;
   padding-bottom: 12px;
 }
 
@@ -2724,7 +2729,12 @@ tbody tr:hover {
 }
 
 .draft-table-list {
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow-y: auto;
   margin: 0 8px 12px;
+  overscroll-behavior-y: contain;
+  scrollbar-gutter: stable;
 }
 
 .draft-table-list label {
@@ -2760,8 +2770,15 @@ tbody tr:hover {
 }
 
 .draft-panel > button {
+  flex: 0 0 auto;
   width: calc(100% - 24px);
   margin: 8px 12px 0;
+}
+
+.draft-panel > .validation-summary {
+  flex: 0 0 auto;
+  max-height: 120px;
+  overflow-y: auto;
 }
 
 .danger-text {
